@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "contracts": {
+    "PGR": {
+      "runner": "adapter-host/classic-runner/Program.cs",
+      "build": "scripts/Build-YeYuGamerClassicAdapter.ps1",
+      "installer": "scripts/Install-YeYuGamerClassicAdapter.ps1",
+      "operations": ["attach-home", "claim-serum", "dorm", "simulation-field", "maintainer-action", "claim-daily-tasks", "battle-pass-free-track"]
+    },
+    "ZZZ": {
+      "runner": "adapter-host/classic-runner/Program.cs",
+      "build": "scripts/Build-YeYuGamerClassicAdapter.ps1",
+      "installer": "scripts/Install-YeYuGamerClassicAdapter.ps1",
+      "operations": ["attach-home", "coffee", "scratch-card", "trigrams-collection", "suibian-temple", "random-play", "charge-plan", "city-fund-free-claim", "engagement-reward"]
+    },
+    "NIKKE": {
+      "runner": "adapter-host/classic-runner/Program.cs",
+      "build": "scripts/Build-YeYuGamerClassicAdapter.ps1",
+      "installer": "scripts/Install-YeYuGamerClassicAdapter.ps1",
+      "operations": ["attach-lobby", "outpost", "dispatch-friend"]
+    },
+    "WW": {
+      "runner": "adapter-host/openkuro-runner/Program.cs",
+      "build": "scripts/Build-YeYuGamerWwAdapter.ps1",
+      "installer": "scripts/Install-YeYuGamerWwAdapter.ps1",
+      "operations": ["attach-world", "inspect-daily-progress", "farm-nightmare-daily-echo", "spend-waveplates", "claim-daily-reward", "claim-mail", "claim-battle-pass"]
+    },
+    "Endfield": {
+      "runner": "adapter-host/openkuro-runner/Program.cs",
+      "build": "scripts/Build-YeYuGamerWwAdapter.ps1",
+      "installer": "scripts/Install-YeYuGamerWwAdapter.ps1",
+      "operations": ["attach-world", "mail", "spend-sanity", "delivery-commission", "collect-credit", "dijiang-harvest", "claim-daily-reward"]
+    },
+    "GF2": {
+      "runner": "adapter-host/openkuro-runner/Program.cs",
+      "build": "scripts/Build-YeYuGamerWwAdapter.ps1",
+      "installer": "scripts/Install-YeYuGamerWwAdapter.ps1",
+      "operations": ["attach-home", "mail", "public-area-dispatch", "spend-stamina", "squad-tasks", "claim-daily-missions", "battle-pass-free-track"]
+    },
+    "NTE": {
+      "runner": "adapter-host/nte-runner/Program.cs",
+      "build": "scripts/Build-YeYuGamerNteAdapter.ps1",
+      "installer": "scripts/Install-YeYuGamerNteAdapter.ps1",
+      "operations": ["attach-home", "mail", "daily-activity", "spend-city-vitality", "claim-activity-reward", "claim-cycle-reward"]
+    },
+    "FGO": {
+      "runner": "adapter-host/fgo-runner/Program.cs",
+      "build": "scripts/Build-YeYuGamerFgoAdapter.ps1",
+      "installer": "scripts/Install-YeYuGamerFgoAdapter.ps1",
+      "operations": ["attach-home", "three-10ap-quests"]
+    },
+    "StarRail": {
+      "runner": "adapter-host/starrail-runner/Program.cs",
+      "build": "scripts/Build-YeYuGamerStarRailAdapter.ps1",
+      "installer": "scripts/Install-YeYuGamerStarRailAdapter.ps1",
+      "operations": ["attach-home", "spend-trailblaze-power", "daily-training-objectives", "claim-daily-training-rewards", "verify-daily-task-list"]
+    },
+    "CZN": {
+      "runner": "adapter-host/czn-runner/Program.cs",
+      "build": "scripts/Build-YeYuGamerCznAdapter.ps1",
+      "installer": "scripts/Install-YeYuGamerCznAdapter.ps1",
+      "operations": ["login-bonus", "achievement-schedule", "arkhianon-supply", "simulation-stamina"]
+    },
+    "BD2": {
+      "runner": "adapter-host/czn-runner/Program.cs",
+      "build": "scripts/Build-YeYuGamerCznAdapter.ps1",
+      "installer": "scripts/Install-YeYuGamerBd2Adapter.ps1",
+      "operations": ["attach-home", "daily-claim", "stamina-sweep"]
+    }
+  }
+}

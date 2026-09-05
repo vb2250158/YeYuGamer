@@ -1,0 +1,12 @@
+@echo off
+setlocal
+set "YEYU_INSTALL=%LOCALAPPDATA%\Programs\YeYuGamer"
+set "YEYU_RUNTIME=%PROGRAMDATA%\YeYuGamer\runtime"
+set "YEYU_PYTHON=%YEYU_INSTALL%\.venv\Scripts\python.exe"
+set "PYTHONDONTWRITEBYTECODE=1"
+if not exist "%YEYU_PYTHON%" (
+  echo [YeYu Gamer] Install the new local package before migrating this entry.
+  exit /b 3
+)
+"%YEYU_PYTHON%" -B -m yeyu_gamer_platform.cli --config "%YEYU_RUNTIME%\config\platform.json" legacy %*
+exit /b %errorlevel%

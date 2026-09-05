@@ -1,0 +1,2 @@
+"""YeYu Gamer Manager tests."""
+

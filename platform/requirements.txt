@@ -1,0 +1,4 @@
+# CLI and lifecycle helpers intentionally use the Python standard library.
+# PySide6 is needed only by the lightweight system tray host.
+PySide6>=6.7,<7
+

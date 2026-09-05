@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yeyu-gamer-platform"
+version = "0.3.2"
+description = "YeYu Gamer single-process desktop host and lifecycle helpers"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+tray = ["PySide6>=6.7,<7"]
+
+[project.scripts]
+yeyu-gamer = "yeyu_gamer_platform.desktop_host:main"
+yeyu-gamer-cli = "yeyu_gamer_platform.cli:main"
+yeyu-gamer-tray = "yeyu_gamer_platform.tray:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["yeyu_gamer_platform*"]

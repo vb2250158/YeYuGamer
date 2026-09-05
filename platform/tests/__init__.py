@@ -1,0 +1,2 @@
+"""YeYu Gamer platform tests."""
+

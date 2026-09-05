@@ -1,0 +1,2 @@
+"""Manager application services."""
+
