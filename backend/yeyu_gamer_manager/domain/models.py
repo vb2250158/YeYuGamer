@@ -1330,6 +1330,17 @@ class GameAccountConfig(ApiModel):
     label: str = Field(min_length=1, max_length=80)
     enabled: bool = True
     saved_account_label: str | None = Field(default=None, max_length=160)
+    daily_todo_selection: list[str] | None = None
+    daily_tool_profiles: DailyToolProfilesConfig | None = None
+
+    @model_validator(mode="after")
+    def account_profiles_are_ww_only(self) -> "GameAccountConfig":
+        if self.daily_tool_profiles is not None and any(
+            value is not None for key, value in self.daily_tool_profiles.model_dump().items()
+            if key != "ok_ww"
+        ):
+            raise ValueError("Account dailyToolProfiles supports only okWw")
+        return self
 
 
 class ConfigPatchRequest(ApiModel):

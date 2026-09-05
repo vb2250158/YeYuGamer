@@ -87,7 +87,7 @@ flowchart TD
 
 ### 鸣潮账号身份与完成隔离
 
-首版只开放鸣潮的显式多账号配置。Manager 的 `gameAccounts` 保存稳定 `accountId`、别名、启用状态与官方登录页已记住账号的精确掩码标签；顺序取自列表。标签是本机私有运行配置，不是密码，也不是账号所有权或当前登录身份的证明。当前账号共享鸣潮的 `dailyTodoSelection` 和 `dailyToolProfiles.okWw`。
+当前只开放鸣潮的显式多账号配置。Manager 的 `gameAccounts` 保存稳定 `accountId`、别名、启用状态与官方登录页已记住账号的精确掩码标签，以及各自的 `dailyTodoSelection` 和 `dailyToolProfiles.okWw`；顺序取自列表。标签是本机私有运行配置，不是密码，也不是账号所有权或当前登录身份的证明。账号缺少独立配置时从原共享配置初始化一次，之后由账号配置拥有选择和参数；显式空步骤列表表示本账号不执行。
 
 - 每个游戏仍使用原有 `GameId` 与同一个 `GameIntegration`。批次冻结 `(gameId, accountId)` 目标与账号快照，不用变造 `GameId` 注册多个账号。
 - 每个目标有独立 GameRun、RunAttempt、TodoInstance 和完成合同。Todo 的持久化唯一键是 `(account_id, todo_definition_id, period_key)`；旧默认账号维持原 Todo ID，迁移保留历史封存内容。

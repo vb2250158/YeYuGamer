@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import type { AccountTarget, BatchRun, CompletionContractDecision, GameAccount, GameDetail, GameRunRecord, GameState, RunAttempt, TodoAttempt, TodoInstance } from '../api/contracts'
-import { accountBindingLabel, accountCompletionEvidence, accountGameState, accountRunLocation, accountTodos, configuredGameAccounts, gameAccountsPatch, loadedAttemptCounts, moveGameAccount, reviewRunContextError, scopeGameDetailToAccount, todayAccountTargets } from './gameAccounts'
+import type { AccountTarget, BatchRun, CompletionContractDecision, GameAccount, GameDetail, GameRunRecord, GameState, RunAttempt, TodoAttempt, TodoDefinition, TodoInstance } from '../api/contracts'
+import { accountBindingLabel, accountCompletionEvidence, accountDailyConfigRows, accountDailySelection, accountGameState, accountOKWWProfile, accountRunLocation, accountTodos, configuredGameAccounts, gameAccountsPatch, loadedAttemptCounts, moveGameAccount, newWWAccount, reviewRunContextError, scopeGameDetailToAccount, todayAccountTargets } from './gameAccounts'
 import { currentStepEvidence } from './todayEvidence'
 import { buildTodayScope } from './todayScope'
 
@@ -26,7 +26,7 @@ const target = (accountId = 'default'): AccountTarget => ({ targetId: accountId 
 describe('WW account configuration', () => {
   it('keeps the implicit original account when adding the first new row', () => {
     const original = configuredGameAccounts({}, 'WW')
-    expect(original).toEqual([{ account_id: 'default', label: '当前账号', enabled: true, saved_account_label: '' }])
+    expect(original).toEqual([{ ...newWWAccount({}, '当前账号'), account_id: 'default' }])
     const patch = gameAccountsPatch([...original, { label: '新账号', enabled: true, saved_account_label: '' }])
     expect(patch[0]?.account_id).toBe('default')
     expect(Object.hasOwn(patch[1]!, 'account_id')).toBe(false)
@@ -60,6 +60,51 @@ describe('WW account configuration', () => {
     expect(configuredGameAccounts({ game_accounts: { WW: [] } }, 'WW')).toEqual([])
     const malformed = configuredGameAccounts({ game_accounts: { WW: [{ label: 'unknown', enabled: true }] } }, 'WW')
     expect(todayAccountTargets('WW', malformed)).toEqual([])
+  })
+
+  it('seeds legacy and new accounts without sharing mutable settings, preserving explicit empty selection', () => {
+    const config = { daily_todo_selection: { WW: ['daily'] }, daily_tool_profiles: { ok_ww: { which_to_farm: 'Simulation Challenge', material_selection: 'Weapon EXP' } } }
+    const original = configuredGameAccounts(config, 'WW')[0]!
+    const fresh = newWWAccount(config)
+    original.daily_todo_selection!.push('other')
+    expect(accountDailySelection(fresh)).toEqual(['daily'])
+    expect(config.daily_todo_selection.WW).toEqual(['daily'])
+    expect(accountOKWWProfile(original)).toMatchObject({ whichToFarm: 'Simulation Challenge', materialSelection: 'Weapon EXP' })
+    const saved = configuredGameAccounts({ ...config, game_accounts: { WW: [
+      { ...accounts[0], daily_todo_selection: null, daily_tool_profiles: null },
+      { ...accounts[1], daily_todo_selection: [], daily_tool_profiles: { ok_ww: { which_to_farm: 'Forgery Challenge', forgery_challenge_number: 4 } } },
+    ] } }, 'WW')
+    expect(saved.map(accountDailySelection)).toEqual([['daily'], []])
+    expect(accountOKWWProfile(saved[1]!)).toMatchObject({ whichToFarm: 'Forgery Challenge', forgeryChallengeNumber: 4 })
+    expect(todayAccountTargets('WW', saved).map((item) => item.accountId)).toEqual(['default'])
+  })
+
+  it('round-trips independent account steps and routes through reorder and server-assigned IDs', () => {
+    const configured = configuredGameAccounts({ game_accounts: { WW: [
+      { ...accounts[0], daily_todo_selection: ['daily'], daily_tool_profiles: { ok_ww: { which_to_farm: 'Simulation Challenge', material_selection: 'Resonator EXP', farm_nightmare_nest_for_daily_echo: false } } },
+      { label: 'New B', enabled: true, saved_account_label: 'saved-B', dailyTodoSelection: ['stamina'], dailyToolProfiles: { okWw: { whichToFarm: 'Tacet Suppression', tacetSuppressionNumber: 7 } } },
+    ] } }, 'WW')
+    const patch = gameAccountsPatch(moveGameAccount(configured, 1, -1))
+    expect(patch.map((item) => item.account_id)).toEqual([undefined, 'default'])
+    expect(patch.map(accountDailySelection)).toEqual([['stamina'], ['daily']])
+    expect(accountOKWWProfile(patch[0]!)).toMatchObject({ whichToFarm: 'Tacet Suppression', tacetSuppressionNumber: 7 })
+    expect(accountOKWWProfile(patch[1]!)).toMatchObject({ whichToFarm: 'Simulation Challenge', materialSelection: 'Resonator EXP', farmNightmareNestForDailyEcho: false })
+    const saved = configuredGameAccounts({ game_accounts: { WW: patch.map((item) => ({ ...item, account_id: item.account_id ?? 'server-B' })) } }, 'WW')
+    expect(gameAccountsPatch(saved)).toEqual(patch.map((item) => ({ ...item, account_id: item.account_id ?? 'server-B' })))
+    expect(configured[0]?.daily_todo_selection).toEqual(['daily'])
+    expect(configuredGameAccounts({}, 'PGR')).toEqual([{ account_id: 'default', label: '当前账号', enabled: true, saved_account_label: '' }])
+  })
+
+  it('uses catalog rows for saved or unsaved accounts without borrowing another account state or screenshots', () => {
+    const definition = { todoDefinitionId: 'daily', gameId: 'WW', cadence: 'daily', active: true, title: '领取', operation: 'claim', orderIndex: 1 } as TodoDefinition
+    const a = { ...todo('default', 'completed'), title: 'A领取', operation: 'claim', orderIndex: 1 }
+    const artifacts = [{ artifactId: 'A-image', gameId: 'WW', runId: a.runId!, todoInstanceId: a.todoInstanceId,
+      gameDayKey: day, todoAttemptId: 'attempt-a', contentType: 'image/png', kind: 'game-ui-step-after-watermarked' }]
+    expect(currentStepEvidence(artifacts, accountDailyConfigRows(accounts[0]!, [definition], [a])[0]!.todo!)).toHaveLength(1)
+    for (const account of [accounts[1]!, newWWAccount({})]) {
+      expect(accountDailyConfigRows(account, [definition], [a])).toEqual([{ todoDefinitionId: 'daily', title: '领取', operation: 'claim', orderIndex: 1, todo: undefined }])
+    }
+    expect(accountDailyConfigRows(newWWAccount({}), [], [a])).toEqual([])
   })
 })
 

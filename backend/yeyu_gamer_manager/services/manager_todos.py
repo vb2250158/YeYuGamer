@@ -26,7 +26,7 @@ from ..domain.models import (
 )
 from ..domain.todos import todo_instance_id, todo_period
 from ..store.sqlite_store import SqliteStore
-from .account_scopes import enabled_account_ids, game_accounts, resolve_game_account
+from .account_scopes import account_target_id, enabled_account_ids, game_accounts, resolve_game_account
 from .adapter_host import ManagerAdapterHost
 from .current_completion import project_current_game_completion
 from .integration_catalog import (
@@ -729,21 +729,27 @@ class ManagerTodosService:
         after a selected batch has sealed successfully.
         """
 
-        configured_selection = self.store.get_config()["values"].get(
-            "daily_todo_selection", {}
-        )
-        configured_definition_ids = configured_selection.get(game_id)
-        selected_definition_ids = (
-            set(configured_definition_ids)
-            if cadence == "daily" and isinstance(configured_definition_ids, list)
-            else {
-                item.todo_definition_id for item in all_items if item.required
-            }
-        )
+        config_values = self.store.get_config()["values"]
+        shared_definition_ids = config_values.get("daily_todo_selection", {}).get(game_id)
+        selections: dict[str, set[str] | None] = {}
+        for account_id in {item.account_id for item in all_items}:
+            definition_ids = shared_definition_ids
+            if cadence == "daily" and game_id == "WW":
+                account = resolve_game_account(config_values, game_id, account_id)
+                if account.get("daily_todo_selection") is not None:
+                    definition_ids = account["daily_todo_selection"]
+            # Missing legacy values use the original shared/required defaults;
+            # an explicitly empty account selection always stays empty.
+            selections[account_id] = (
+                set(definition_ids)
+                if cadence == "daily" and isinstance(definition_ids, list)
+                else None
+            )
         return [
             item
             for item in all_items
-            if item.todo_definition_id in selected_definition_ids
+            if (item.required if selections[item.account_id] is None
+                else item.todo_definition_id in selections[item.account_id])
         ]
 
     @staticmethod
@@ -944,7 +950,11 @@ class ManagerTodosService:
         )}
 
     def _todo_plans_for_targets(
-        self, targets: list[dict[str, Any]], cadence: str
+        self,
+        targets: list[dict[str, Any]],
+        cadence: str,
+        *,
+        frozen_todos_by_target: dict[str, list[TodoInstanceRecord]] | None = None,
     ) -> list[dict[str, Any]]:
         plans: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
@@ -958,14 +968,27 @@ class ManagerTodosService:
                 raise ManagerValidation("targets contains duplicate game accounts")
             seen.add((game_id, account_id))
             resolve_game_account(self.store.get_config()["values"], game_id, account_id)
-            all_items = self.list_todo_instances(
-                game_id=game_id, account_id=account_id, cadence=cadence, current=True, limit=1000
-            )
-            items = self._selected_todo_scope_items(
-                game_id=game_id,
-                cadence=cadence,
-                all_items=all_items,
-            )
+            if frozen_todos_by_target is not None:
+                target_id = account_target_id(game_id, account_id)
+                if target_id not in frozen_todos_by_target:
+                    raise ManagerConflict("Frozen Todo plan is missing its game/account target")
+                items = list(frozen_todos_by_target[target_id])
+                if any(
+                    item.game_id != game_id
+                    or item.account_id != account_id
+                    or str(item.cadence) != cadence
+                    for item in items
+                ) or len({item.todo_instance_id for item in items}) != len(items):
+                    raise ManagerConflict("Frozen Todo plan differs from its game/account scope")
+            else:
+                all_items = self.list_todo_instances(
+                    game_id=game_id, account_id=account_id, cadence=cadence, current=True, limit=1000
+                )
+                items = self._selected_todo_scope_items(
+                    game_id=game_id,
+                    cadence=cadence,
+                    all_items=all_items,
+                )
             selected_definition_ids = {
                 item.todo_definition_id for item in items
             }

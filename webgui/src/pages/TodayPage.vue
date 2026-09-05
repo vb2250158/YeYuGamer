@@ -7,8 +7,9 @@ import StatusBadge from '../components/StatusBadge.vue'
 import EmptyState from '../components/EmptyState.vue'
 import TodoChecklist from '../components/TodoChecklist.vue'
 import GameAccountEditor from '../components/GameAccountEditor.vue'
-import { accountCompletionEvidence, accountGameState, accountIdOf, accountRunLocation, accountTodos, configuredGameAccounts, gameAccountsPatch, todayAccountTargets } from '../utils/gameAccounts'
-import type { GameAccount, GameRunRecord } from '../api/contracts'
+import OKWWProfileEditor from '../components/OKWWProfileEditor.vue'
+import { accountCompletionEvidence, accountDailyConfigRows, accountDailySelection, accountGameState, accountIdOf, accountOKWWProfile, accountRunLocation, accountTargetId, accountTodos, configuredGameAccounts, gameAccountsPatch, newWWAccount, todayAccountTargets } from '../utils/gameAccounts'
+import type { AccountTarget, GameAccount, GameRunRecord, OKWWProfile, TodoDefinition } from '../api/contracts'
 import { useManagerStore } from '../stores/manager'
 import { formatTime } from '../utils/format'
 import { executionIsEnabled, runtimeBindingReadinessForGames } from '../utils/managerResources'
@@ -21,14 +22,6 @@ import { queueCleanupTarget, queueCleanupView } from '../utils/queueCleanup'
 import { managerApi } from '../api/client'
 import { recordOf, type AdapterInfo, type BatchRun, type ConfigDocument, type EvidenceArtifact, type GameIntegration, type GamePathConfig, type GameState, type LDPlayerGameBindingConfig, type RunAttempt, type TodoInstance, type TodoResetPreview } from '../api/contracts'
 import { useResource } from '../composables/useResource'
-
-type OKWWProfile = {
-  whichToFarm: 'Tacet Suppression' | 'Forgery Challenge' | 'Simulation Challenge'
-  tacetSuppressionNumber: number
-  forgeryChallengeNumber: number
-  materialSelection: 'Resonator EXP' | 'Weapon EXP' | 'Shell Credit'
-  farmNightmareNestForDailyEcho: boolean
-}
 
 type EndfieldProfile = {
   staminaStage: string
@@ -53,19 +46,6 @@ type CZNProfile = {
   battleEfficiency: number
   untilExhausted: true
 }
-
-const defaultOKWWProfile = (): OKWWProfile => ({
-  whichToFarm: 'Tacet Suppression',
-  tacetSuppressionNumber: 1,
-  forgeryChallengeNumber: 1,
-  materialSelection: 'Shell Credit',
-  farmNightmareNestForDailyEcho: true,
-})
-
-const tacetSuppressionOptions = Array.from({ length: 19 }, (_, index) => ({
-  title: `F2 列表第 ${index + 1} 个`,
-  value: index + 1,
-}))
 
 const defaultEndfieldProfile = (): EndfieldProfile => ({
   staminaStage: '超距辉映管', rewardTier: '保持当前', staminaRotationStartDate: '2026-04-06', staminaRotation: ['超距辉映管'], teamSlot: '不换队伍',
@@ -98,11 +78,11 @@ const resetConfirmDialog = ref(false)
 const pendingResetGame = shallowRef<{ gameId: string; displayName: string }>()
 const gameIntegrationsError = ref<string>()
 const dailyTodos = useCurrentTodos('daily')
+const wwDefinitions = useResource<TodoDefinition>('/todo-definitions?gameId=WW&cadence=daily')
 const runtimeBindings = useResource<AdapterInfo>('/adapters')
 const gamePathDrafts = ref<Record<string, GamePathConfig>>({})
 const gameEnabledDrafts = ref<Record<string, boolean>>({})
 const dailyTodoSelectionDrafts = ref<Record<string, string[]>>({})
-const okWwProfileDraft = ref<OKWWProfile>()
 const wwAccountDraft = ref<GameAccount[]>()
 const wwAccounts = computed(() => wwAccountDraft.value ?? configuredGameAccounts(configDocument.value?.config, 'WW'))
 const savedWwAccounts = computed(() => configuredGameAccounts(configDocument.value?.config, 'WW'))
@@ -125,8 +105,9 @@ let configurationMutationRevision = 0
 const allGames = computed(() => snapshot.value.games)
 const queuedDailyGames = computed(() => allGames.value.filter((game) => (
   dailyGameEnabled(game.gameId)
-  && selectedDailyTodoDefinitionIds(game.gameId).length > 0
-  && (game.gameId !== 'WW' || wwAccounts.value.some((account) => account.enabled))
+  && (game.gameId === 'WW'
+    ? wwAccounts.value.some((account) => account.enabled && accountDailySelection(account).length > 0)
+    : selectedDailyTodoDefinitionIds(game.gameId).length > 0)
 )))
 const dailySelectionSaving = computed(() => savingDailySelectionIds.value.size > 0)
 const executionEnabled = computed(() => executionIsEnabled(snapshot.value))
@@ -202,6 +183,8 @@ const todayScope = computed(() => buildTodayScope({
   games: allGames.value,
   todos: dailyTodos.items.value,
   selectedTodoDefinitionIds: selectedTodoDefinitionIdsByGame.value,
+  selectedTodoDefinitionIdsByTarget: Object.fromEntries(savedWwAccounts.value.filter((account) => account.account_id)
+    .map((account) => [accountTargetId('WW', account.account_id!), accountDailySelection(account)])),
   enabledAccountIds: { WW: savedWwAccounts.value.filter((account) => account.enabled && account.account_id).map((account) => account.account_id!) },
 }))
 const gameDayLabel = computed(() => {
@@ -254,7 +237,6 @@ const todayScopeStatus = computed(() => {
 })
 const manualDirtyGameIds = computed(() => {
   const ids = new Set(Object.keys(gamePathDrafts.value))
-  if (okWwProfileDraft.value) ids.add('WW')
   if (wwAccountDraft.value) ids.add('WW')
   if (endfieldProfileDraft.value) ids.add('Endfield')
   if (nteProfileDraft.value) ids.add('NTE')
@@ -439,6 +421,36 @@ function updateWwAccounts(accounts: GameAccount[]): void {
   touchManualConfig('WW')
 }
 
+function updateWwAccountProfile(index: number, profile: OKWWProfile): void {
+  updateWwAccounts(wwAccounts.value.map((account, row) => row === index
+    ? { ...account, daily_tool_profiles: { ok_ww: profile } } : account))
+}
+
+function updateWwAccountSelection(index: number, definitionId: string, selected: boolean): void {
+  const account = wwAccounts.value[index]
+  if (!account) return
+  const selection = new Set(accountDailySelection(account))
+  if (selected) selection.add(definitionId)
+  else selection.delete(definitionId)
+  updateWwAccounts(wwAccounts.value.map((item, row) => row === index
+    ? { ...item, daily_todo_selection: [...selection] } : item))
+}
+
+function wwAccountView(account: GameAccount) {
+  const game = allGames.value.find((item) => item.gameId === 'WW')
+  const target: AccountTarget | undefined = account.account_id ? wwTargets.value.find((item) => item.accountId === account.account_id)
+    ?? { targetId: accountTargetId('WW', account.account_id), gameId: 'WW', accountId: account.account_id, accountLabel: account.label } : undefined
+  const todos = target ? accountTodos(dailyTodos.items.value, 'WW', target.accountId) : []
+  const scopedTodos = target ? accountTodos(gameTodos('WW'), 'WW', target.accountId) : []
+  return {
+    rows: accountDailyConfigRows(account, wwDefinitions.items.value, dailyTodos.items.value),
+    game: game && target ? accountGameState(game, target, todos, accountRuns.value) : undefined,
+    todos,
+    summary: todoSummaryFromItems(scopedTodos, 'daily'),
+    evidence: game && target ? accountCompletionEvidence(game, target, todos, accountRuns.value, evidenceArtifacts.value) : [],
+  }
+}
+
 let evidenceReloadTimer: ReturnType<typeof setTimeout> | undefined
 watch(() => snapshot.value.stateVersion, () => {
   if (evidenceReloadTimer) clearTimeout(evidenceReloadTimer)
@@ -487,12 +499,6 @@ function todayEvidenceForGame(gameId: string): EvidenceArtifact[] {
     gameDayKeys: dailyConfigTodos(gameId).map((item) => item.periodKey).filter(Boolean),
     acceptedArtifactIds,
   })
-}
-
-function accountRewardEvidence(targetId: string): EvidenceArtifact[] {
-  const target = wwTargets.value.find((item) => item.targetId === targetId)
-  const game = allGames.value.find((item) => item.gameId === 'WW')
-  return target && game ? accountCompletionEvidence(game, target, gameTodos('WW'), accountRuns.value, evidenceArtifacts.value) : []
 }
 
 function artifactContentUrl(artifactId: string): string {
@@ -602,7 +608,7 @@ function updateDailyGameEnabled(gameId: string, value: boolean): void {
   failures.delete(gameId)
   failedDailySelectionIds.value = failures
   gameEnabledDrafts.value = { ...gameEnabledDrafts.value, [gameId]: value }
-  if (value && selectedDailyTodoDefinitionIds(gameId).length === 0) {
+  if (gameId !== 'WW' && value && selectedDailyTodoDefinitionIds(gameId).length === 0) {
     const registeredOperations = new Set(
       integrationForGame(gameId)?.operations.map((item) => item.operation) ?? [],
     )
@@ -627,6 +633,7 @@ function updateDailyGameEnabled(gameId: string, value: boolean): void {
 }
 
 function selectedDailyTodoDefinitionIds(gameId: string): string[] {
+  if (gameId === 'WW') return [...new Set(wwAccounts.value.filter((account) => account.enabled).flatMap(accountDailySelection))]
   if (hasDraft(dailyTodoSelectionDrafts.value, gameId)) return dailyTodoSelectionDrafts.value[gameId]
   if (hasDraft(configuredDailyTodoSelection.value, gameId)) return configuredDailyTodoSelection.value[gameId]
   return []
@@ -653,51 +660,6 @@ function updateDailyTodoSelection(gameId: string, todoDefinitionId: string, sele
 
 function todayTodoState(todo: { status: string }): string {
   return todo.status === 'completed' ? '本步骤已执行' : '本步骤未完成'
-}
-
-function configuredOKWWProfile(): OKWWProfile {
-  const raw = recordOf(dailyToolProfiles.value.okWw ?? dailyToolProfiles.value.ok_ww)
-  const defaults = defaultOKWWProfile()
-  const whichToFarm = raw.whichToFarm ?? raw.which_to_farm
-  const materialSelection = raw.materialSelection ?? raw.material_selection
-  const tacetSuppressionNumber = raw.tacetSuppressionNumber ?? raw.tacet_suppression_number
-  const forgeryChallengeNumber = raw.forgeryChallengeNumber ?? raw.forgery_challenge_number
-  return {
-    whichToFarm: whichToFarm === 'Forgery Challenge' || whichToFarm === 'Simulation Challenge' ? whichToFarm : defaults.whichToFarm,
-    tacetSuppressionNumber: typeof tacetSuppressionNumber === 'number' ? tacetSuppressionNumber : defaults.tacetSuppressionNumber,
-    forgeryChallengeNumber: typeof forgeryChallengeNumber === 'number' ? forgeryChallengeNumber : defaults.forgeryChallengeNumber,
-    materialSelection: materialSelection === 'Resonator EXP' || materialSelection === 'Weapon EXP' ? materialSelection : defaults.materialSelection,
-    farmNightmareNestForDailyEcho: typeof (raw.farmNightmareNestForDailyEcho ?? raw.farm_nightmare_nest_for_daily_echo) === 'boolean'
-      ? Boolean(raw.farmNightmareNestForDailyEcho ?? raw.farm_nightmare_nest_for_daily_echo)
-      : defaults.farmNightmareNestForDailyEcho,
-  }
-}
-
-function okWWProfile(): OKWWProfile {
-  return okWwProfileDraft.value ?? configuredOKWWProfile()
-}
-
-function updateOKWWProfile<K extends keyof OKWWProfile>(key: K, value: OKWWProfile[K]): void {
-  if (configurationLocked.value) return
-  okWwProfileDraft.value = { ...okWWProfile(), [key]: value }
-  touchManualConfig('WW')
-}
-
-function updateOKWWFarmTarget(value: unknown): void {
-  if (value === 'Tacet Suppression' || value === 'Forgery Challenge' || value === 'Simulation Challenge') {
-    updateOKWWProfile('whichToFarm', value)
-  }
-}
-
-function updateOKWWMaterial(value: unknown): void {
-  if (value === 'Resonator EXP' || value === 'Weapon EXP' || value === 'Shell Credit') {
-    updateOKWWProfile('materialSelection', value)
-  }
-}
-
-function updateOKWWIndex(key: 'tacetSuppressionNumber' | 'forgeryChallengeNumber', value: unknown): void {
-  const index = Number(value)
-  if (Number.isInteger(index) && index >= 1) updateOKWWProfile(key, index)
 }
 
 function configuredEndfieldProfile(): EndfieldProfile {
@@ -783,7 +745,6 @@ function updateCZNProfile<K extends keyof CZNProfile>(key: K, value: CZNProfile[
 }
 
 function dailyToolProfilePatch(gameId: string): Record<string, unknown> | undefined {
-  if (gameId === 'WW') return { okWw: okWWProfile() }
   if (gameId === 'Endfield') return { endfield: endfieldProfile() }
   if (gameId === 'NTE') return { nte: nteProfile() }
   if (gameId === 'CZN') return { czn: cznProfile() }
@@ -825,7 +786,7 @@ function saveDailySelection(gameId: string): Promise<void> {
       const beforeStateVersion = snapshot.value.stateVersion
       const receipt = await manager.submitCommand('保存每日勾选', 'PATCH', '/config', {
         enabled: { [gameId]: dailyGameEnabled(gameId) },
-        dailyTodoSelection: { [gameId]: selectedDailyTodoDefinitionIds(gameId) },
+        ...(gameId !== 'WW' ? { dailyTodoSelection: { [gameId]: selectedDailyTodoDefinitionIds(gameId) } } : {}),
       })
       if (!receipt) {
         markDailySelectionFailure(gameId, true)
@@ -885,7 +846,7 @@ async function saveDailyGameConfig(gameId: string): Promise<boolean> {
           } : null,
         },
       },
-      dailyTodoSelection: { [gameId]: selectedDailyTodoDefinitionIds(gameId) },
+      ...(gameId !== 'WW' ? { dailyTodoSelection: { [gameId]: selectedDailyTodoDefinitionIds(gameId) } } : {}),
       ...(dailyToolProfilesPatch ? { dailyToolProfiles: dailyToolProfilesPatch } : {}),
       ...(gameId === 'WW' ? { game_accounts: { WW: gameAccountsPatch(wwAccounts.value) } } : {}),
     })
@@ -896,7 +857,6 @@ async function saveDailyGameConfig(gameId: string): Promise<boolean> {
       }
       if ((manualConfigRevisions.get(gameId) ?? 0) === manualRevision) {
         gamePathDrafts.value = Object.fromEntries(Object.entries(gamePathDrafts.value).filter(([id]) => id !== gameId))
-        if (gameId === 'WW') okWwProfileDraft.value = undefined
         if (gameId === 'Endfield') endfieldProfileDraft.value = undefined
         if (gameId === 'NTE') nteProfileDraft.value = undefined
         if (gameId === 'CZN') cznProfileDraft.value = undefined
@@ -1179,8 +1139,8 @@ async function resumeGameRun(runId: string): Promise<void> {
 
     <v-card class="panel span-12">
       <div class="panel-title">
-        <div><h2>每日游戏配置</h2><p class="soft-note">勾选决定一键每日的范围；鸣潮各账号共用每日选择，执行进度在下方按账号分别显示。</p></div>
-        <span class="soft-note">勾选自动保存；账号与参数可点击保存，开始前也会统一保存</span>
+        <div><h2>每日游戏配置</h2><p class="soft-note">勾选决定一键每日的范围；鸣潮每个账号分别设置路线、材料和每日步骤。</p></div>
+        <span class="soft-note">鸣潮账号内的修改点击保存；开始前也会统一保存</span>
       </div>
       <div v-if="allGames.length" class="daily-game-config-list">
         <details v-for="game in allGames" :key="game.gameId" class="daily-game-config">
@@ -1200,7 +1160,7 @@ async function resumeGameRun(runId: string): Promise<void> {
               />
               <span class="daily-game-title"><strong>{{ game.displayName }}</strong><small v-if="savingDailySelectionIds.has(game.gameId)">保存中</small></span>
             </span>
-            <span class="daily-game-config-summary">{{ dailyGameEnabled(game.gameId) ? '已纳入每日' : '未纳入每日' }} · 已选 {{ selectedDailyTodoDefinitionIds(game.gameId).length }} 项 · {{ integrationSummary(game.gameId) }}</span>
+            <span class="daily-game-config-summary">{{ dailyGameEnabled(game.gameId) ? '已纳入每日' : '未纳入每日' }} · <template v-if="game.gameId === 'WW'">{{ wwAccounts.filter((account) => account.enabled && accountDailySelection(account).length).length }} 个账号有每日项目</template><template v-else>已选 {{ selectedDailyTodoDefinitionIds(game.gameId).length }} 项</template> · {{ integrationSummary(game.gameId) }}</span>
           </summary>
           <div class="daily-game-config-body">
             <div class="game-setup-fields">
@@ -1293,73 +1253,43 @@ async function resumeGameRun(runId: string): Promise<void> {
             <v-alert v-if="integrationForGame(game.gameId)?.mappingStatus !== 'registered'" type="info" variant="tonal" density="compact">
               {{ integrationSummary(game.gameId) }}。当前选择仍会保存，开始时会再次确认能否自动执行。
             </v-alert>
-            <GameAccountEditor v-if="game.gameId === 'WW'" :model-value="wwAccounts" :disabled="configurationLocked || savingGameConfigId === 'WW'" @update:model-value="updateWwAccounts" />
-            <section v-if="game.gameId === 'WW'" class="tool-profile ok-ww-profile">
-              <strong>OK-WW 每日配置映射</strong>
-              <p class="soft-note">选好体力路线和材料后，软件会按这些选择自动完成每日；不需要按快捷键或操作底层导航。</p>
-              <div class="ok-ww-profile-grid">
-                <v-select
-                  :model-value="okWWProfile().whichToFarm"
-                  label="体力路线"
-                  :items="[
-                    { title: '无音区', value: 'Tacet Suppression' },
-                    { title: '锻造挑战', value: 'Forgery Challenge' },
-                    { title: '模拟领域', value: 'Simulation Challenge' },
-                  ]"
-                  density="compact"
-                  variant="outlined"
-                  hide-details
-                  :disabled="configurationLocked"
-                  @update:model-value="updateOKWWFarmTarget"
-                />
-                <v-select
-                  v-if="okWWProfile().whichToFarm === 'Tacet Suppression'"
-                  :model-value="okWWProfile().tacetSuppressionNumber"
-                  label="无音区目标编号"
-                  :items="tacetSuppressionOptions"
-                  density="compact"
-                  variant="outlined"
-                  hide-details
-                  :disabled="configurationLocked"
-                  @update:model-value="updateOKWWIndex('tacetSuppressionNumber', $event)"
-                />
-                <v-text-field
-                  v-else-if="okWWProfile().whichToFarm === 'Forgery Challenge'"
-                  :model-value="okWWProfile().forgeryChallengeNumber"
-                  label="锻造挑战目标编号"
-                  type="number"
-                  min="1"
-                  density="compact"
-                  variant="outlined"
-                  hide-details
-                  :disabled="configurationLocked"
-                  @update:model-value="updateOKWWIndex('forgeryChallengeNumber', $event)"
-                />
-                <v-select
-                  v-else
-                  :model-value="okWWProfile().materialSelection"
-                  label="模拟领域材料"
-                  :items="[
-                    { title: '共鸣者经验', value: 'Resonator EXP' },
-                    { title: '武器经验', value: 'Weapon EXP' },
-                    { title: '贝币', value: 'Shell Credit' },
-                  ]"
-                  density="compact"
-                  variant="outlined"
-                  hide-details
-                  :disabled="configurationLocked"
-                  @update:model-value="updateOKWWMaterial"
-                />
-              </div>
-              <v-checkbox
-                :model-value="okWWProfile().farmNightmareNestForDailyEcho"
-                label="通关 1 次梦魇聚落或残象聚落（+20 活跃，确保满 100）"
-                density="compact"
-                hide-details
-                :disabled="configurationLocked"
-                @update:model-value="updateOKWWProfile('farmNightmareNestForDailyEcho', Boolean($event))"
-              />
-            </section>
+            <GameAccountEditor v-if="game.gameId === 'WW'" :model-value="wwAccounts" :new-account="newWWAccount(configDocument?.config)" :disabled="configurationLocked || savingGameConfigId === 'WW'" @update:model-value="updateWwAccounts">
+              <template #default="{ account, index }">
+                <template v-for="view in [wwAccountView(account)]" :key="account.account_id ?? index">
+                  <div v-if="view.game" class="account-progress">
+                    <span>执行 <StatusBadge :state="todayRuntimeState(view.game, view.todos)" small /></span>
+                    <span>完成 <StatusBadge :state="knownDisplayState(view.game.acceptanceState, acceptanceDisplayStates)" small /></span>
+                    <span class="soft-note">{{ todayScopeUsable ? `${view.summary.requiredCompleted}/${view.summary.requiredTotal} 个本次必做项已执行` : '项目明细等待同步' }}</span>
+                    <v-btn size="small" variant="text" @click="router.push(accountRunLocation('WW', view.game.runId, account.account_id))">{{ todayGameNextAction(view.game, view.todos) }} · 详情</v-btn>
+                  </div>
+                  <p v-else class="soft-note">尚未保存账号；保存后由 Manager 建立独立的执行记录。</p>
+                  <OKWWProfileEditor :model-value="accountOKWWProfile(account)" :disabled="configurationLocked || savingGameConfigId === 'WW'" @update:model-value="updateWwAccountProfile(index, $event)" />
+                  <strong>本账号每日步骤 · 已选 {{ accountDailySelection(account).length }} 项</strong>
+                  <p v-if="!accountDailySelection(account).length" class="soft-note">未选择步骤，本账号不会加入每日队列。</p>
+                  <p v-if="wwDefinitions.error.value" class="soft-note">步骤目录读取失败；已保存的选择保持不变。</p>
+                  <div class="daily-item-list">
+                    <div v-for="row in view.rows" :key="row.todoDefinitionId" class="daily-item-config-row">
+                      <v-switch class="daily-item-toggle" :model-value="accountDailySelection(account).includes(row.todoDefinitionId)" :label="row.title" color="primary" inset density="compact" hide-details :disabled="configurationLocked || savingGameConfigId === 'WW'" @update:model-value="updateWwAccountSelection(index, row.todoDefinitionId, Boolean($event))" />
+                      <span class="daily-item-capability">{{ integrationOperation('WW', row.operation) ? '已可自动执行' : '这一步暂时不能自动执行' }}</span>
+                      <v-btn size="small" variant="tonal" color="info" :disabled="!row.todo || !stepEvidenceForTodo(row.todo).length" @click="row.todo && openStepScreenshots(`${game.displayName} · ${account.label}`, row.todo)">查看步骤截图</v-btn>
+                      <span v-if="row.todo?.status === 'completed'" class="today-todo-state complete">本步骤已执行</span>
+                      <StatusBadge v-else-if="row.todo" :state="row.todo.status" small />
+                      <span v-else class="soft-note">尚无执行记录</span>
+                    </div>
+                  </div>
+                  <section class="completion-evidence">
+                    <strong>本账号今日完成截图</strong>
+                    <div v-if="view.evidence.length" class="completion-evidence-grid">
+                      <a v-for="artifact in view.evidence" :key="artifact.artifactId" class="completion-evidence-card" :href="artifactContentUrl(artifact.artifactId)" target="_blank" rel="noopener">
+                        <img :src="artifactContentUrl(artifact.artifactId)" :alt="`${game.displayName} · ${account.label} ${evidenceKindLabel(artifact)}`" loading="lazy">
+                        <span>{{ evidenceKindLabel(artifact) }}</span><small>{{ formatTime(artifact.capturedAt) }}</small>
+                      </a>
+                    </div>
+                    <p v-else class="soft-note">本账号尚无同一次运行已经确认的完成截图；步骤截图可在各步骤旁查看。</p>
+                  </section>
+                </template>
+              </template>
+            </GameAccountEditor>
             <section v-if="game.gameId === 'Endfield'" class="tool-profile">
               <strong>终末地每日玩法草稿</strong>
               <p class="soft-note">这里的下拉会保存到 YeYu Gamer；等逐阶段 Adapter 接好后，保存的选择会原样下发，不会直接改上游工具文件。</p>
@@ -1421,7 +1351,7 @@ async function resumeGameRun(runId: string): Promise<void> {
               </div>
               <v-checkbox :model-value="true" label="持续到自然体力不足（固定安全策略）" density="compact" hide-details disabled />
             </section>
-            <div class="daily-item-list">
+            <div v-if="game.gameId !== 'WW'" class="daily-item-list">
               <div v-for="todo in dailyConfigTodos(game.gameId)" :key="todo.todoInstanceId" class="daily-item-config-row">
                 <v-switch
                   class="daily-item-toggle"
@@ -1440,15 +1370,13 @@ async function resumeGameRun(runId: string): Promise<void> {
                   <small v-else>这一步暂时不能自动执行</small>
                 </span>
                 <v-btn
-                  v-if="game.gameId !== 'WW'"
                   size="small"
                   variant="tonal"
                   color="info"
                   :disabled="!stepEvidenceForTodo(todo).length"
                   @click="openStepScreenshots(game.displayName, todo)"
                 >查看步骤截图</v-btn>
-                <span v-if="game.gameId !== 'WW'" class="today-todo-state" :class="{ complete: todo.status === 'completed' }">{{ todayTodoState(todo) }}</span>
-                <small v-else class="soft-note">各账号进度见下方</small>
+                <span class="today-todo-state" :class="{ complete: todo.status === 'completed' }">{{ todayTodoState(todo) }}</span>
               </div>
               <p v-if="!dailyConfigTodos(game.gameId).length" class="soft-note">这款游戏暂时没有可选的每日项目。</p>
             </div>
@@ -1610,11 +1538,12 @@ async function resumeGameRun(runId: string): Promise<void> {
                   <button class="game-link" @click="router.push(accountRunLocation(row.game.gameId, row.game.runId, row.accountId))"><strong>{{ row.game.displayName }}</strong></button>
                 </td>
                 <td>
-                  <button v-if="todayScopeUsable" class="todo-toggle" @click="toggleTodo(row.targetId)">
+                  <button v-if="todayScopeUsable && !row.accountId" class="todo-toggle" @click="toggleTodo(row.targetId)">
                     {{ row.summary.requiredCompleted }}/{{ row.summary.requiredTotal }} · 每日已执行项
                     <span v-if="row.summary.counts.blocked">· 阻塞 {{ row.summary.counts.blocked }}</span>
                     <span v-if="row.summary.counts.review_required">· 复核 {{ row.summary.counts.review_required }}</span>
                   </button>
+                  <span v-else-if="todayScopeUsable">{{ row.summary.requiredCompleted }}/{{ row.summary.requiredTotal }} · 每日已执行项</span>
                   <span v-else class="soft-note">项目明细等待同步</span>
                 </td>
                 <td><StatusBadge :state="todayRuntimeState(row.game, row.todos)" /></td>
@@ -1626,7 +1555,7 @@ async function resumeGameRun(runId: string): Promise<void> {
                 </td>
                 <td>{{ formatTime(row.game.updatedAt) }}</td>
               </tr>
-              <tr v-if="expanded.has(row.targetId)" class="todo-detail-row">
+              <tr v-if="!row.accountId && expanded.has(row.targetId)" class="todo-detail-row">
                 <td colspan="7">
                   <section class="daily-plan">
                     <div class="daily-plan-heading">
@@ -1641,22 +1570,6 @@ async function resumeGameRun(runId: string): Promise<void> {
                       <summary>查看可选每日项</summary>
                       <TodoChecklist :items="row.todos.filter((todo) => !todo.required)" compact product-mode />
                     </details>
-                    <div v-if="row.accountId" class="account-step-evidence">
-                      <div v-for="todo in row.todos" :key="todo.todoInstanceId">
-                        <span>{{ todo.title }} · {{ todayTodoState(todo) }}</span>
-                        <v-btn size="small" variant="tonal" :disabled="!stepEvidenceForTodo(todo).length" @click="openStepScreenshots(row.game.displayName, todo)">查看步骤截图</v-btn>
-                      </div>
-                    </div>
-                    <section v-if="row.accountId" class="completion-evidence">
-                      <strong>{{ row.game.displayName }} · 今日完成截图</strong>
-                      <div v-if="accountRewardEvidence(row.targetId).length" class="completion-evidence-grid">
-                        <a v-for="artifact in accountRewardEvidence(row.targetId)" :key="artifact.artifactId" class="completion-evidence-card" :href="artifactContentUrl(artifact.artifactId)" target="_blank" rel="noopener">
-                          <img :src="artifactContentUrl(artifact.artifactId)" :alt="`${row.game.displayName} ${evidenceKindLabel(artifact)}`" loading="lazy">
-                          <span>{{ evidenceKindLabel(artifact) }}</span><small>{{ formatTime(artifact.capturedAt) }}</small>
-                        </a>
-                      </div>
-                      <p v-else class="soft-note">本账号尚无同一次运行已经确认的完成截图；其他账号的截图不会显示在这里。</p>
-                    </section>
                     <p class="soft-note mt-3">所有必做项目完成后，还要确认同一次运行中的完成截图，才会显示为“确认完成”。</p>
                   </section>
                 </td>
@@ -1714,8 +1627,7 @@ async function resumeGameRun(runId: string): Promise<void> {
 .completion-evidence-card small { color: var(--muted); }
 .step-screenshot-dialog { overflow: hidden; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
-.account-step-evidence { display: grid; gap: 8px; }
-.account-step-evidence > div { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.account-progress { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
 .step-screenshot-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .step-screenshot-grid .completion-evidence-card img { aspect-ratio: 16 / 9; object-fit: contain; }
 .current-execution { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }

@@ -16,9 +16,9 @@ Manager 不实现游戏画面识别、坐标点击或游戏规则。这些属于
 | 数据 | 说明 |
 | --- | --- |
 | `gamePaths` | 每个游戏的游戏/工具路径 |
-| `dailyToolProfiles` | 工具参数，例如 OK-WW 的体力路线 |
-| `dailyTodoSelection` | 用户今天勾选的步骤 |
-| `gameAccounts` | 本机账号列表、顺序、启用状态与记住账号的标签；首版仅鸣潮允许显式配置 |
+| `dailyToolProfiles` | 其他游戏的工具参数；鸣潮的旧值仅作为账号初始化模板 |
+| `dailyTodoSelection` | 其他游戏勾选的步骤；鸣潮的旧值仅作为账号初始化模板 |
+| `gameAccounts` | 本机账号列表、顺序、启用状态、记住账号的标签，以及账号内独立的 `dailyTodoSelection` 与 `dailyToolProfiles.okWw`；当前仅鸣潮允许显式配置 |
 | Run / Todo 状态 | 本次队列和每一步的 `pending`、`running`、`completed`、`failed`、`skipped` |
 
 WebGUI 通过 API 编辑配置；Adapter 通过结构化事件更新运行事实。任何页面或外部调用者都不应直接写 SQLite 或伪造完成状态。

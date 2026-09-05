@@ -704,6 +704,18 @@ class TodoApiContractTests(unittest.TestCase):
         )
         self.assertEqual(selected.status_code, 202, selected.text)
 
+        # Shared defaults remain editable for future account initialization;
+        # an already initialized account keeps its independent selected scope.
+        accounts = self.client.get("/api/v1/config").json()["config"]["game_accounts"]["WW"]
+        self.assertGreater(len(accounts[0]["daily_todo_selection"]), 1)
+        accounts[0]["daily_todo_selection"] = [selected_definition_id]
+        account_selected = self.client.patch(
+            "/api/v1/config",
+            json={"game_accounts": {"WW": accounts}},
+            headers=self.mutation_headers("today-account-selected-scope"),
+        )
+        self.assertEqual(account_selected.status_code, 202, account_selected.text)
+
         manager = self.client.app.state.manager
         with manager.store.atomic():
             manager.store.connection.execute(

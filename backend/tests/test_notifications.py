@@ -199,6 +199,82 @@ class NotificationStoreAndWorkerTests(unittest.TestCase):
         dispatcher.run_once()
         self.assertEqual(len(transport.sent), 1)
 
+    def test_report_is_frozen_through_seed_render_restart_and_retry(self) -> None:
+        clock = MutableClock(datetime.now(timezone.utc) + timedelta(seconds=1))
+        dispatcher, transport = self.dispatcher(outcomes=["transient", "sent"], clock=clock)
+        rendered = SimpleNamespace(
+            outcome="blocked", subject="frozen subject", text_body="compact text",
+            html_body="<p>compact</p>", report_html="<details><summary>冻结详情</summary>same seal</details>",
+        )
+        with patch("yeyu_gamer_manager.services.notifications.dispatcher.render_batch_notification", return_value=rendered):
+            batch, _ = self.seal_execute(dispatcher)
+        original = self.store.list_notification_deliveries()[0]
+        self.assertEqual(original["report_html"], rendered.report_html)
+        self.store.close()
+        self.store = SqliteStore(self.root / "manager.sqlite3")
+        self.store.initialize()
+        dispatcher, transport = self.dispatcher(outcomes=["transient", "sent"], clock=clock)
+        with patch("yeyu_gamer_manager.services.notifications.dispatcher.render_batch_notification", side_effect=AssertionError("frozen notification must not render again")):
+            replay = self.store.seal_batch(batch["batch_id"], state="failed", result={})
+            self.assertEqual(replay["result"]["sealVersion"], original["seal_version"])
+            self.store._complete_notification_render(
+                original["notification_id"],
+                draft={"outcome": "blocked", "subject": "replacement", "text_body": "replacement", "html_body": "replacement", "report_html": "replacement", "attachment_refs": []},
+                policy=self.store.get_notification_policy(),
+            )
+            self.assertEqual(dispatcher.run_once(), 1)
+            failed = self.store.get_notification_delivery(original["notification_id"])
+            self.assertEqual(failed["report_html"], rendered.report_html)
+            clock.move_to(str(failed["next_attempt_at"]))
+            self.assertEqual(dispatcher.run_once(), 1)
+        self.assertEqual(len(transport.sent), 1)
+        self.assertEqual(transport.sent[0].report_html, rendered.report_html)
+        self.assertEqual(transport.sent[0].html_body, "<p>compact</p>")
+        self.assertEqual(transport.sent[0].message_id, original["message_id"])
+
+    def test_report_column_migration_preserves_legacy_frozen_notification(self) -> None:
+        dispatcher, _ = self.dispatcher()
+        rendered = SimpleNamespace(outcome="blocked", subject="legacy", text_body="legacy text", html_body="<p>legacy</p>", report_html="")
+        with patch("yeyu_gamer_manager.services.notifications.dispatcher.render_batch_notification", return_value=rendered):
+            self.seal_execute(dispatcher)
+        before = self.store.list_notification_deliveries()[0]
+        # The current schema's generated public-text guards mention every text
+        # column; remove only this fixture table's guards before emulating its
+        # pre-report schema. initialize() recreates guards after migration.
+        triggers = self.store.connection.execute(
+            "SELECT name FROM sqlite_temp_master WHERE type = 'trigger' AND tbl_name = 'notification_deliveries'"
+        ).fetchall()
+        for trigger in triggers:
+            self.store.connection.execute("DROP TRIGGER " + self.store._quote_identifier(str(trigger["name"])))
+        self.store.connection.execute("ALTER TABLE notification_deliveries DROP COLUMN report_html")
+        self.store.close()
+        self.store = SqliteStore(self.root / "manager.sqlite3")
+        with patch("yeyu_gamer_manager.services.notifications.dispatcher.render_batch_notification", side_effect=AssertionError("migration must not render")):
+            self.store.initialize()
+        self.assertEqual(self.store.get_notification_delivery(before["notification_id"]), before)
+        column = next(row for row in self.store.connection.execute("PRAGMA table_info(notification_deliveries)") if row["name"] == "report_html")
+        self.assertEqual(column["type"], "TEXT")
+        self.assertEqual(column["notnull"], 1)
+        self.assertEqual(column["dflt_value"], "''")
+        dispatcher, transport = self.dispatcher()
+        self.assertEqual(dispatcher.run_once(), 1)
+        self.assertEqual(transport.sent[0].report_html, "")
+
+    def test_direct_delivery_insert_keeps_optional_report_and_deduplicates_frozen_content(self) -> None:
+        batch = self.store.create_batch({"cadence": "daily", "mode": "execute", "state": "running", "game_ids": ["StarRail"], "requested_by": "test"})
+        policy = self.store.get_notification_policy()
+        draft = {"outcome": "blocked", "subject": "subject", "text_body": "text", "html_body": "<p>body</p>", "attachment_refs": []}
+        for version, report in ((1, ""), (2, "<p>frozen report</p>")):
+            with self.subTest(version=version), self.store._write_scope():
+                source = {**draft, **({"report_html": report} if report else {})}
+                row = self.store._create_notification_delivery_locked(batch_id=batch["batch_id"], seal_version=version, draft=source, policy=policy, timestamp=datetime.now(timezone.utc).isoformat())
+                replay = self.store._create_notification_delivery_locked(batch_id=batch["batch_id"], seal_version=version, draft={**source, "report_html": "changed"}, policy=policy, timestamp=datetime.now(timezone.utc).isoformat())
+                self.assertEqual(row["report_html"], report)
+                self.assertEqual(replay["report_html"], report)
+                self.assertEqual(replay["message_id"], row["message_id"])
+        with self.assertRaisesRegex(ValueError, "report HTML must be text"):
+            self.store._validate_notification_draft({**draft, "report_html": None})
+
     def test_plan_seal_has_no_delivery_and_execute_seal_is_irreversible_and_deduped(self) -> None:
         dispatcher, transport = self.dispatcher(configured=False)
         plan = self.store.create_batch(
@@ -283,6 +359,7 @@ class NotificationStoreAndWorkerTests(unittest.TestCase):
         self.assertEqual(broken_delivery["state"], "failed")
         self.assertEqual(broken_delivery["dispatch_gate"], "manual_review")
         self.assertEqual(broken_delivery["last_error_class"], "render_failed")
+        self.assertEqual(broken_delivery["report_html"], "")
         self.assertEqual(broken_delivery["attempt_count"], 0)
         self.assertIsNone(broken_delivery["next_attempt_at"])
         self.assertEqual(
@@ -637,6 +714,89 @@ class NotificationStoreAndWorkerTests(unittest.TestCase):
             delivery["last_error_class"], "attachment_contract_missing"
         )
         self.assertEqual(transport.sent, [])
+
+    def test_attachment_coverage_requires_each_accounts_exact_frozen_run(self) -> None:
+        dispatcher, transport = self.dispatcher()
+        now = datetime.now(timezone.utc)
+        contracts = [
+            {"gameId": "StarRail", "accountId": account, "runId": run_id,
+             "screenshotArtifactRefs": [artifact_id]}
+            for account, run_id, artifact_id in (
+                ("default", "run-a", "frame-a"), ("account-b", "run-b", "frame-b"),
+            )
+        ]
+        for artifact_id, run_id, extra in (
+            ("frame-a", "run-a", {}), ("frame-b", "run-b", {}),
+            ("wrong-account", "run-b", {"accountId": "default"}),
+            ("wrong-run", "older-run-b", {"accountId": "account-b"}),
+            ("unlisted-frame", "run-b", {}),
+        ):
+            (self.artifact_root / f"{artifact_id}.png").write_bytes(PNG_1X1)
+            self.store.create_resource("artifact", resource_id=artifact_id, state="captured", document={
+                "kind": "game-ui-claimed-reward", "contentType": "image/png",
+                "gameId": "StarRail", "runId": run_id, "capturedAt": now.isoformat(),
+                "relativePath": f"{artifact_id}.png", "sizeBytes": len(PNG_1X1),
+                "hash": hashlib.sha256(PNG_1X1).hexdigest(), **extra,
+            })
+        refs = ["frame-a", "frame-b", "wrong-account", "wrong-run", "unlisted-frame"]
+        # Wrong-account is named by the frozen contract but still fails its
+        # explicit identity; unlisted-frame fails the contract's own whitelist.
+        contracts[1]["screenshotArtifactRefs"].append("wrong-account")
+        frozen = {"completionContracts": contracts, "sealEvidenceArtifactIds": refs,
+                  "finalGameRunIds": ["run-a", "run-b", "older-run-b"],
+                  "sealedAt": (now + timedelta(seconds=1)).isoformat()}
+        batch = {"game_ids": ["StarRail"], "created_at": (now - timedelta(seconds=1)).isoformat(),
+                 "result": frozen}
+        delivery = {"batch_id": "batch-fixture", "outcome": "completed", "attachment_refs": refs}
+        with patch.object(self.store, "get_batch", return_value=batch):
+            for artifact_id, accepted in (("frame-b", True), ("wrong-account", False)):
+                preflight = dispatcher.artifacts.preflight_reference(
+                    artifact_id, allowed_games={"StarRail"}, allowed_runs={"run-b"},
+                    started_at=now - timedelta(seconds=1), sealed_at=now + timedelta(seconds=1),
+                    expected_contract=contracts[1],
+                )
+                self.assertEqual(preflight.accepted, accepted)
+            attachments, decisions = dispatcher.artifacts.resolve(delivery)
+            self.assertEqual([item.artifact_id for item in attachments], ["frame-a", "frame-b"])
+            self.assertEqual({item.reason for item in decisions if not item.accepted}, {"artifact_contract_scope_mismatch"})
+            self.assertEqual(dispatcher.artifacts.missing_contract_games(delivery, decisions), ())
+            only_a = tuple(item for item in decisions if item.artifact_id != "frame-b")
+            self.assertEqual(dispatcher.artifacts.missing_contract_games(delivery, only_a), ("StarRail::account-b",))
+            frozen["notificationBlockers"] = [{"gameId": "StarRail", "accountId": "default",
+                "screenshotUnavailableReason": "no frame for account a"}]
+            delivery["outcome"] = "blocked"
+            self.assertEqual(dispatcher.artifacts.missing_contract_games(delivery, only_a), ("StarRail::account-b",))
+            frozen["notificationBlockers"] = [{"gameId": "StarRail", "accountId": "account-b",
+                "targetId": "StarRail::account-b", "runId": "older-run-b", "screenshotUnavailableReason": "old run"}]
+            self.assertEqual(dispatcher.artifacts.missing_contract_games(delivery, only_a), ("StarRail::account-b",))
+            frozen["notificationBlockers"][0]["runId"] = "run-b"
+            self.assertEqual(dispatcher.artifacts.missing_contract_games(delivery, only_a), ())
+            # Legacy dictionary contracts/default artifacts remain compatible.
+            frozen["completionContracts"] = {"StarRail": {"runId": "run-a"}}
+            self.assertEqual(dispatcher.artifacts.missing_contract_games(delivery, only_a), ())
+        self.assertEqual(transport.sent, [])
+
+    def test_rendition_reads_verified_bytes_after_original_path_is_replaced(self) -> None:
+        verified = PNG_1X1 + b"x" * (notification_artifacts._RENDITION_THRESHOLD_BYTES + 1)
+        candidate = self.artifact_root / "replaced-frame.png"
+        replacement = b"different frame after validation"
+        candidate.write_bytes(replacement)
+        seen = []
+        def render(path):
+            seen.append(path)
+            self.assertNotEqual(path, candidate)
+            self.assertEqual(path.read_bytes(), verified)
+            self.assertEqual(candidate.read_bytes(), replacement)
+            return SimpleNamespace(content=b"bounded-jpeg", content_type="image/jpeg")
+        with patch.object(notification_artifacts, "render_mail_image", side_effect=render):
+            result = notification_artifacts.SealArtifactResolver._wire_rendition(candidate, verified, "image/png")
+        self.assertEqual(result, (b"bounded-jpeg", "image/jpeg"))
+        self.assertTrue(seen)
+        self.assertTrue(all(not path.exists() for path in seen))
+        self.assertEqual(candidate.read_bytes(), replacement)
+        with patch.object(notification_artifacts, "render_mail_image", side_effect=OSError("fixture decode failure")):
+            self.assertEqual(notification_artifacts.SealArtifactResolver._wire_rendition(candidate, verified, "image/png"),
+                             (verified, "image/png"))
 
     def test_artifact_reads_are_stat_gated_bounded_and_race_checked(self) -> None:
         dispatcher, _ = self.dispatcher()

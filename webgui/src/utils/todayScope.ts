@@ -1,5 +1,5 @@
 import type { BatchRun, GameState, TodoInstance } from '../api/contracts'
-import { accountIdOf } from './gameAccounts'
+import { accountIdOf, accountTargetId } from './gameAccounts'
 
 export type TodayScopeSource = 'current_batch' | 'saved_selection' | 'unknown'
 
@@ -9,6 +9,7 @@ export interface TodayScopeInput {
   todos: TodoInstance[]
   selectedTodoDefinitionIds: Record<string, string[]>
   enabledAccountIds?: Record<string, string[]>
+  selectedTodoDefinitionIdsByTarget?: Record<string, string[]>
 }
 
 export interface TodayScopeResult {
@@ -50,7 +51,9 @@ export function withFrozenBatchScope(batch: BatchRun | null | undefined, detail:
 function selectedGameIds(input: TodayScopeInput): string[] {
   return input.games
     .filter((game) => game.enabled !== false)
-    .filter((game) => (input.selectedTodoDefinitionIds[game.gameId] ?? []).length > 0)
+    .filter((game) => input.enabledAccountIds?.[game.gameId] && input.selectedTodoDefinitionIdsByTarget
+      ? input.enabledAccountIds[game.gameId]!.some((accountId) => (input.selectedTodoDefinitionIdsByTarget![accountTargetId(game.gameId, accountId)] ?? []).length > 0)
+      : (input.selectedTodoDefinitionIds[game.gameId] ?? []).length > 0)
     .filter((game) => !input.enabledAccountIds?.[game.gameId] || input.enabledAccountIds[game.gameId]!.length > 0)
     .map((game) => game.gameId)
 }
@@ -144,6 +147,9 @@ export function buildTodayScope(input: TodayScopeInput): TodayScopeResult {
     if (useBatch && frozen?.exact) return frozenTodoIdSet.has(todo.todoInstanceId)
     const enabledAccounts = input.enabledAccountIds?.[todo.gameId]
     if (enabledAccounts && !enabledAccounts.includes(accountIdOf(todo))) return false
+    if (enabledAccounts && input.selectedTodoDefinitionIdsByTarget) {
+      return (input.selectedTodoDefinitionIdsByTarget[accountTargetId(todo.gameId, accountIdOf(todo))] ?? []).includes(todo.todoDefinitionId)
+    }
     return (selectedByGame[todo.gameId] ?? []).includes(todo.todoDefinitionId)
   })
   const allFrozenTodosLoaded = !useBatch || !frozen?.exact || frozenTodoIdSet.size === todos.length

@@ -661,6 +661,7 @@ class SqliteStore:
                     subject TEXT NOT NULL,
                     text_body TEXT NOT NULL,
                     html_body TEXT NOT NULL,
+                    report_html TEXT NOT NULL DEFAULT '',
                     attachment_refs_json TEXT NOT NULL,
                     attempt_count INTEGER NOT NULL DEFAULT 0,
                     next_attempt_at TEXT,
@@ -694,6 +695,7 @@ class SqliteStore:
                     ON notification_attempts(notification_id, attempt_number);
                 """
             )
+            self._ensure_column("notification_deliveries", "report_html", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column("batches", "mode", "TEXT NOT NULL DEFAULT 'plan'")
             self._ensure_column(
                 "work_items", "artifact_refs_json", "TEXT NOT NULL DEFAULT '[]'"
@@ -1808,6 +1810,7 @@ class SqliteStore:
 
     def _ensure_column(self, table: str, column: str, declaration: str) -> None:
         allowed = {
+            ("notification_deliveries", "report_html"),
             ("batches", "mode"),
             ("work_items", "artifact_refs_json"),
             ("work_items", "allowed_capability_refs_json"),
@@ -3637,6 +3640,8 @@ class SqliteStore:
         outcome = str(draft["outcome"])
         if outcome not in {"completed", "blocked"}:
             raise ValueError("notification draft outcome is invalid")
+        if not isinstance(draft.get("report_html", ""), str):
+            raise ValueError("notification report HTML must be text")
         attachment_refs = list(draft.get("attachment_refs", []))
         if any(
             not isinstance(item, str)
@@ -3701,10 +3706,10 @@ class SqliteStore:
             INSERT INTO notification_deliveries(
                 notification_id, batch_id, seal_version, channel,
                 recipient_binding_id, message_id, state, dispatch_gate,
-                outcome, subject, text_body, html_body, attachment_refs_json,
+                outcome, subject, text_body, html_body, report_html, attachment_refs_json,
                 attempt_count, next_attempt_at, lease_owner, lease_token,
                 lease_expires_at, last_error_class, sent_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, '', '', '', '[]', 0,
+            ) VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, '', '', '', '', '[]', 0,
                       NULL, NULL, NULL, NULL, 'render_pending', NULL, ?, ?)
             ON CONFLICT(batch_id, seal_version, channel, recipient_binding_id) DO NOTHING
             """,
@@ -3773,7 +3778,7 @@ class SqliteStore:
                 """
                 UPDATE notification_deliveries SET
                     state = 'draft', dispatch_gate = ?, outcome = ?, subject = ?,
-                    text_body = ?, html_body = ?, attachment_refs_json = ?,
+                    text_body = ?, html_body = ?, report_html = ?, attachment_refs_json = ?,
                     next_attempt_at = ?, last_error_class = ?, updated_at = ?
                 WHERE notification_id = ? AND attempt_count = 0
                   AND last_error_class IN ('render_pending', 'render_failed')
@@ -3784,6 +3789,7 @@ class SqliteStore:
                     str(draft["subject"]),
                     str(draft["text_body"]),
                     str(draft["html_body"]),
+                    draft.get("report_html", ""),
                     _json(attachment_refs),
                     next_attempt_at,
                     last_error_class,
@@ -3867,10 +3873,10 @@ class SqliteStore:
             INSERT INTO notification_deliveries(
                 notification_id, batch_id, seal_version, channel,
                 recipient_binding_id, message_id, state, dispatch_gate,
-                outcome, subject, text_body, html_body, attachment_refs_json,
+                outcome, subject, text_body, html_body, report_html, attachment_refs_json,
                 attempt_count, next_attempt_at, lease_owner, lease_token,
                 lease_expires_at, last_error_class, sent_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, 0, ?, NULL,
+            ) VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL,
                       NULL, NULL, ?, NULL, ?, ?)
             ON CONFLICT(batch_id, seal_version, channel, recipient_binding_id) DO NOTHING
             """,
@@ -3886,6 +3892,7 @@ class SqliteStore:
                 str(draft["subject"]),
                 str(draft["text_body"]),
                 str(draft["html_body"]),
+                draft.get("report_html", ""),
                 _json(attachment_refs),
                 next_attempt_at,
                 last_error_class,
@@ -3943,6 +3950,7 @@ class SqliteStore:
             "subject": row["subject"],
             "text_body": row["text_body"],
             "html_body": row["html_body"],
+            "report_html": row["report_html"],
             "attachment_refs": _decode(row["attachment_refs_json"], []),
             "attempt_count": int(row["attempt_count"]),
             "next_attempt_at": row["next_attempt_at"],

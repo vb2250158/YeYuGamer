@@ -82,6 +82,7 @@ class NotificationDispatcher:
             "subject": rendered.subject,
             "text_body": rendered.text_body,
             "html_body": rendered.html_body,
+            "report_html": rendered.report_html,
             "attachment_refs": attachment_refs,
             "secret_state": secret_state,
             "dispatch_disposition": self._dispatch_disposition(batch_id),
@@ -205,6 +206,7 @@ class NotificationDispatcher:
                 subject=str(claimed["subject"]),
                 text_body=str(claimed["text_body"]),
                 html_body=str(claimed["html_body"]),
+                report_html=str(claimed["report_html"]),
                 attachments=attachments,
             )
             try:

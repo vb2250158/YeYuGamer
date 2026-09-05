@@ -40,6 +40,23 @@ function todo(gameId: string, id: string, day: string, status: TodoInstance['sta
 }
 
 describe('Today scope', () => {
+  it('counts each account own selected steps rather than the union of WW selections', () => {
+    const make = (accountId: string, definitionId: string, status: TodoInstance['status']) => ({
+      ...todo('WW', definitionId, '2026-09-06', status), accountId, todoInstanceId: `${accountId}-${definitionId}`,
+    })
+    const todos = [make('A', 'claim', 'completed'), make('A', 'stamina', 'blocked'), make('B', 'claim', 'completed'), make('B', 'stamina', 'pending')]
+    const input = { games: [game('WW')], todos, enabledAccountIds: { WW: ['A', 'B'] },
+      selectedTodoDefinitionIds: { WW: ['claim', 'stamina'] }, selectedTodoDefinitionIdsByTarget: { 'WW::A': ['claim'], 'WW::B': ['stamina'] } }
+    const scope = buildTodayScope(input)
+    expect(scope.todos).toEqual([todos[0], todos[3]])
+    expect([scope.requiredCompleted, scope.requiredTotal, scope.blocked]).toEqual([1, 2, 0])
+    expect(buildTodayScope({ ...input, selectedTodoDefinitionIdsByTarget: { 'WW::A': [], 'WW::B': [] } }).gameIds).toEqual([])
+    const activeBatch: BatchRun = { batchId: 'frozen', cadence: 'daily', state: 'running', gameIds: ['WW'], result: {
+      todoScope: { games: [{ gameId: 'WW', completionTodoInstanceIds: [todos[1]!.todoInstanceId] }] },
+    } }
+    expect(buildTodayScope({ ...input, activeBatch }).todos).toEqual([todos[1]])
+  })
+
   it('keeps the locked game and date visible while a pre-Adapter snapshot omits Todo details', () => {
     const activeBatch: BatchRun = {
       batchId: 'pgr-dorm-run', cadence: 'daily', state: 'running', gameIds: ['PGR'],

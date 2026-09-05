@@ -1,21 +1,59 @@
-import { recordOf, type AccountTarget, type AgentWorkItem, type BatchRun, type EvidenceArtifact, type GameAccount, type GameDetail, type GameRunRecord, type GameState, type TodoInstance } from '../api/contracts'
+import { recordOf, type AccountTarget, type AgentWorkItem, type BatchRun, type EvidenceArtifact, type GameAccount, type GameDetail, type GameRunRecord, type GameState, type OKWWProfile, type TodoDefinition, type TodoInstance } from '../api/contracts'
 import { acceptedCompletionEvidence } from './todayEvidence'
 
 export const defaultAccountId = 'default'
 export const accountIdOf = (value: { accountId?: string }) => value.accountId ?? defaultAccountId
 export const accountTargetId = (gameId: string, accountId: string) => accountId === defaultAccountId ? gameId : `${gameId}::${accountId}`
 
+export function readOKWWProfile(value: unknown): OKWWProfile {
+  const raw = recordOf(value)
+  const farm = raw.whichToFarm ?? raw.which_to_farm
+  const material = raw.materialSelection ?? raw.material_selection
+  const tacet = raw.tacetSuppressionNumber ?? raw.tacet_suppression_number
+  const forgery = raw.forgeryChallengeNumber ?? raw.forgery_challenge_number
+  const echo = raw.farmNightmareNestForDailyEcho ?? raw.farm_nightmare_nest_for_daily_echo
+  return {
+    whichToFarm: farm === 'Forgery Challenge' || farm === 'Simulation Challenge' ? farm : 'Tacet Suppression',
+    tacetSuppressionNumber: typeof tacet === 'number' ? tacet : 1,
+    forgeryChallengeNumber: typeof forgery === 'number' ? forgery : 1,
+    materialSelection: material === 'Resonator EXP' || material === 'Weapon EXP' ? material : 'Shell Credit',
+    farmNightmareNestForDailyEcho: typeof echo === 'boolean' ? echo : true,
+  }
+}
+
+/** Legacy shared values seed a new account only; saved account values win. */
+export function newWWAccount(config: unknown, label = '新账号'): GameAccount {
+  const raw = recordOf(config)
+  const selection = recordOf(raw.daily_todo_selection ?? raw.dailyTodoSelection).WW
+  const profiles = recordOf(raw.daily_tool_profiles ?? raw.dailyToolProfiles)
+  return {
+    label, enabled: true, saved_account_label: '',
+    daily_todo_selection: Array.isArray(selection) ? selection.filter((item): item is string => typeof item === 'string') : [],
+    daily_tool_profiles: { ok_ww: readOKWWProfile(profiles.ok_ww ?? profiles.okWw) },
+  }
+}
+
+export const accountDailySelection = (account: GameAccount): string[] => account.daily_todo_selection ?? []
+export const accountOKWWProfile = (account: GameAccount): OKWWProfile => readOKWWProfile(account.daily_tool_profiles?.ok_ww)
+
 export function configuredGameAccounts(config: unknown, gameId: string): GameAccount[] {
   const raw = recordOf(config)
   const accounts = recordOf(raw.game_accounts ?? raw.gameAccounts)[gameId]
-  if (!Array.isArray(accounts)) return [{ account_id: defaultAccountId, label: '当前账号', enabled: true, saved_account_label: '' }]
+  if (!Array.isArray(accounts)) return [{ ...(gameId === 'WW' ? newWWAccount(config, '当前账号') : { label: '当前账号', enabled: true, saved_account_label: '' }), account_id: defaultAccountId }]
   return accounts.map((value) => {
     const row = recordOf(value)
+    const initial = gameId === 'WW' ? newWWAccount(config) : undefined
+    const selection = row.daily_todo_selection ?? row.dailyTodoSelection
+    const profiles = row.daily_tool_profiles ?? row.dailyToolProfiles
     return {
       account_id: typeof row.account_id === 'string' ? row.account_id : undefined,
       label: typeof row.label === 'string' ? row.label : '',
       enabled: row.enabled === true,
       saved_account_label: typeof row.saved_account_label === 'string' ? row.saved_account_label : '',
+      ...(initial ? {
+        daily_todo_selection: Array.isArray(selection) ? selection.filter((item): item is string => typeof item === 'string') : initial.daily_todo_selection,
+        daily_tool_profiles: profiles == null ? initial.daily_tool_profiles : { ok_ww: readOKWWProfile(recordOf(profiles).ok_ww ?? recordOf(profiles).okWw) },
+      } : {}),
     }
   })
 }
@@ -26,6 +64,8 @@ export function gameAccountsPatch(accounts: readonly GameAccount[]): GameAccount
     ...(account.account_id ? { account_id: account.account_id } : {}),
     label: account.label.trim(), enabled: account.enabled,
     saved_account_label: account.saved_account_label.trim(),
+    ...(account.daily_todo_selection != null ? { daily_todo_selection: [...account.daily_todo_selection] } : {}),
+    ...(account.daily_tool_profiles != null ? { daily_tool_profiles: { ok_ww: accountOKWWProfile(account) } } : {}),
   }))
 }
 
@@ -47,6 +87,17 @@ export function accountTodos(todos: readonly TodoInstance[], gameId: string, acc
   return todos.filter((todo) => todo.gameId === gameId && accountIdOf(todo) === accountId)
 }
 
+/** Catalog entries configure a new account; only its own instances supply state. */
+export function accountDailyConfigRows(account: GameAccount, definitions: readonly TodoDefinition[], todos: readonly TodoInstance[]) {
+  const ownTodos = account.account_id ? accountTodos(todos, 'WW', account.account_id).filter((todo) => todo.cadence === 'daily') : []
+  const catalog = definitions.filter((definition) => definition.gameId === 'WW' && definition.cadence === 'daily' && definition.active)
+  const rows = new Map([...catalog, ...ownTodos].map((item) => [item.todoDefinitionId, {
+    todoDefinitionId: item.todoDefinitionId, title: item.title, operation: item.operation, orderIndex: item.orderIndex,
+    todo: ownTodos.find((todo) => todo.todoDefinitionId === item.todoDefinitionId),
+  }]))
+  return [...rows.values()].sort((a, b) => a.orderIndex - b.orderIndex)
+}
+
 export function todayAccountTargets(gameId: string, accounts: readonly GameAccount[], batch?: BatchRun | null): AccountTarget[] {
   if (batch?.cadence === 'daily') {
     const targets = batch.result?.accountTargets
@@ -56,7 +107,8 @@ export function todayAccountTargets(gameId: string, accounts: readonly GameAccou
       ? [{ targetId: gameId, gameId, accountId: defaultAccountId, accountLabel: '当前账号' }]
       : []
   }
-  return accounts.filter((account) => account.enabled && account.account_id).map((account) => ({
+  return accounts.filter((account) => account.enabled && account.account_id
+    && (account.daily_todo_selection == null || account.daily_todo_selection.length > 0)).map((account) => ({
     targetId: accountTargetId(gameId, account.account_id!), gameId,
     accountId: account.account_id!, accountLabel: account.label || '未命名账号',
   }))

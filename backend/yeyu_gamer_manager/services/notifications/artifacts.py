@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from ...store.sqlite_store import RecordNotFound, SqliteStore
+from ..account_scopes import DEFAULT_ACCOUNT_ID, account_target_id
 from .renditions import render_mail_image
 from .transport import NotificationAttachment
 
@@ -100,6 +102,49 @@ def _same_file_snapshot(before: os.stat_result, after: os.stat_result) -> bool:
     )
 
 
+def _contract_targets(sealed_result: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Retain every frozen account/Run contract, including legacy default keys."""
+    contracts = sealed_result.get("completionContracts")
+    if isinstance(contracts, dict):
+        entries = [
+            {"gameId": key, **value}
+            for key, value in contracts.items() if isinstance(value, dict)
+        ]
+    elif isinstance(contracts, list):
+        entries = [value for value in contracts if isinstance(value, dict)]
+    else:
+        return []
+    targets = []
+    for contract in entries:
+        game_id = contract.get("gameId")
+        if not isinstance(game_id, str) or not game_id:
+            continue
+        account_id = contract.get("accountId", DEFAULT_ACCOUNT_ID)
+        target_id = account_target_id(game_id, account_id)
+        targets.append((target_id, contract))
+    return targets
+
+
+def _matches_contract(
+    document: dict[str, Any], artifact_id: str, contract: dict[str, Any]
+) -> bool:
+    """An absent artifact account is derived only from its exact frozen Run."""
+    run_id = contract.get("runId")
+    account_id = contract.get("accountId", DEFAULT_ACCOUNT_ID)
+    if (
+        not isinstance(run_id, str) or not run_id
+        or not isinstance(account_id, str) or not account_id
+        or document.get("gameId") != contract.get("gameId")
+        or document.get("runId") != run_id
+        or ("accountId" in document and document["accountId"] != account_id)
+    ):
+        return False
+    references = contract.get("screenshotArtifactRefs")
+    return "screenshotArtifactRefs" not in contract or (
+        isinstance(references, list) and artifact_id in references
+    )
+
+
 class SealArtifactResolver:
     def __init__(self, store: SqliteStore, artifact_root: Path) -> None:
         self.store = store
@@ -116,6 +161,7 @@ class SealArtifactResolver:
         allowed_runs: set[str],
         started_at: datetime,
         sealed_at: datetime,
+        expected_contract: dict[str, Any] | None = None,
     ) -> AttachmentDecision:
         """Validate one future seal allowlist entry without mutating state.
 
@@ -135,6 +181,7 @@ class SealArtifactResolver:
             allowed_runs=allowed_runs,
             started_at=started_at,
             sealed_at=sealed_at,
+            expected_contract=expected_contract,
         )
         return AttachmentDecision(
             artifact_id,
@@ -160,6 +207,7 @@ class SealArtifactResolver:
             )
         batch = self.store.get_batch(str(delivery["batch_id"]))
         sealed_result = batch.get("result", {})
+        contracts = _contract_targets(sealed_result)
         whitelist = {
             str(item)
             for item in sealed_result.get("sealEvidenceArtifactIds", [])
@@ -190,6 +238,12 @@ class SealArtifactResolver:
                 decisions.append(AttachmentDecision(artifact_id, False, reason))
                 continue
             document, candidate, data = reason
+            if contracts and not any(
+                _matches_contract(document, artifact_id, contract)
+                for _, contract in contracts
+            ):
+                decisions.append(AttachmentDecision(artifact_id, False, "artifact_contract_scope_mismatch"))
+                continue
             content_type = str(document["contentType"])
             wire_data, wire_type = self._wire_rendition(candidate, data, content_type)
             if total_bytes + len(wire_data) > _MAX_TOTAL_BYTES:
@@ -222,7 +276,12 @@ class SealArtifactResolver:
         if len(data) <= _RENDITION_THRESHOLD_BYTES:
             return data, content_type
         try:
-            rendition = render_mail_image(candidate)
+            # The original path can change after validation. Decode only a
+            # private copy of the bytes whose sealed hash was just verified.
+            with tempfile.TemporaryDirectory(prefix="yeyu-mail-rendition-") as directory:
+                verified_copy = Path(directory) / ("verified" + _ALLOWED_MIME[content_type])
+                verified_copy.write_bytes(data)
+                rendition = render_mail_image(verified_copy)
         except Exception:
             rendition = None
         if rendition is None or len(rendition.content) >= len(data):
@@ -234,11 +293,11 @@ class SealArtifactResolver:
         delivery: dict[str, Any],
         decisions: tuple[AttachmentDecision, ...],
     ) -> tuple[str, ...]:
-        """Return CompletionContract games without an accepted screenshot.
+        """Return frozen account targets without their own Run's screenshot.
 
         Older sealed batches that predate CompletionContract integration do not
         acquire a new dispatch requirement retroactively.  A completed notice
-        requires one resolver-accepted screenshot per named game.  A blocked
+        requires one resolver-accepted screenshot per account/Run. A blocked
         notice may substitute only the Manager-frozen typed explanation in
         ``notificationBlockers[].screenshotUnavailableReason``.  This is checked
         again after the delivery lease is claimed so a removed or changed file
@@ -247,55 +306,39 @@ class SealArtifactResolver:
 
         batch = self.store.get_batch(str(delivery["batch_id"]))
         sealed_result = batch.get("result", {})
-        contracts = sealed_result.get("completionContracts")
-        if not isinstance(contracts, (dict, list)) or not contracts:
+        contracts = _contract_targets(sealed_result)
+        if not contracts:
             return ()
-        if isinstance(contracts, dict):
-            required_games = {
-                str(game_id)
-                for game_id, contract in contracts.items()
-                if isinstance(game_id, str)
-                and game_id
-                and isinstance(contract, dict)
-            }
-        else:
-            required_games = {
-                str(contract.get("gameId"))
-                for contract in contracts
-                if isinstance(contract, dict)
-                and isinstance(contract.get("gameId"), str)
-                and contract.get("gameId")
-            }
         accepted_ids = {
             decision.artifact_id for decision in decisions if decision.accepted
-        }
-        covered_games: set[str] = set()
+        } & set(delivery.get("attachment_refs", [])) & set(sealed_result.get("sealEvidenceArtifactIds", []))
+        documents: dict[str, dict[str, Any]] = {}
         for artifact_id in accepted_ids:
             try:
                 resource = self.store.get_resource("artifact", artifact_id)
             except RecordNotFound:
                 continue
-            document = resource.get("document", {})
-            game_id = document.get("gameId")
-            if isinstance(game_id, str):
-                covered_games.add(game_id)
-        missing_games = required_games - covered_games
-        if delivery.get("outcome") != "blocked":
-            return tuple(sorted(missing_games))
-
-        # A blocked run can fail before capture becomes possible.  It may still
-        # notify the operator, but only when the immutable seal explicitly says
-        # why each game's screenshot is unavailable.  The template surfaces
-        # the same typed blocker; the dispatcher never invents an excuse.
-        typed_unavailable_games = {
-            str(item.get("gameId"))
-            for item in sealed_result.get("notificationBlockers", [])
-            if isinstance(item, dict)
-            and isinstance(item.get("gameId"), str)
-            and isinstance(item.get("screenshotUnavailableReason"), str)
-            and item.get("screenshotUnavailableReason", "").strip()
-        }
-        return tuple(sorted(missing_games - typed_unavailable_games))
+            documents[artifact_id] = resource.get("document", {})
+        missing: set[str] = set()
+        for target_id, contract in contracts:
+            if any(_matches_contract(document, artifact_id, contract)
+                   for artifact_id, document in documents.items()):
+                continue
+            # Legacy blockers omit runId. They may cover only the same frozen
+            # account; new blockers also pin the exact final Run.
+            unavailable = delivery.get("outcome") == "blocked" and any(
+                isinstance(item, dict)
+                and item.get("gameId") == contract.get("gameId")
+                and item.get("accountId", DEFAULT_ACCOUNT_ID) == contract.get("accountId", DEFAULT_ACCOUNT_ID)
+                and ("runId" not in item or item["runId"] == contract.get("runId"))
+                and ("targetId" not in item or item["targetId"] == target_id)
+                and isinstance(item.get("screenshotUnavailableReason"), str)
+                and bool(item["screenshotUnavailableReason"].strip())
+                for item in sealed_result.get("notificationBlockers", [])
+            )
+            if not unavailable:
+                missing.add(target_id)
+        return tuple(sorted(missing))
 
     def _validate_reference(
         self,
@@ -306,6 +349,7 @@ class SealArtifactResolver:
         allowed_runs: set[str],
         started_at: datetime | None,
         sealed_at: datetime | None,
+        expected_contract: dict[str, Any] | None = None,
     ) -> str | tuple[dict[str, Any], Path, bytes]:
         if artifact_id not in whitelist:
             return "not_in_seal_whitelist"
@@ -323,6 +367,8 @@ class SealArtifactResolver:
             return "artifact_game_mismatch"
         if document.get("runId") not in allowed_runs:
             return "artifact_run_mismatch"
+        if expected_contract is not None and not _matches_contract(document, artifact_id, expected_contract):
+            return "artifact_contract_scope_mismatch"
         captured_at = _timestamp(document.get("capturedAt"))
         if (
             captured_at is None

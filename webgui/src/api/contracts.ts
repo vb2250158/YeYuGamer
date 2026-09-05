@@ -62,11 +62,21 @@ export interface GamePathConfig {
 }
 
 /** Config uses snake_case; newly added rows receive their identity from Manager. */
+export interface OKWWProfile {
+  whichToFarm: 'Tacet Suppression' | 'Forgery Challenge' | 'Simulation Challenge'
+  tacetSuppressionNumber: number
+  forgeryChallengeNumber: number
+  materialSelection: 'Resonator EXP' | 'Weapon EXP' | 'Shell Credit'
+  farmNightmareNestForDailyEcho: boolean
+}
+
 export interface GameAccount {
   account_id?: string
   label: string
   enabled: boolean
   saved_account_label: string
+  daily_todo_selection?: string[] | null
+  daily_tool_profiles?: { ok_ww?: OKWWProfile } | null
 }
 
 export interface GameRunRecord {

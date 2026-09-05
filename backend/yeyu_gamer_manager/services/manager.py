@@ -148,6 +148,7 @@ from .batch_projection import project_batch_record
 from .account_scopes import (
     DEFAULT_ACCOUNT_ID, account_target_id, daily_account_targets,
     enabled_account_ids, game_accounts, resolve_game_account, run_target_id, validate_account_patch,
+    freeze_account_snapshot, frozen_run_tool_profiles, initialize_ww_account_configs,
 )
 from .capability_catalog import build_capability_registry
 from .manager_errors import ExecutionUnavailable, ManagerConflict, ManagerValidation
@@ -173,6 +174,7 @@ from .notifications import (
     SmtpNotificationTransport,
 )
 from .notifications.artifacts import _has_reparse_point, _same_file_snapshot
+from .notifications.screenshots import is_reward_capture
 from .notifications.secrets import NotificationSecretProvider
 from .notifications.transport import NotificationTransport
 from .completion_contract import (
@@ -235,7 +237,7 @@ def _dump(model: Any) -> dict[str, Any]:
 
 
 class ManagerService:
-    VERSION = "0.3.6"
+    VERSION = "0.3.7"
     # A pending Agent completion review may delay the batch seal (and the round
     # mail) for at most this long.  After that the machine adjudication seals
     # the batch; unreviewed runs stay review_required.
@@ -342,6 +344,14 @@ class ManagerService:
         # Initialization is a Manager lifecycle mutation, never a GET side
         # effect. Long-running processes use the explicit reconcile/reset API
         # when a new game period begins.
+        if "WW" in known_game_ids:
+            current_config = self.store.get_config()["values"]
+            account_config = initialize_ww_account_configs(current_config, [
+                str(item["todo_definition_id"]) for item in eligible_definitions
+                if item["game_id"] == "WW" and item["cadence"] == "daily" and item.get("required", True)
+            ])
+            if account_config != current_config.get("game_accounts", {}):
+                self.store.update_config({"game_accounts": account_config})
         startup_items = self._todo_instance_candidates()
         self.store.reconcile_todo_instances(
             startup_items,
@@ -4128,6 +4138,13 @@ class ManagerService:
         key = run_target_id(run)
         return self._batch_todo_scope({key: plan}, [key])
 
+    def _frozen_run_todo_plan(self, run: dict[str, Any]) -> dict[str, Any]:
+        return self.manager_todos._todo_plans_for_targets(
+            [{"gameId": run["game_id"], "accountId": run.get("account_id", DEFAULT_ACCOUNT_ID)}],
+            str(run["cadence"]),
+            frozen_todos_by_target={run_target_id(run): self._frozen_todos_for_run(run)},
+        )[0]
+
     def _completion_policy_context(
         self,
         *,
@@ -4685,9 +4702,22 @@ class ManagerService:
             if artifact_id in documents
             and documents[artifact_id].get("runAttemptId") == decision.run_attempt_id
         ]
+        instances = [
+            _dump(todo) for todo in self._frozen_todos_for_run(
+                self.store.get_game_run(decision.run_id)
+            )
+        ]
+
+        def reward_frame(artifact_id: str) -> bool:
+            return is_reward_capture(
+                {**documents[artifact_id], "artifactId": artifact_id},
+                decision.game_id, instances,
+            )
+
         selected: list[str] = []
         if decision.accepted_done and accepted:
-            pool = sorted(accepted, key=rank)
+            pool = [*sorted((item for item in accepted if reward_frame(item)), key=rank),
+                    *sorted(accepted, key=rank)]
         else:
             # Failure/review story: the newest "after" frame (failure scene),
             # then the newest "before" frame (progress panel), then accepted
@@ -4708,7 +4738,9 @@ class ManagerService:
                 ),
                 key=rank,
             )
-            pool = [*after[:1], *before[:1], *sorted(accepted, key=rank), *after[1:], *sorted(current_attempt, key=rank)]
+            reward = sorted((item for item in current_attempt if reward_frame(item)), key=rank)
+            pool = [*reward[:1], *after[:1], *before[:1], *sorted(accepted, key=rank),
+                    *after[1:], *sorted(current_attempt, key=rank)]
         for artifact_id in pool:
             if artifact_id not in selected:
                 selected.append(artifact_id)
@@ -4738,6 +4770,10 @@ class ManagerService:
             role = "现场画面"
         return {
             "artifactId": artifact_id,
+            "targetId": account_target_id(decision.game_id, decision.account_id),
+            "gameId": decision.game_id,
+            "accountId": decision.account_id,
+            "runId": decision.run_id,
             "kind": kind,
             "role": role,
             "operation": document.get("operation"),
@@ -4807,6 +4843,7 @@ class ManagerService:
         )
         completion_contracts: list[dict[str, Any]] = []
         decisions: list[CompletionContractDecision] = []
+        run_states_by_target: dict[str, str] = {}
         accepted_screenshot_candidates: list[tuple[str, str]] = []
         mail_screenshots_by_game: dict[str, list[dict[str, Any]]] = {}
         for run_id in final_run_ids or []:
@@ -4817,6 +4854,7 @@ class ManagerService:
                 )
             if run_target_id(run) not in target_by_id:
                 raise ManagerValidation("final GameRun account differs from the batch scope")
+            run_states_by_target[run_target_id(run)] = str(run["state"])
             contract_snapshot = self._completion_contract_snapshot(run_id)
             _, run_policies, policy_status, _ = self._completion_policy_context(
                 run=run,
@@ -4844,7 +4882,7 @@ class ManagerService:
                 }
             )
             accepted_screenshot_candidates.extend(
-                (decision.game_id, artifact_id)
+                (account_target_id(decision.game_id, decision.account_id), artifact_id)
                 for artifact_id in self._mail_screenshot_selection(decision)
             )
             mail_screenshots_by_game.setdefault(decision.game_id, []).extend([
@@ -4894,7 +4932,6 @@ class ManagerService:
         }
         completed_ids = set(completed_run_ids or [])
         contract_game_ids = set(decisions_by_game)
-        candidate_game_ids = set(game_ids)
         full_contract_coverage = contract_game_ids == set(target_ids)
         run_outcomes_complete = all(
             decision.run_id in completed_ids
@@ -4923,25 +4960,30 @@ class ManagerService:
         lineage_document = dict(existing["result"].get("batchLineage", {}))
         notification_blockers: list[dict[str, Any]] = []
         preflight_at = utc_now()
-        allowed_runs = set(final_run_ids or [])
         notification_screenshot_decisions: list[dict[str, Any]] = []
         allowed_screenshots_by_game: dict[str, list[str]] = {
             game_id: [] for game_id in game_ids
         }
-        for game_id, artifact_id in accepted_screenshot_candidates:
+        for target_id, artifact_id in accepted_screenshot_candidates:
+            decision = decisions_by_game[target_id]
+            game_id = decision.game_id
             artifact_decision = (
                 self.notification_dispatcher.artifacts.preflight_reference(
                     artifact_id,
-                    allowed_games=candidate_game_ids,
-                    allowed_runs=allowed_runs,
+                    allowed_games={game_id},
+                    allowed_runs={decision.run_id},
                     started_at=self._contract_datetime(existing["created_at"]),
                     sealed_at=preflight_at,
+                    expected_contract=decision.model_dump(mode="json", by_alias=True),
                 )
             )
             notification_screenshot_decisions.append(
                 {
                     "artifactId": artifact_id,
                     "gameId": game_id,
+                    "accountId": decision.account_id,
+                    "targetId": target_id,
+                    "runId": decision.run_id,
                     "accepted": artifact_decision.accepted,
                     "reasonCode": artifact_decision.reason,
                 }
@@ -4999,6 +5041,7 @@ class ManagerService:
                     "accountId": target["accountId"],
                     "targetId": game_id,
                     "runId": decision.run_id if decision is not None else None,
+                    "runState": run_states_by_target.get(game_id),
                     "completionAdjudicationId": next(
                         (
                             item["completionAdjudicationId"]
@@ -5024,12 +5067,12 @@ class ManagerService:
                     {
                         str(item["reasonCode"])
                         for item in notification_screenshot_decisions
-                        if item["gameId"] == game_id and not item["accepted"]
+                        if item["targetId"] == target_id and not item["accepted"]
                     }
                 )
                 has_accepted_screenshot_candidate = any(
-                    candidate_game_id == game_id
-                    for candidate_game_id, _ in accepted_screenshot_candidates
+                    candidate_target_id == target_id
+                    for candidate_target_id, _ in accepted_screenshot_candidates
                 )
                 unavailable_reason_code = (
                     "no_completion_contract"
@@ -5054,6 +5097,8 @@ class ManagerService:
                     {
                         "gameId": game_id,
                         "accountId": target["accountId"],
+                        "targetId": target_id,
+                        "runId": decision.run_id if decision is not None else target.get("runId"),
                         "kind": (
                             "completion_contract"
                             if decision is not None
@@ -5957,15 +6002,15 @@ class ManagerService:
                 raise ManagerValidation("gameIds differs from explicit account targets")
             requested_game_ids = target_games
         if requested_game_ids is None and request.cadence == Cadence.DAILY:
-            configured_selection = self.store.get_config()["values"].get(
-                "daily_todo_selection", {}
-            )
+            config_values = self.store.get_config()["values"]
+            configured_selection = config_values.get("daily_todo_selection", {})
             requested_game_ids = [
                 game.game_id
                 for game in self.list_games()
                 if game.enabled
-                and isinstance(configured_selection.get(game.game_id), list)
-                and configured_selection[game.game_id]
+                and (bool(daily_account_targets(config_values, ["WW"])) if game.game_id == "WW"
+                     else isinstance(configured_selection.get(game.game_id), list)
+                     and bool(configured_selection[game.game_id]))
             ]
         candidate_games = self._validated_games(requested_game_ids)
 
@@ -6169,7 +6214,8 @@ class ManagerService:
             cancel_authority=cancel_authority,
             game_id=run["game_id"],
             account_id=run.get("account_id", DEFAULT_ACCOUNT_ID),
-            account_snapshot=(run.get("account_snapshot", {}) if run["game_id"] == "WW" and
+            account_snapshot=({key: run["account_snapshot"][key] for key in ("label", "saved_account_label")}
+                              if run["game_id"] == "WW" and
                               run.get("account_snapshot", {}).get("saved_account_label") else {}),
             cadence=run["cadence"],
             manager_state_version=self.store.latest_event_sequence(),
@@ -7795,8 +7841,8 @@ class ManagerService:
         # lease behind.
         manager_config = self.store.get_config()["values"]
         owning_batch = self._latest_batch_for_run(run_id)
-        if owning_batch is not None and "dailyToolProfiles" in owning_batch["result"]:
-            manager_config = {**manager_config, "daily_tool_profiles": owning_batch["result"]["dailyToolProfiles"]}
+        manager_config = {**manager_config, "daily_tool_profiles": frozen_run_tool_profiles(
+            run, owning_batch, manager_config.get("daily_tool_profiles", {}))}
         configured_paths = manager_config.get("game_paths", {})
         path_binding = configured_paths.get(str(run["game_id"]), {})
         emulator_config = path_binding.get("emulator")
@@ -9234,7 +9280,7 @@ class ManagerService:
         account = resolve_game_account(self.store.get_config()["values"], game.game_id, request.account_id)
         if not account.get("enabled", True):
             raise ManagerValidation("The selected account is disabled")
-        account_snapshot = {"label": account["label"], "saved_account_label": account.get("saved_account_label") or ""}
+        account_snapshot = freeze_account_snapshot(account)
         if request.mode == RequestMode.EXECUTE:
             self._validate_account_execution_targets([{"gameId": game.game_id, "accountId": request.account_id,
                                                        "accountLabel": account["label"], "accountSnapshot": account_snapshot}])
@@ -9246,6 +9292,13 @@ class ManagerService:
                 "manager.lifecycle_state", "running"
             ) != "running":
                 raise ManagerConflict("Manager is stopping and cannot accept new execution")
+            account = resolve_game_account(self.store.get_config()["values"], game.game_id, request.account_id)
+            if not account.get("enabled", True):
+                raise ManagerValidation("The selected account is disabled")
+            account_snapshot = freeze_account_snapshot(account)
+            if request.mode == RequestMode.EXECUTE:
+                self._validate_account_execution_targets([{"gameId": game.game_id, "accountId": request.account_id,
+                    "accountLabel": account["label"], "accountSnapshot": account_snapshot}])
             self.store.reconcile_todo_instances(
                 self._todo_instance_candidates([game.game_id], request.cadence, account_id=request.account_id),
                 intent="reconcile",
@@ -11330,9 +11383,21 @@ class ManagerService:
         def operation() -> dict[str, Any]:
             validated_patch = dict(patch)
             if "game_accounts" in validated_patch:
+                definitions = {item.todo_definition_id: item for item in self.list_todo_definitions()}
+                for account in validated_patch["game_accounts"].get("WW", []):
+                    selection = account.get("daily_todo_selection")
+                    if selection is None:
+                        continue
+                    if len(selection) != len(set(selection)) or any(
+                        definition_id not in definitions or definitions[definition_id].game_id != "WW"
+                        or str(definitions[definition_id].cadence) != "daily" for definition_id in selection
+                    ):
+                        raise ManagerValidation("Account dailyTodoSelection must contain unique WW daily Todo IDs")
                 validated_patch["game_accounts"] = validate_account_patch(
                     self.store.get_config()["values"], validated_patch["game_accounts"],
                     has_execution=self.store.has_account_execution,
+                    required_definition_ids=[item.todo_definition_id for item in definitions.values()
+                        if item.game_id == "WW" and str(item.cadence) == "daily" and item.required],
                 )
             document = self.store.update_config(validated_patch)
             if "game_accounts" in validated_patch:
@@ -11473,7 +11538,7 @@ class ManagerService:
                 account = resolve_game_account(self.store.get_config()["values"], selected_game_id, selected_account_id)
                 if not account.get("enabled", True):
                     raise ManagerValidation("The selected account is disabled")
-                account_snapshot = {"label": account["label"], "saved_account_label": account.get("saved_account_label") or ""}
+                account_snapshot = freeze_account_snapshot(account)
                 if execute:
                     self._validate_account_execution_targets([{"gameId": selected_game_id, "accountId": selected_account_id,
                                                                "accountLabel": account["label"], "accountSnapshot": account_snapshot}])
@@ -12511,9 +12576,7 @@ class ManagerService:
                     "explicit_human_release: release the launch takeover before same-run resume"
                 )
             if not predecessor_attempts:
-                todo_plan = self._todo_plans_for_games(
-                    [latest["game_id"]], latest["cadence"], account_id=latest.get("account_id", DEFAULT_ACCOUNT_ID)
-                )[latest["game_id"]]
+                todo_plan = self._frozen_run_todo_plan(latest)
                 todo_plan = {
                     **todo_plan,
                     "executableTodoInstanceIds": [],
@@ -12658,10 +12721,14 @@ class ManagerService:
                     ]
                 )
             )
-            todo_plan = self._todo_plans_for_games(
-                [latest["game_id"]], latest["cadence"], account_id=latest.get("account_id", DEFAULT_ACCOUNT_ID)
-            )[latest["game_id"]]
+            todo_plan = {**self._frozen_run_todo_plan(latest),
+                "todoInstanceIds": list(latest["todo_instance_ids"]),
+                "executableTodoInstanceIds": eligible_ids if execution_requested else [],
+                "completedTodoInstanceIds": list(decision.completed_skip),
+                "deferredTodoInstanceIds": deferred_ids}
             latest_batch = self._latest_batch_for_run(run_id)
+            if execution_requested:
+                frozen_run_tool_profiles(latest, latest_batch, {})
             target_batch: dict[str, Any] | None = None
             if execution_requested and latest_batch is not None:
                 latest_batch_result = dict(latest_batch.get("result", {}))
@@ -12736,7 +12803,8 @@ class ManagerService:
                                                     "accountLabel": latest.get("account_snapshot", {}).get("label", "当前账号"),
                                                     "accountSnapshot": latest.get("account_snapshot", {}), "runId": run_id}],
                                 "todoScope": self._frozen_run_batch_scope(latest),
-                                "dailyToolProfiles": latest_batch["result"].get("dailyToolProfiles", {}),
+                                **({"dailyToolProfiles": latest_batch["result"]["dailyToolProfiles"]}
+                                   if "dailyToolProfiles" in latest_batch["result"] else {}),
                                 "executableGameIds": [latest["game_id"]],
                                 "deferredGameIds": [],
                                 "skippedCompletedGameIds": [],
