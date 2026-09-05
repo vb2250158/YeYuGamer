@@ -61,6 +61,39 @@ export interface GamePathConfig {
   emulator?: LDPlayerGameBindingConfig | null
 }
 
+/** Config uses snake_case; newly added rows receive their identity from Manager. */
+export interface GameAccount {
+  account_id?: string
+  label: string
+  enabled: boolean
+  saved_account_label: string
+}
+
+export interface GameRunRecord {
+  runId: string
+  gameId: string
+  accountId?: string
+  accountSnapshot?: JsonObject
+  state: string
+  cadence?: TodoCadence
+  updatedAt?: string
+  message?: string
+  completionTodoInstanceIds?: string[]
+  completionContract?: CompletionContractDecision
+}
+
+export interface AccountTarget {
+  targetId: string
+  gameId: string
+  accountId: string
+  accountLabel: string
+  runId?: string | null
+  state?: string
+  updatedAt?: string
+  acceptanceState?: AcceptanceState
+  completionContract?: CompletionContractDecision
+}
+
 export type GameIntegrationMappingStatus = 'registered' | 'incomplete' | 'not_registered'
 
 export interface GameIntegrationOperation {
@@ -175,6 +208,7 @@ export interface TodoDefinition {
 }
 
 export interface TodoInstance {
+  accountId?: string
   todoInstanceId: string
   todoDefinitionId: string
   definitionVersion: number
@@ -411,6 +445,7 @@ export interface CompletionReviewRequiredTodo {
 }
 
 export interface CompletionReviewScope {
+  accountId?: string
   schemaVersion: 3
   batchId: string
   gameId: string
@@ -466,6 +501,7 @@ export interface CompletionReviewContract {
 }
 
 export interface CompletionReviewSubmission {
+  accountId?: string
   gameId: string
   runId: string
   runAttemptId: string
@@ -549,6 +585,7 @@ export interface CompletionExcludedEvidence {
 }
 
 export interface CompletionContractDecision {
+  accountId?: string
   outcome: 'accepted_done' | 'review_required' | 'blocked'
   acceptedDone: boolean
   gameId: string
@@ -630,6 +667,9 @@ export interface BatchActionAvailability {
 }
 
 export interface BatchResult extends JsonObject {
+  accountTargets?: AccountTarget[]
+  currentAccountId?: string
+  currentTargetId?: string
   /** Manager preflight projection. It is advisory in the UI; execution rechecks it. */
   candidateGameIds?: string[]
   executableGameIds?: string[]
@@ -652,6 +692,8 @@ export interface BatchResult extends JsonObject {
     }>
   }
   todoPlans?: Record<string, {
+    gameId?: string
+    accountId?: string
     selectedTodoDefinitionIds?: string[]
     periodKeys?: string[]
     completionTodoInstanceIds?: string[]
@@ -750,6 +792,8 @@ export interface PageResult<T> {
 }
 
 export interface GameDetail extends GameState {
+  accountId?: string
+  accountSnapshot?: JsonObject
   bootstrapStage?: string
   activeRun?: JsonObject | null
   attempts?: JsonObject[]

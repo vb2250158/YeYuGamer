@@ -9,6 +9,7 @@ import {
   type CompletionAdjudication,
   type CompletionReview,
   type GameDetail,
+  type GameRunRecord,
   type PageResult,
 } from '../api/contracts'
 import { useResource } from '../composables/useResource'
@@ -24,6 +25,7 @@ import { formatTime } from '../utils/format'
 import { cadenceSummary, resetCountdown, todoDiagnostics, todoSummaryFromItems } from '../utils/todos'
 import { blockersFromDiagnostics, blockersFromTodos } from '../utils/completion'
 import { artifactContentPath } from '../utils/managerResources'
+import { accountIdOf, accountTodos, scopeGameDetailToAccount } from '../utils/gameAccounts'
 
 const manager = useManagerStore()
 const { snapshot, executionInProgress, executionBusyReason } = storeToRefs(manager)
@@ -45,7 +47,10 @@ const automationAssessments = useAutomationAssessments()
 
 const gameOptions = computed(() => snapshot.value.games.map((game) => ({ title: game.displayName, value: game.gameId })))
 const fallback = computed(() => snapshot.value.games.find((game) => game.gameId === gameId.value))
-const shown = computed<GameDetail | undefined>(() => detail.value ?? fallback.value as GameDetail | undefined)
+const requestedRunId = computed(() => typeof route.query.runId === 'string' ? route.query.runId : undefined)
+const requestedAccountId = computed(() => typeof route.query.accountId === 'string' ? route.query.accountId : undefined)
+const accountScoped = computed(() => gameId.value === 'WW' || Boolean(requestedRunId.value || requestedAccountId.value))
+const shown = computed<GameDetail | undefined>(() => detail.value ?? (accountScoped.value ? undefined : fallback.value as GameDetail | undefined))
 const executionEnabled = computed(() => snapshot.value.manager?.legacyExecutionEnabled === true)
 const capabilityEnabled = (capabilityId: string) => computed(() =>
   capabilities.items.value.some((item) => item.capabilityId === capabilityId && item.enabled === true),
@@ -78,7 +83,7 @@ const resumeProjectionText = computed(() => {
   return 'Manager 尚未返回 Todo actionAvailability；恢复按钮失败关闭。'
 })
 const dailySummary = computed(() => detail.value?.todoSummary?.daily
-  ?? cadenceSummary(fallback.value?.todoSummary, 'daily')
+  ?? (accountScoped.value ? undefined : cadenceSummary(fallback.value?.todoSummary, 'daily'))
   ?? todoSummaryFromItems(dailyTodos.value, 'daily'))
 const weeklySummary = computed(() => detail.value?.todoSummary?.weekly
   ?? todoSummaryFromItems(weeklyTodos.value, 'weekly'))
@@ -110,8 +115,9 @@ async function loadCompletionLedger(runId?: string): Promise<void> {
       managerApi.get<PagePayload<CompletionReview>>(`/completion-reviews?runId=${encodedRunId}&limit=100`),
       managerApi.get<PagePayload<CompletionAdjudication>>(`/completion-adjudications?runId=${encodedRunId}&limit=100`),
     ])
-    if (reviewsResult.status === 'fulfilled') completionReviews.value = extractItems(reviewsResult.value)
-    if (adjudicationsResult.status === 'fulfilled') completionAdjudications.value = extractItems(adjudicationsResult.value)
+    if (runId !== shown.value?.runId) return
+    if (reviewsResult.status === 'fulfilled') completionReviews.value = extractItems(reviewsResult.value).filter((review) => review.runId === runId)
+    if (adjudicationsResult.status === 'fulfilled') completionAdjudications.value = extractItems(adjudicationsResult.value).filter((item) => item.runId === runId)
     const failures = [reviewsResult, adjudicationsResult]
       .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
       .map((result) => result.reason instanceof Error ? result.reason.message : String(result.reason))
@@ -121,19 +127,38 @@ async function loadCompletionLedger(runId?: string): Promise<void> {
   }
 }
 
+let loadRevision = 0
 async function load(): Promise<void> {
   if (!gameId.value) return
+  const revision = ++loadRevision
+  const runId = requestedRunId.value
+  const explicitAccountId = requestedAccountId.value
+  const scoped = accountScoped.value
   loading.value = true
   error.value = undefined
+  detail.value = undefined
   try {
-    detail.value = await managerApi.get<GameDetail>(`/games/${encodeURIComponent(gameId.value)}`)
+    let loaded = await managerApi.get<GameDetail>(`/games/${encodeURIComponent(gameId.value)}`)
+    if (scoped) {
+      let run = runId ? await managerApi.get<GameRunRecord>(`/game-runs/${encodeURIComponent(runId)}`) : undefined
+      const accountId = explicitAccountId ?? (run ? accountIdOf(run) : 'default')
+      if (!run) {
+        const latest = accountTodos(loaded.todoInstances ?? [], loaded.gameId, accountId)
+          .filter((todo) => todo.runId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0]?.runId
+        if (latest) run = await managerApi.get<GameRunRecord>(`/game-runs/${encodeURIComponent(latest)}`)
+      }
+      loaded = scopeGameDetailToAccount(loaded, accountId, run)
+    }
+    if (revision !== loadRevision) return
+    detail.value = loaded
     await loadCompletionLedger(detail.value.runId)
   } catch (caught) {
+    if (revision !== loadRevision) return
     error.value = caught instanceof Error ? caught.message : String(caught)
     detail.value = undefined
-    await loadCompletionLedger(fallback.value?.runId)
+    await loadCompletionLedger(scoped ? undefined : fallback.value?.runId)
   } finally {
-    loading.value = false
+    if (revision === loadRevision) loading.value = false
   }
 }
 
@@ -149,6 +174,7 @@ watch(gameId, (value) => {
   if (value && route.params.gameId !== value) void router.replace(`/games/${encodeURIComponent(value)}`)
   void load()
 })
+watch(() => [requestedRunId.value, requestedAccountId.value], () => void load())
 watch(() => snapshot.value.games, (games) => {
   if (!gameId.value && games[0]) gameId.value = games[0].gameId
 }, { immediate: true })
@@ -161,6 +187,7 @@ async function command(label: string, path: string, body: Record<string, unknown
   busy.value = true
   await manager.submitCommand(label, 'POST', path, {
     ...body,
+    ...(path === '/game-runs' && shown.value?.accountId ? { accountId: shown.value.accountId } : {}),
   })
   busy.value = false
   await load()
@@ -188,7 +215,7 @@ async function captureScreenshot(): Promise<void> {
   </PageHeader>
 
   <v-progress-linear v-if="loading" indeterminate color="primary" class="mb-4" />
-  <v-alert v-if="error" type="warning" variant="tonal" class="mb-4">详细查询失败，正在展示 snapshot 摘要：{{ error }}</v-alert>
+  <v-alert v-if="error" type="warning" variant="tonal" class="mb-4">{{ accountScoped ? '所选账号或运行读取失败，未展示其他账号的数据' : '详细查询失败，正在展示 snapshot 摘要' }}：{{ error }}</v-alert>
   <v-alert v-if="capabilities.error.value" type="warning" variant="tonal" class="mb-4">能力目录读取失败，所有控制按钮保持失败关闭：{{ capabilities.error.value }}</v-alert>
   <v-alert v-if="completionLedgerError" type="warning" variant="tonal" class="mb-4">完成复核台账读取不完整：{{ completionLedgerError }}。空列表不会被解释为没有阻塞或已经完成。</v-alert>
   <v-alert v-if="automationAssessments.error.value" type="warning" variant="tonal" class="mb-4">AutomationAssessment 读取失败：{{ automationAssessments.error.value }}。Todo 仍显示 Manager 的调度投影，不根据历史尝试补算。</v-alert>

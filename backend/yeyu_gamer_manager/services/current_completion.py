@@ -41,6 +41,7 @@ class CurrentCompletionProjection:
     scope_key: str
     scope_fingerprint: str
     period_keys: tuple[str, ...]
+    account_id: str = "default"
     batch_id: str | None = None
     seal_version: int | None = None
     game_day_key: str | None = None
@@ -92,7 +93,7 @@ def _current_scope(value: Mapping[str, Any]) -> _CurrentScope:
 
 
 def _frozen_game_scope(
-    result: Mapping[str, Any], game_id: str
+    result: Mapping[str, Any], game_id: str, account_id: str
 ) -> Mapping[str, Any] | None:
     todo_scope = result.get("todoScope")
     if not isinstance(todo_scope, Mapping):
@@ -104,6 +105,7 @@ def _frozen_game_scope(
         item
         for item in games
         if isinstance(item, Mapping) and item.get("gameId") == game_id
+        and item.get("accountId", "default") == account_id
     ]
     return matches[0] if len(matches) == 1 else None
 
@@ -143,6 +145,7 @@ def _decision(value: Mapping[str, Any]) -> tuple[str, CompletionContractDecision
 def _batch_candidates(
     *,
     game_id: str,
+    account_id: str,
     current: _CurrentScope,
     batch: Mapping[str, Any],
 ) -> tuple[_Candidate, ...]:
@@ -153,7 +156,7 @@ def _batch_candidates(
     seal_version = result.get("sealVersion")
     if isinstance(seal_version, bool) or not isinstance(seal_version, int) or seal_version < 1:
         return ()
-    if not _scope_matches(_frozen_game_scope(result, game_id), current):
+    if not _scope_matches(_frozen_game_scope(result, game_id, account_id), current):
         return ()
     contracts = result.get("completionContracts")
     if not isinstance(contracts, Sequence) or isinstance(contracts, (str, bytes)):
@@ -169,6 +172,7 @@ def _batch_candidates(
         decision_id, decision = parsed
         if (
             decision.game_id != game_id
+            or decision.account_id != account_id
             or decision.game_day_key not in current.period_keys
         ):
             continue
@@ -214,6 +218,7 @@ def _timestamp(value: object) -> datetime | None:
 def project_current_game_completion(
     *,
     game_id: str,
+    account_id: str = "default",
     current_scope: Mapping[str, Any],
     sealed_batches: Sequence[Mapping[str, Any]],
     invalidated_at: datetime | str | None = None,
@@ -238,6 +243,7 @@ def project_current_game_completion(
         return CurrentCompletionProjection(
             status=CurrentCompletionStatus.NONE,
             game_id=game_id,
+            account_id=account_id,
             scope_key=current.scope_key,
             scope_fingerprint=current.scope_fingerprint,
             period_keys=current.period_keys,
@@ -262,6 +268,7 @@ def project_current_game_completion(
         for batch in eligible_batches
         for candidate in _batch_candidates(
             game_id=game_id,
+            account_id=account_id,
             current=current,
             batch=batch,
         )
@@ -270,6 +277,7 @@ def project_current_game_completion(
         return CurrentCompletionProjection(
             status=CurrentCompletionStatus.NONE,
             game_id=game_id,
+            account_id=account_id,
             scope_key=current.scope_key,
             scope_fingerprint=current.scope_fingerprint,
             period_keys=current.period_keys,
@@ -295,6 +303,7 @@ def project_current_game_completion(
         return CurrentCompletionProjection(
             status=CurrentCompletionStatus.EVIDENCE_PENDING,
             game_id=game_id,
+            account_id=account_id,
             scope_key=current.scope_key,
             scope_fingerprint=current.scope_fingerprint,
             period_keys=current.period_keys,
@@ -319,6 +328,7 @@ def project_current_game_completion(
             else CurrentCompletionStatus.EVIDENCE_PENDING
         ),
         game_id=game_id,
+        account_id=account_id,
         scope_key=current.scope_key,
         scope_fingerprint=current.scope_fingerprint,
         period_keys=current.period_keys,

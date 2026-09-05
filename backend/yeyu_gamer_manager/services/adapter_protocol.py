@@ -8,7 +8,7 @@ import re
 import secrets
 import stat
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
@@ -368,6 +368,8 @@ class AdapterExecutionPlan:
     executable_todo_instance_ids: tuple[str, ...]
     todos: tuple[AdapterTodoTarget, ...]
     preserve_client_on_stop: bool = True
+    account_id: str = "default"
+    account_snapshot: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_document(cls, document: object) -> "AdapterExecutionPlan":
@@ -393,6 +395,7 @@ class AdapterExecutionPlan:
                 "executableTodoInstanceIds",
                 "todos",
             },
+            optional={"accountId", "accountSnapshot"},
             context="execute request",
         )
         if value["schemaVersion"] != SCHEMA_VERSION:
@@ -406,6 +409,28 @@ class AdapterExecutionPlan:
         game_id = _text(value["gameId"], field="gameId", maximum=32)
         if game_id not in ALLOWED_GAME_IDS:
             raise AdapterProtocolError("invalid_scope", "gameId is not allowed")
+        account_id = value.get("accountId", "default")
+        account_snapshot = value.get("accountSnapshot", {})
+        if ("accountId" in value or "accountSnapshot" in value) and game_id != "WW":
+            raise AdapterProtocolError("invalid_scope", "account scope is only supported for WW")
+        if account_id != "default":
+            account_id = _canonical_uuid(account_id, field="accountId")
+        if account_snapshot:
+            account_snapshot = dict(_exact_object(
+                account_snapshot, required={"label", "saved_account_label"},
+                context="accountSnapshot",
+            ))
+            for key, maximum in (("label", 80), ("saved_account_label", 160)):
+                text = account_snapshot[key]
+                text = _text(text, field=f"accountSnapshot.{key}", maximum=maximum)
+                if text != text.strip() or any(character in "\\/" or 127 <= ord(character) <= 159 for character in text):
+                    raise AdapterProtocolError("invalid_schema", "account label is not display text")
+            if "****" not in account_snapshot["saved_account_label"]:
+                raise AdapterProtocolError("invalid_scope", "saved account selector must be a masked login-page label")
+        elif not isinstance(account_snapshot, dict):
+            raise AdapterProtocolError("invalid_schema", "accountSnapshot must be an object")
+        elif account_id != "default":
+            raise AdapterProtocolError("invalid_scope", "a named WW account requires its frozen saved-account selector")
         cadence = _text(value["cadence"], field="cadence", maximum=16)
         if cadence not in ALLOWED_CADENCES:
             raise AdapterProtocolError("invalid_schema", "cadence is unsupported")
@@ -483,10 +508,12 @@ class AdapterExecutionPlan:
             executable_todo_instance_ids=target_ids,
             todos=todos,
             preserve_client_on_stop=True,
+            account_id=account_id,
+            account_snapshot=account_snapshot,
         )
 
     def to_document(self) -> dict[str, Any]:
-        return {
+        document = {
             "schemaVersion": SCHEMA_VERSION,
             "protocolVersion": PROTOCOL_VERSION,
             "requestType": "execute",
@@ -506,6 +533,11 @@ class AdapterExecutionPlan:
             "executableTodoInstanceIds": list(self.executable_todo_instance_ids),
             "todos": [todo.to_document() for todo in self.todos],
         }
+        if self.account_id != "default" or self.account_snapshot:
+            if self.game_id != "WW":
+                raise AdapterProtocolError("invalid_scope", "account scope is only supported for WW")
+            document.update(accountId=self.account_id, accountSnapshot=dict(self.account_snapshot))
+        return document
 
 
 def parse_execute_request(raw: bytes) -> AdapterExecutionPlan:

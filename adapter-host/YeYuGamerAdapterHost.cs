@@ -21,7 +21,7 @@ namespace YeYuGamer.AdapterHost
     internal static class Program
     {
         private const string ProtocolVersion = "1.1";
-        private const string HostVersion = "0.3.3";
+        private const string HostVersion = "0.3.4";
         private const string ExecutionPackageId = "legacy-night-rain-gamer";
         private const int MaxRequestBytes = 262144;
         private const int MaxEventBytes = 65536;
@@ -686,7 +686,8 @@ namespace YeYuGamer.AdapterHost
                 "cancelAuthority",
                 "gameId", "cadence", "managerStateVersion", "catalogVersion", "policyDigest", "issuedAt", "expiresAt",
                 "timeoutSeconds", "preserveClientOnStop", "executableTodoInstanceIds", "todos"
-            })) { error = "Request fields differ from protocol v1.1."; return false; }
+            }, new [] { "accountId", "accountSnapshot" })) { error = "Request fields differ from protocol v1.1."; return false; }
+            if (!ValidAccountScope(value)) { error = "Request account scope is invalid."; return false; }
             long schema;
             long stateVersion;
             long timeout;
@@ -1007,11 +1008,30 @@ namespace YeYuGamer.AdapterHost
             }
         }
 
-        private static bool HasExactKeys(IDictionary<string, object> value, string[] names)
+        private static bool HasExactKeys(IDictionary<string, object> value, string[] names, string[] optional = null)
         {
-            if (value == null || value.Count != names.Length) return false;
+            if (value == null || value.Count < names.Length || value.Count > names.Length + (optional == null ? 0 : optional.Length)) return false;
             foreach (string name in names) if (!value.ContainsKey(name)) return false;
+            foreach (string key in value.Keys) if (!names.Contains(key) && (optional == null || !optional.Contains(key))) return false;
             return true;
+        }
+        private static bool ValidAccountScope(IDictionary<string, object> value)
+        {
+            if (!value.ContainsKey("accountId") && !value.ContainsKey("accountSnapshot")) return true;
+            if (GetString(value, "gameId") != "WW") return false;
+            string accountId = value.ContainsKey("accountId") ? GetString(value, "accountId") : "default";
+            if (accountId != "default" && !IsUuid(accountId)) return false;
+            if (!value.ContainsKey("accountSnapshot")) return accountId == "default";
+            IDictionary<string, object> snapshot = GetObject(value, "accountSnapshot");
+            if (snapshot == null) return false;
+            if (snapshot.Count == 0) return accountId == "default";
+            if (!HasExactKeys(snapshot, new [] { "label", "saved_account_label" })) return false;
+            foreach (string key in new [] { "label", "saved_account_label" }) {
+                string text = GetString(snapshot, key);
+                if (String.IsNullOrWhiteSpace(text) || text != text.Trim() || text.Length > (key == "label" ? 80 : 160) ||
+                    text.Any(character => Char.IsControl(character) || character == '\\' || character == '/')) return false;
+            }
+            return GetString(snapshot, "saved_account_label").Contains("****");
         }
         private static string GetString(IDictionary<string, object> value, string name)
         {

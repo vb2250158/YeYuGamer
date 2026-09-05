@@ -184,13 +184,14 @@ export function parseCompletionReviewScope(
   const scope = objectValue(workItem.result?.completionReviewScope)
   if (!scope) return { errors: ['工作项没有 Manager 签发的 completionReviewScope'] }
   exactKeys(scope, [
-    'schemaVersion', 'batchId', 'gameId', 'runId', 'runAttemptId', 'attemptLineageIds',
+    'schemaVersion', 'batchId', 'gameId', 'accountId', 'runId', 'runAttemptId', 'attemptLineageIds',
     'gameDayKey', 'periodStartsAt', 'periodEndsAt', 'requiredTodoInstanceIds', 'requiredTodos',
   ], 'completionReviewScope', errors)
   if (scope.schemaVersion !== 3) errors.push('completionReviewScope schemaVersion 必须为 3')
 
   const batchId = requiredOpaque(scope, 'batchId', errors)
   const gameId = requiredOpaque(scope, 'gameId', errors)
+  const accountId = scope.accountId === undefined ? undefined : requiredOpaque(scope, 'accountId', errors)
   const runId = requiredOpaque(scope, 'runId', errors)
   const runAttemptId = requiredOpaque(scope, 'runAttemptId', errors)
   const gameDayKey = requiredOpaque(scope, 'gameDayKey', errors)
@@ -232,6 +233,7 @@ export function parseCompletionReviewScope(
 
   if (workItem.batchId && batchId && workItem.batchId !== batchId) errors.push('scope batchId 与工作项不一致')
   if (workItem.gameId && gameId && workItem.gameId !== gameId) errors.push('scope gameId 与工作项不一致')
+  if (workItem.accountId !== undefined && workItem.accountId !== (accountId ?? 'default')) errors.push('scope accountId 与工作项不一致')
   if (workItem.runId && runId && workItem.runId !== runId) errors.push('scope runId 与工作项不一致')
   if (currentSnapshotRunId && runId && currentSnapshotRunId !== runId) errors.push('scope runId 与 Manager 当前 snapshot 不一致')
   if (errors.length || !batchId || !gameId || !runId || !runAttemptId || !gameDayKey
@@ -241,6 +243,7 @@ export function parseCompletionReviewScope(
       schemaVersion: 3,
       batchId,
       gameId,
+      ...(accountId ? { accountId } : {}),
       runId,
       runAttemptId,
       attemptLineageIds,
@@ -574,6 +577,7 @@ export function buildCompletionReviewSubmission(
     return {
       value: {
         gameId: scope.gameId,
+        ...(scope.accountId ? { accountId: scope.accountId } : {}),
         runId: scope.runId,
         runAttemptId: scope.runAttemptId,
         gameDayKey: scope.gameDayKey,
@@ -629,6 +633,7 @@ export function buildCompletionReviewSubmission(
     return {
       value: {
         gameId: scope.gameId,
+        ...(scope.accountId ? { accountId: scope.accountId } : {}),
         runId: scope.runId,
         runAttemptId: scope.runAttemptId,
         gameDayKey: scope.gameDayKey,
@@ -647,6 +652,7 @@ export function buildCompletionReviewSubmission(
     return {
       value: {
         gameId: scope.gameId,
+        ...(scope.accountId ? { accountId: scope.accountId } : {}),
         runId: scope.runId,
         runAttemptId: scope.runAttemptId,
         gameDayKey: scope.gameDayKey,
@@ -697,6 +703,7 @@ export function buildCompletionReviewSubmission(
   return {
     value: {
       gameId: scope.gameId,
+      ...(scope.accountId ? { accountId: scope.accountId } : {}),
       runId: scope.runId,
       runAttemptId: scope.runAttemptId,
       gameDayKey: scope.gameDayKey,

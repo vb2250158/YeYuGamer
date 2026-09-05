@@ -33,7 +33,7 @@ def build_capability_registry(
             input_schema={
                 "type": "object",
                 "required": ["gameId"],
-                "properties": {"gameId": {"type": "string"}},
+                "properties": {"gameId": {"type": "string"}, "accountId": {"type": "string"}},
                 "additionalProperties": False,
             },
         ),
@@ -47,7 +47,7 @@ def build_capability_registry(
             input_schema={
                 "type": "object",
                 "required": ["gameId"],
-                "properties": {"gameId": {"type": "string"}},
+                "properties": {"gameId": {"type": "string"}, "accountId": {"type": "string"}},
                 "additionalProperties": False,
             },
         ),

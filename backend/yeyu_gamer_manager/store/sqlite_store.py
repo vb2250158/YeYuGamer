@@ -277,6 +277,8 @@ class SqliteStore:
                 );
                 CREATE TABLE IF NOT EXISTS game_runs (
                     run_id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL DEFAULT 'default',
+                    account_snapshot_json TEXT NOT NULL DEFAULT '{}',
                     game_id TEXT NOT NULL REFERENCES games(game_id),
                     cadence TEXT NOT NULL,
                     state TEXT NOT NULL,
@@ -401,6 +403,7 @@ class SqliteStore:
                     ON todo_definitions(game_id, cadence, active, order_index);
                 CREATE TABLE IF NOT EXISTS todo_instances (
                     todo_instance_id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL DEFAULT 'default',
                     todo_definition_id TEXT NOT NULL REFERENCES todo_definitions(todo_definition_id),
                     game_id TEXT NOT NULL REFERENCES games(game_id),
                     cadence TEXT NOT NULL,
@@ -418,12 +421,13 @@ class SqliteStore:
                     last_attempt_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    UNIQUE(todo_definition_id, period_key)
+                    UNIQUE(account_id, todo_definition_id, period_key)
                 );
                 CREATE INDEX IF NOT EXISTS idx_todo_instances_period
                     ON todo_instances(game_id, cadence, period_key, status);
                 CREATE TABLE IF NOT EXISTS run_attempts (
                     run_attempt_id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL DEFAULT 'default',
                     run_id TEXT NOT NULL REFERENCES game_runs(run_id),
                     game_id TEXT NOT NULL REFERENCES games(game_id),
                     cadence TEXT NOT NULL,
@@ -718,6 +722,10 @@ class SqliteStore:
             self._ensure_column(
                 "game_runs", "completion_scope_version", "INTEGER NOT NULL DEFAULT 0"
             )
+            self._ensure_column("game_runs", "account_id", "TEXT NOT NULL DEFAULT 'default'")
+            self._ensure_column("game_runs", "account_snapshot_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column("todo_instances", "account_id", "TEXT NOT NULL DEFAULT 'default'")
+            self._ensure_column("run_attempts", "account_id", "TEXT NOT NULL DEFAULT 'default'")
             self._ensure_column(
                 "todo_instances",
                 "period_starts_at",
@@ -787,6 +795,7 @@ class SqliteStore:
                 END;
                 """
             )
+        self._migrate_account_todo_identity()
         with self._write_scope():
             self._normalize_private_fencing_tokens_and_history()
             needs_public_fencing_migration = (
@@ -1745,6 +1754,58 @@ class SqliteStore:
                     ),
                 )
 
+    def _migrate_account_todo_identity(self) -> None:
+        """Replace the legacy per-day unique constraint without changing any ID or seal."""
+        with self._lock:
+            if self.connection.execute("SELECT 1 FROM schema_version WHERE version = 14").fetchone():
+                return
+            if self._transaction_depth:
+                raise RuntimeError("account schema migration requires its own transaction")
+            sql = str(self.connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'todo_instances'"
+            ).fetchone()["sql"])
+            legacy_unique = r"UNIQUE\s*\(\s*todo_definition_id\s*,\s*period_key\s*\)"
+            rebuilt_sql, replacements = re.subn(legacy_unique,
+                "UNIQUE(account_id, todo_definition_id, period_key)", sql, flags=re.IGNORECASE)
+            self.connection.execute("PRAGMA foreign_keys=OFF")
+            try:
+                with self._write_scope():
+                    if replacements:
+                        if replacements != 1:
+                            raise ValueError("unexpected Todo identity constraints")
+                        objects = self.connection.execute(
+                            "SELECT sql FROM sqlite_master WHERE tbl_name = 'todo_instances' "
+                            "AND type IN ('index', 'trigger') AND sql IS NOT NULL"
+                        ).fetchall()
+                        columns = [str(row["name"]) for row in self.connection.execute("PRAGMA table_info(todo_instances)")]
+                        column_sql = ", ".join('"' + name.replace('"', '""') + '"' for name in columns)
+                        rebuilt_sql, renamed = re.subn(
+                            r'^(CREATE TABLE(?: IF NOT EXISTS)?\s+)(?:"todo_instances"|todo_instances)(?=\s*\()',
+                            r"\1todo_instances_v14", rebuilt_sql, count=1, flags=re.IGNORECASE,
+                        )
+                        if renamed != 1:
+                            raise ValueError("unrecognized legacy Todo table declaration")
+                        self.connection.execute(rebuilt_sql)
+                        self.connection.execute(f"INSERT INTO todo_instances_v14 ({column_sql}) SELECT {column_sql} FROM todo_instances")
+                        self.connection.execute("DROP TABLE todo_instances")
+                        self.connection.execute("ALTER TABLE todo_instances_v14 RENAME TO todo_instances")
+                        for item in objects:
+                            self.connection.execute(str(item["sql"]))
+                    unique_scopes = {
+                        tuple(column["name"] for column in self.connection.execute(
+                            f"PRAGMA index_info({self._quote_identifier(str(index['name']))})"
+                        ))
+                        for index in self.connection.execute("PRAGMA index_list(todo_instances)")
+                        if index["unique"]
+                    }
+                    if ("account_id", "todo_definition_id", "period_key") not in unique_scopes:
+                        raise ValueError("Todo account identity constraint is missing")
+                    if self.connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                        raise ValueError("account migration would leave broken foreign keys")
+                    self.connection.execute("INSERT INTO schema_version(version, applied_at) VALUES (?, ?)", (14, _now()))
+            finally:
+                self.connection.execute("PRAGMA foreign_keys=ON")
+
     def _ensure_column(self, table: str, column: str, declaration: str) -> None:
         allowed = {
             ("batches", "mode"),
@@ -1755,6 +1816,10 @@ class SqliteStore:
             ("game_runs", "completed_todo_instance_ids_json"),
             ("game_runs", "completion_todo_instance_ids_json"),
             ("game_runs", "completion_scope_version"),
+            ("game_runs", "account_id"),
+            ("game_runs", "account_snapshot_json"),
+            ("todo_instances", "account_id"),
+            ("run_attempts", "account_id"),
             ("todo_instances", "period_starts_at"),
             ("todo_instances", "period_ends_at"),
             ("todo_definitions", "definition_version"),
@@ -2221,16 +2286,16 @@ class SqliteStore:
         reset_ids: list[str] = []
         normalized_conditional_ids: list[str] = []
         retired_blocker_ids: list[str] = []
-        scoped_periods: dict[tuple[str, str], set[str]] = {}
+        scoped_periods: dict[tuple[str, str, str], set[str]] = {}
         for item in instances:
             scoped_periods.setdefault(
-                (str(item["game_id"]), str(item["cadence"])), set()
+                (str(item["game_id"]), str(item.get("account_id", "default")), str(item["cadence"])), set()
             ).add(str(item["period_key"]))
         with self._write_scope():
             for item in instances:
                 row = self.connection.execute(
-                    "SELECT * FROM todo_instances WHERE todo_definition_id = ? AND period_key = ?",
-                    (item["todo_definition_id"], item["period_key"]),
+                    "SELECT * FROM todo_instances WHERE account_id = ? AND todo_definition_id = ? AND period_key = ?",
+                    (item.get("account_id", "default"), item["todo_definition_id"], item["period_key"]),
                 ).fetchone()
                 if row is not None:
                     todo_instance_id = str(row["todo_instance_id"])
@@ -2344,18 +2409,19 @@ class SqliteStore:
                 self.connection.execute(
                     """
                     INSERT INTO todo_instances(
-                        todo_instance_id, todo_definition_id, game_id, cadence,
+                        todo_instance_id, todo_definition_id, game_id, cadence, account_id,
                         period_key, period_starts_at, period_ends_at,
                         definition_snapshot_json, status, attempts,
                         reason, evidence_refs_json, run_id, started_at,
                         completed_at, last_attempt_at, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, '[]', NULL, NULL, NULL, NULL, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, '[]', NULL, NULL, NULL, NULL, ?, ?)
                     """,
                     (
                         item["todo_instance_id"],
                         item["todo_definition_id"],
                         item["game_id"],
                         item["cadence"],
+                        item.get("account_id", "default"),
                         item["period_key"],
                         item["period_starts_at"],
                         item["period_ends_at"],
@@ -2377,7 +2443,7 @@ class SqliteStore:
                 blocker_rows = self.connection.execute(
                     """
                     SELECT tb.*, ti.game_id AS todo_game_id,
-                           ti.cadence, ti.period_key
+                           ti.account_id, ti.cadence, ti.period_key
                     FROM todo_blockers AS tb
                     JOIN todo_instances AS ti
                       ON ti.todo_instance_id = tb.todo_instance_id
@@ -2389,6 +2455,7 @@ class SqliteStore:
                 for blocker_row in blocker_rows:
                     scope = (
                         str(blocker_row["todo_game_id"]),
+                        str(blocker_row["account_id"]),
                         str(blocker_row["cadence"]),
                     )
                     current_periods = scoped_periods.get(scope)
@@ -2472,6 +2539,7 @@ class SqliteStore:
         self,
         *,
         game_id: str | None = None,
+        account_id: str | None = None,
         cadence: str | None = None,
         period_key: str | None = None,
         status: str | None = None,
@@ -2481,6 +2549,7 @@ class SqliteStore:
         parameters: list[Any] = []
         for column, value in (
             ("ti.game_id", game_id),
+            ("ti.account_id", account_id),
             ("ti.cadence", cadence),
             ("ti.period_key", period_key),
             ("ti.status", status),
@@ -2523,6 +2592,7 @@ class SqliteStore:
         definition = _decode(row["definition_snapshot_json"], {})
         return {
             "todo_instance_id": row["todo_instance_id"],
+            "account_id": row["account_id"],
             "todo_definition_id": row["todo_definition_id"],
             "definition_version": int(definition.get("definition_version", 1)),
             "catalog_version": definition.get("catalog_version", "legacy-v1"),
@@ -2572,6 +2642,12 @@ class SqliteStore:
         timestamp = _now()
         with self._write_scope():
             before = self.get_todo_instance(todo_instance_id)
+            if run_id is not None:
+                run = self.get_game_run(run_id)
+                if (run["game_id"], run["account_id"], run["cadence"]) != (
+                    before["game_id"], before["account_id"], before["cadence"]
+                ):
+                    raise ValueError("Todo transition account scope differs from its GameRun")
             if status not in _TODO_TRANSITIONS.get(before["status"], frozenset()):
                 raise ValueError(
                     f"invalid Todo transition: {before['status']} -> {status}"
@@ -2801,6 +2877,25 @@ class SqliteStore:
             if predecessor["result"].get("sealVersion") is None:
                 raise ValueError("continuation predecessor must already be sealed")
             run = self.get_game_run(run_id)
+            account_id = run["account_id"]
+            account_targets = predecessor["result"].get("accountTargets")
+            if isinstance(account_targets, list):
+                if not any(isinstance(target, dict)
+                           and target.get("gameId") == run["game_id"]
+                           and target.get("accountId", "default") == account_id
+                           for target in account_targets):
+                    raise ValueError("continuation account is outside predecessor scope")
+            elif account_id != "default":
+                raise ValueError("continuation predecessor has no frozen account scope")
+            continuation_targets = data.get("result", {}).get("accountTargets")
+            if continuation_targets is not None and (
+                not isinstance(continuation_targets, list)
+                or len(continuation_targets) != 1
+                or not isinstance(continuation_targets[0], dict)
+                or continuation_targets[0].get("gameId") != run["game_id"]
+                or continuation_targets[0].get("accountId", "default") != account_id
+            ):
+                raise ValueError("continuation target differs from its GameRun account")
             if run["game_id"] not in set(predecessor["game_ids"]):
                 # Older batches could have candidate scope only in their seal.
                 candidates = set(
@@ -4241,6 +4336,8 @@ class SqliteStore:
             raise ValueError("completed Todo scope exceeds completion scope")
         record = {
             "run_id": str(uuid.uuid4()),
+            "account_id": data.get("account_id", "default"),
+            "account_snapshot": dict(data.get("account_snapshot") or {}),
             "game_id": data["game_id"],
             "cadence": data["cadence"],
             "state": data["state"],
@@ -4263,14 +4360,23 @@ class SqliteStore:
         if record["completion_scope_version"] != 1:
             raise ValueError("new GameRuns require completion scope version 1")
         with self._write_scope():
+            if not isinstance(record["account_id"], str) or not record["account_id"]:
+                raise ValueError("GameRun account ID is required")
+            for todo_id in completion_ids:
+                todo = self.get_todo_instance(todo_id)
+                if (todo["game_id"], todo["account_id"], todo["cadence"]) != (
+                    record["game_id"], record["account_id"], record["cadence"]
+                ):
+                    raise ValueError("GameRun Todo account scope is inconsistent")
             self.connection.execute(
                 """
                 INSERT INTO game_runs(
                     run_id, game_id, cadence, state, mode, requested_by,
                     exit_code, message, created_at, updated_at,
                     todo_instance_ids_json, completed_todo_instance_ids_json,
-                    completion_todo_instance_ids_json, completion_scope_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    completion_todo_instance_ids_json, completion_scope_version,
+                    account_id, account_snapshot_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["run_id"],
@@ -4287,6 +4393,8 @@ class SqliteStore:
                     _json(record["completed_todo_instance_ids"]),
                     _json(record["completion_todo_instance_ids"]),
                     record["completion_scope_version"],
+                    record["account_id"],
+                    _json(record["account_snapshot"]),
                 ),
             )
             self.append_event("game-run.created", "game-run", record["run_id"], record)
@@ -4359,10 +4467,21 @@ class SqliteStore:
     def get_game_run(self, run_id: str) -> dict[str, Any]:
         return self._one("game_runs", "run_id", run_id, self._game_run)
 
+    def has_account_execution(self, game_id: str, account_id: str) -> bool:
+        """A frozen execute GameRun binds identity even before its first attempt."""
+        with self._lock:
+            return self.connection.execute(
+                "SELECT 1 FROM game_runs WHERE game_id = ? AND account_id = ? "
+                "AND mode = 'execute' LIMIT 1",
+                (game_id, account_id),
+            ).fetchone() is not None
+
     @staticmethod
     def _game_run(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "run_id": row["run_id"],
+            "account_id": row["account_id"],
+            "account_snapshot": _decode(row["account_snapshot_json"], {}),
             "game_id": row["game_id"],
             "cadence": row["cadence"],
             "state": row["state"],
@@ -4395,6 +4514,7 @@ class SqliteStore:
             raise ValueError("run attempt cancel authority must be a sha256 digest")
         record = {
             "run_attempt_id": data["run_attempt_id"],
+            "account_id": data.get("account_id", safe_plan.get("accountId", "default")),
             "run_id": data["run_id"],
             "game_id": data["game_id"],
             "cadence": data["cadence"],
@@ -4415,6 +4535,8 @@ class SqliteStore:
             run = self.get_game_run(record["run_id"])
             if (
                 run["game_id"] != record["game_id"]
+                or run["account_id"] != record["account_id"]
+                or safe_plan.get("accountId", "default") != run["account_id"]
                 or run["cadence"] != record["cadence"]
             ):
                 raise ValueError("run attempt scope differs from its GameRun")
@@ -4457,8 +4579,8 @@ class SqliteStore:
                     run_attempt_id, run_id, game_id, cadence, state,
                     fencing_token_hash, cancel_authority_hash, plan_json, process_id, exit_code,
                     result_json, attempt_ordinal, started_at, completed_at,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, account_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["run_attempt_id"],
@@ -4477,6 +4599,7 @@ class SqliteStore:
                     record["completed_at"],
                     record["created_at"],
                     record["updated_at"],
+                    record["account_id"],
                 ),
             )
             self.append_event(
@@ -4499,6 +4622,7 @@ class SqliteStore:
     def _run_attempt(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "run_attempt_id": row["run_attempt_id"],
+            "account_id": row["account_id"],
             "run_id": row["run_id"],
             "game_id": row["game_id"],
             "cadence": row["cadence"],
@@ -4825,6 +4949,7 @@ class SqliteStore:
             completed_replay = session_reentry or completion_recovery_replay
             if (
                 todo["game_id"] != run_attempt["game_id"]
+                or todo["account_id"] != run_attempt["account_id"]
                 or todo["cadence"] != run_attempt["cadence"]
                 or todo["operation"] != data["operation"]
             ):
@@ -5070,6 +5195,7 @@ class SqliteStore:
                 document = artifact["document"]
                 if (
                     document.get("runAttemptId") != before["run_attempt_id"]
+                    or document.get("accountId", "default") != run_attempt["account_id"]
                     or document.get("todoAttemptId") != todo_attempt_id
                     or document.get("todoInstanceId") != before["todo_instance_id"]
                 ):

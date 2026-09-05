@@ -1,4 +1,5 @@
 import type { BatchRun, GameState, TodoInstance } from '../api/contracts'
+import { accountIdOf } from './gameAccounts'
 
 export type TodayScopeSource = 'current_batch' | 'saved_selection' | 'unknown'
 
@@ -7,6 +8,7 @@ export interface TodayScopeInput {
   games: GameState[]
   todos: TodoInstance[]
   selectedTodoDefinitionIds: Record<string, string[]>
+  enabledAccountIds?: Record<string, string[]>
 }
 
 export interface TodayScopeResult {
@@ -40,6 +42,7 @@ export function withFrozenBatchScope(batch: BatchRun | null | undefined, detail:
       ...batch.result,
       todoScope: detail.result?.todoScope ?? batch.result?.todoScope,
       todoPlans: detail.result?.todoPlans ?? batch.result?.todoPlans,
+      accountTargets: batch.result?.accountTargets ?? detail.result?.accountTargets,
     },
   }
 }
@@ -48,6 +51,7 @@ function selectedGameIds(input: TodayScopeInput): string[] {
   return input.games
     .filter((game) => game.enabled !== false)
     .filter((game) => (input.selectedTodoDefinitionIds[game.gameId] ?? []).length > 0)
+    .filter((game) => !input.enabledAccountIds?.[game.gameId] || input.enabledAccountIds[game.gameId]!.length > 0)
     .map((game) => game.gameId)
 }
 
@@ -71,7 +75,9 @@ function frozenBatchScope(batch: BatchRun): FrozenBatchScope {
   if (plans && typeof plans === 'object' && Object.keys(plans).length > 0) {
     const entries = Object.entries(plans)
     return {
-      gameIds: entries.map(([gameId]) => gameId),
+      gameIds: [...new Set(entries.map(([targetId, plan]) => plan.gameId
+        ?? batch.result?.accountTargets?.find((target) => target.targetId === targetId)?.gameId
+        ?? targetId))],
       todoInstanceIds: [...new Set(entries.flatMap(([, plan]) => plan.completionTodoInstanceIds ?? []))],
       periodKeys: [...new Set(entries.flatMap(([, plan]) => plan.periodKeys ?? []))],
       exact: entries.length > 0,
@@ -136,6 +142,8 @@ export function buildTodayScope(input: TodayScopeInput): TodayScopeResult {
   const todos = input.todos.filter((todo) => {
     if (todo.cadence !== 'daily' || !gameIdSet.has(todo.gameId)) return false
     if (useBatch && frozen?.exact) return frozenTodoIdSet.has(todo.todoInstanceId)
+    const enabledAccounts = input.enabledAccountIds?.[todo.gameId]
+    if (enabledAccounts && !enabledAccounts.includes(accountIdOf(todo))) return false
     return (selectedByGame[todo.gameId] ?? []).includes(todo.todoDefinitionId)
   })
   const allFrozenTodosLoaded = !useBatch || !frozen?.exact || frozenTodoIdSet.size === todos.length

@@ -396,6 +396,7 @@ def todo_definition(
 def todo_instances(
     manager: Manager,
     game_id: Annotated[str | None, Query(alias="gameId")] = None,
+    account_id: Annotated[str | None, Query(alias="accountId")] = None,
     cadence: Cadence | None = None,
     period_key: Annotated[str | None, Query(alias="periodKey")] = None,
     status: TodoStatus | None = None,
@@ -404,6 +405,7 @@ def todo_instances(
 ) -> TodoInstancePage:
     items = manager.list_todo_instances(
         game_id=game_id,
+        account_id=account_id,
         cadence=cadence,
         period_key=period_key,
         status=status,
@@ -524,10 +526,11 @@ def todo_reset_preview(
     manager: Manager,
     action: Annotated[str, Query(pattern="^(?:reconcile|reset)$")] = "reconcile",
     game_ids: Annotated[list[str] | None, Query(alias="gameId")] = None,
+    account_id: Annotated[str | None, Query(alias="accountId")] = None,
     cadence: Cadence | None = None,
 ) -> TodoResetPreviewResponse:
     return manager.preview_todo_reset(
-        action=action, game_ids=game_ids, cadence=cadence
+        action=action, game_ids=game_ids, cadence=cadence, account_id=account_id
     )
 
 
@@ -725,6 +728,7 @@ def create_game_run_alias(
     body = _bind_actor(body, mutation)
     request = GameRunCreateRequest(
         game_id=game_id,
+        account_id=body.account_id,
         cadence=body.kind,
         mode="execute",
         requested_by=body.requested_by,

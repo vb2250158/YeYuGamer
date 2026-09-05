@@ -6,6 +6,9 @@ import PageHeader from '../components/PageHeader.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import EmptyState from '../components/EmptyState.vue'
 import TodoChecklist from '../components/TodoChecklist.vue'
+import GameAccountEditor from '../components/GameAccountEditor.vue'
+import { accountCompletionEvidence, accountGameState, accountIdOf, accountRunLocation, accountTodos, configuredGameAccounts, gameAccountsPatch, todayAccountTargets } from '../utils/gameAccounts'
+import type { GameAccount, GameRunRecord } from '../api/contracts'
 import { useManagerStore } from '../stores/manager'
 import { formatTime } from '../utils/format'
 import { executionIsEnabled, runtimeBindingReadinessForGames } from '../utils/managerResources'
@@ -100,6 +103,10 @@ const gamePathDrafts = ref<Record<string, GamePathConfig>>({})
 const gameEnabledDrafts = ref<Record<string, boolean>>({})
 const dailyTodoSelectionDrafts = ref<Record<string, string[]>>({})
 const okWwProfileDraft = ref<OKWWProfile>()
+const wwAccountDraft = ref<GameAccount[]>()
+const wwAccounts = computed(() => wwAccountDraft.value ?? configuredGameAccounts(configDocument.value?.config, 'WW'))
+const savedWwAccounts = computed(() => configuredGameAccounts(configDocument.value?.config, 'WW'))
+const accountRuns = shallowRef<GameRunRecord[]>([])
 const endfieldProfileDraft = ref<EndfieldProfile>()
 const nteProfileDraft = ref<NTEProfile>()
 const cznProfileDraft = ref<CZNProfile>()
@@ -119,6 +126,7 @@ const allGames = computed(() => snapshot.value.games)
 const queuedDailyGames = computed(() => allGames.value.filter((game) => (
   dailyGameEnabled(game.gameId)
   && selectedDailyTodoDefinitionIds(game.gameId).length > 0
+  && (game.gameId !== 'WW' || wwAccounts.value.some((account) => account.enabled))
 )))
 const dailySelectionSaving = computed(() => savingDailySelectionIds.value.size > 0)
 const executionEnabled = computed(() => executionIsEnabled(snapshot.value))
@@ -194,6 +202,7 @@ const todayScope = computed(() => buildTodayScope({
   games: allGames.value,
   todos: dailyTodos.items.value,
   selectedTodoDefinitionIds: selectedTodoDefinitionIdsByGame.value,
+  enabledAccountIds: { WW: savedWwAccounts.value.filter((account) => account.enabled && account.account_id).map((account) => account.account_id!) },
 }))
 const gameDayLabel = computed(() => {
   const label = todayScopePeriodLabel(todayScope.value.todos, todayScope.value.periodKeys)
@@ -202,13 +211,26 @@ const gameDayLabel = computed(() => {
 const scopedGameIdSet = computed(() => new Set(todayScope.value.gameIds))
 const scopedGames = computed(() => allGames.value.filter((game) => scopedGameIdSet.value.has(game.gameId)))
 const scopedTodoGroups = computed(() => todosByGame(todayScope.value.todos))
+const wwTargets = computed(() => todayAccountTargets('WW', savedWwAccounts.value,
+  withFrozenBatchScope(displayedExecutionBatch.value, frozenBatchDetail.value)))
+const progressRows = computed(() => scopedGames.value.flatMap((game) => {
+  if (game.gameId !== 'WW') {
+    const todos = gameTodos(game.gameId)
+    return [{ targetId: game.gameId, game, todos, accountId: undefined as string | undefined, summary: todoSummaryFromItems(todos, 'daily') }]
+  }
+  return wwTargets.value.map((target) => {
+    const todos = accountTodos(gameTodos(game.gameId), game.gameId, target.accountId)
+    return { targetId: target.targetId, accountId: target.accountId, todos,
+      game: accountGameState(game, target, todos, accountRuns.value), summary: todoSummaryFromItems(todos, 'daily') }
+  })
+}))
 const todoRequired = computed(() => todayScope.value.requiredTotal)
 const todoCompleted = computed(() => todayScope.value.requiredCompleted)
-const acceptedCount = computed(() => scopedGames.value.filter((game) => {
-  const required = (scopedTodoGroups.value.get(game.gameId) ?? []).filter((todo) => todo.required)
-  return required.length > 0 && required.every((todo) => todo.status === 'completed') && game.acceptanceState === 'accepted_done'
+const acceptedCount = computed(() => progressRows.value.filter((row) => {
+  const required = row.todos.filter((todo) => todo.required)
+  return required.length > 0 && required.every((todo) => todo.status === 'completed') && row.game.acceptanceState === 'accepted_done'
 }).length)
-const evidencePendingGames = computed(() => scopedGames.value.filter((game) => {
+const evidencePendingGames = computed(() => progressRows.value.map((row) => row.game).filter((game) => {
   if (['human_required', 'human_takeover'].includes(gameRuntimeState(game))) return false
   if (game.acceptanceState !== 'evidence_pending') return false
   if (displayedExecutionBatch.value?.batchId && game.batchId === displayedExecutionBatch.value.batchId) return true
@@ -218,8 +240,7 @@ const evidencePendingGames = computed(() => scopedGames.value.filter((game) => {
   return typeof game.runId === 'string' && currentRunIds.has(game.runId)
 }))
 const reviewCount = computed(() => new Set([
-  ...todayScope.value.todos.filter((todo) => todo.status === 'review_required').map((todo) => todo.gameId),
-  ...evidencePendingGames.value.map((game) => game.gameId),
+  ...progressRows.value.filter((row) => row.todos.some((todo) => todo.status === 'review_required') || row.game.acceptanceState === 'evidence_pending').map((row) => row.targetId),
 ]).size)
 const riskCount = computed(() => todayScope.value.blocked)
 const todayScopeUsable = computed(() => todayScope.value.known && !dailyTodos.loading.value && !dailyTodos.error.value)
@@ -234,6 +255,7 @@ const todayScopeStatus = computed(() => {
 const manualDirtyGameIds = computed(() => {
   const ids = new Set(Object.keys(gamePathDrafts.value))
   if (okWwProfileDraft.value) ids.add('WW')
+  if (wwAccountDraft.value) ids.add('WW')
   if (endfieldProfileDraft.value) ids.add('Endfield')
   if (nteProfileDraft.value) ids.add('NTE')
   if (cznProfileDraft.value) ids.add('CZN')
@@ -303,8 +325,13 @@ const activeGame = computed(() => {
   return allGames.value.find((game) => game.gameId === currentGameId)
     ?? allGames.value.find((game) => game.runtimeState === 'running')
 })
+const currentAccountId = computed(() => displayedExecutionBatch.value?.result?.currentAccountId ?? 'default')
+const currentAccountLabel = computed(() => activeGame.value?.gameId === 'WW'
+  ? wwTargets.value.find((target) => target.accountId === currentAccountId.value)?.accountLabel ?? '账号等待同步'
+  : '')
 const activeTodo = computed(() => activeGame.value
-  ? gameTodos(activeGame.value.gameId).find((item) => item.status === 'in_progress')
+  ? gameTodos(activeGame.value.gameId).find((item) => item.status === 'in_progress'
+    && (activeGame.value?.gameId !== 'WW' || accountIdOf(item) === currentAccountId.value))
   : undefined)
 const displayedRunState = computed(() => {
   if (humanTakeoverTargets.value.length) return 'human_required'
@@ -327,9 +354,6 @@ function gameRuntimeState(game: GameState): string {
   return todayRuntimeState(game, gameTodos(game.gameId))
 }
 
-function gameNextActionLabel(game: GameState): string {
-  return todayGameNextAction(game, gameTodos(game.gameId))
-}
 const gamePaths = computed<Record<string, GamePathConfig>>(() => {
   const raw = recordOf(configDocument.value?.config)
   const configured = recordOf(raw.gamePaths ?? raw.game_paths)
@@ -365,11 +389,13 @@ const dailyToolProfiles = computed(() => {
   return recordOf(raw.dailyToolProfiles ?? raw.daily_tool_profiles)
 })
 
-async function loadConfiguration(): Promise<void> {
+async function loadConfiguration(): Promise<boolean> {
   try {
     configDocument.value = await managerApi.get<ConfigDocument>('/config')
+    return true
   } catch (error) {
     manager.rememberError('读取游戏路径配置', error)
+    return false
   }
 }
 
@@ -390,6 +416,27 @@ async function loadEvidenceArtifacts(): Promise<void> {
   } catch (error) {
     manager.rememberError('读取今日完成截图', error)
   }
+}
+
+let accountRunLoadRevision = 0
+async function loadAccountRuns(): Promise<void> {
+  const revision = ++accountRunLoadRevision
+  const runIds = [...new Set([
+    ...wwTargets.value.map((target) => target.runId),
+    ...dailyTodos.items.value.filter((todo) => todo.gameId === 'WW').map((todo) => todo.runId),
+  ].filter((id): id is string => typeof id === 'string' && id.length > 0))]
+  const results = await Promise.allSettled(runIds.map((id) => managerApi.get<GameRunRecord>(`/game-runs/${encodeURIComponent(id)}`)))
+  if (revision === accountRunLoadRevision) accountRuns.value = results.flatMap((result) => result.status === 'fulfilled' ? [result.value] : [])
+}
+watch(() => [dailyTodos.items.value, wwTargets.value, snapshot.value.stateVersion], (_value, _previous, onCleanup) => {
+  const timer = setTimeout(() => void loadAccountRuns(), 300)
+  onCleanup(() => clearTimeout(timer))
+}, { immediate: true })
+
+function updateWwAccounts(accounts: GameAccount[]): void {
+  if (configurationLocked.value) return
+  wwAccountDraft.value = accounts
+  touchManualConfig('WW')
 }
 
 let evidenceReloadTimer: ReturnType<typeof setTimeout> | undefined
@@ -425,19 +472,9 @@ function gameTodos(gameId: string) {
   return scopedTodoGroups.value.get(gameId) ?? []
 }
 
-function requiredGameTodos(gameId: string) {
-  return gameTodos(gameId).filter((item) => item.required)
-}
-
-function optionalGameTodos(gameId: string) {
-  return gameTodos(gameId).filter((item) => !item.required)
-}
-
-function gameTodoSummary(gameId: string) {
-  return todoSummaryFromItems(gameTodos(gameId), 'daily')
-}
-
 function todayEvidenceForGame(gameId: string): EvidenceArtifact[] {
+  // WW completion images are shown on each account's exact Run below.
+  if (gameId === 'WW') return []
   const game = allGames.value.find((item) => item.gameId === gameId)
   const completion = recordOf(recordOf(game?.policy).currentCompletion)
   const acceptedArtifactIds = Array.isArray(completion.screenshotEvidenceIds)
@@ -450,6 +487,12 @@ function todayEvidenceForGame(gameId: string): EvidenceArtifact[] {
     gameDayKeys: dailyConfigTodos(gameId).map((item) => item.periodKey).filter(Boolean),
     acceptedArtifactIds,
   })
+}
+
+function accountRewardEvidence(targetId: string): EvidenceArtifact[] {
+  const target = wwTargets.value.find((item) => item.targetId === targetId)
+  const game = allGames.value.find((item) => item.gameId === 'WW')
+  return target && game ? accountCompletionEvidence(game, target, gameTodos('WW'), accountRuns.value, evidenceArtifacts.value) : []
 }
 
 function artifactContentUrl(artifactId: string): string {
@@ -497,7 +540,8 @@ function toggleTodo(gameId: string): void {
 }
 
 function dailyConfigTodos(gameId: string) {
-  return allGameTodos(gameId).filter((item) => item.cadence === 'daily')
+  return [...new Map(allGameTodos(gameId).filter((item) => item.cadence === 'daily')
+    .map((item) => [item.todoDefinitionId, item])).values()]
 }
 
 function hasDraft<T>(drafts: Record<string, T>, gameId: string): boolean {
@@ -761,7 +805,8 @@ function markDailySelectionFailure(gameId: string, failed: boolean): void {
 }
 
 async function confirmSavedStateVersion(beforeStateVersion: number, acceptedStateVersion?: number): Promise<boolean> {
-  await Promise.all([manager.refresh({ quiet: true }), loadConfiguration()])
+  const [, configLoaded] = await Promise.all([manager.refresh({ quiet: true }), loadConfiguration()])
+  if (!configLoaded) return false
   const target = acceptedStateVersion ?? beforeStateVersion + 1
   return target > beforeStateVersion
     && snapshot.value.stateVersion >= target
@@ -820,6 +865,7 @@ async function saveDailyGameConfig(gameId: string): Promise<boolean> {
   const dailyToolProfilesPatch = dailyToolProfilePatch(gameId)
   const manualRevision = manualConfigRevisions.get(gameId) ?? 0
   const selectionRevision = dailySelectionRevisions.get(gameId) ?? 0
+  const submittedAccountDraft = wwAccountDraft.value
   savingGameConfigId.value = gameId
   try {
     await manager.refresh({ quiet: true })
@@ -841,6 +887,7 @@ async function saveDailyGameConfig(gameId: string): Promise<boolean> {
       },
       dailyTodoSelection: { [gameId]: selectedDailyTodoDefinitionIds(gameId) },
       ...(dailyToolProfilesPatch ? { dailyToolProfiles: dailyToolProfilesPatch } : {}),
+      ...(gameId === 'WW' ? { game_accounts: { WW: gameAccountsPatch(wwAccounts.value) } } : {}),
     })
     if (receipt) {
       if (!await confirmSavedStateVersion(beforeStateVersion, receipt.acceptedStateVersion)) {
@@ -854,6 +901,7 @@ async function saveDailyGameConfig(gameId: string): Promise<boolean> {
         if (gameId === 'NTE') nteProfileDraft.value = undefined
         if (gameId === 'CZN') cznProfileDraft.value = undefined
       }
+      if (gameId === 'WW' && wwAccountDraft.value === submittedAccountDraft) wwAccountDraft.value = undefined
       if ((dailySelectionRevisions.get(gameId) ?? 0) === selectionRevision) {
         gameEnabledDrafts.value = Object.fromEntries(Object.entries(gameEnabledDrafts.value).filter(([id]) => id !== gameId))
         dailyTodoSelectionDrafts.value = Object.fromEntries(Object.entries(dailyTodoSelectionDrafts.value).filter(([id]) => id !== gameId))
@@ -1101,14 +1149,14 @@ async function resumeGameRun(runId: string): Promise<void> {
       <div class="panel-body primary-action-detail">
         <div class="primary-action-copy">
           <span>{{ todayScopeStatus }}</span>
-          <span>本次范围：{{ todayScope.gameIds.length }} 款游戏 · {{ todayScopeUsable ? `${todoCompleted}/${todoRequired} 个必做项目` : '项目明细等待同步' }}</span>
+          <span>本次范围：{{ todayScope.gameIds.length }} 款游戏 · {{ progressRows.length }} 个游戏账号 · {{ todayScopeUsable ? `${todoCompleted}/${todoRequired} 个必做项目` : '项目明细等待同步' }}</span>
           <div v-if="cleanupView" class="queue-cleanup-note" role="status" aria-live="polite">
             <strong>{{ cleanupView.title }}</strong><span>{{ cleanupView.summary }}</span>
           </div>
         </div>
         <div class="primary-action-buttons">
           <template v-if="humanTakeoverTargets.length">
-            <v-btn v-for="target in humanTakeoverTargets" :key="target.runId" color="warning" @click="router.push(`/games/${encodeURIComponent(target.gameId)}`)">打开{{ allGames.find((game) => game.gameId === target.gameId)?.displayName ?? target.gameId }}人工接管详情</v-btn>
+            <v-btn v-for="target in humanTakeoverTargets" :key="target.runId" color="warning" @click="router.push(accountRunLocation(target.gameId, target.runId))">打开{{ allGames.find((game) => game.gameId === target.gameId)?.displayName ?? target.gameId }}{{ wwTargets.find((item) => item.runId === target.runId)?.accountLabel ?? '' }}人工接管详情</v-btn>
           </template>
           <v-btn v-else-if="canReviewEvidence" color="warning" :loading="busy" @click="router.push('/agent-workbench')">打开证据复核</v-btn>
           <template v-else-if="runResumeTargets.length">
@@ -1120,7 +1168,7 @@ async function resumeGameRun(runId: string): Promise<void> {
               :loading="busy"
               :disabled="!manager.supports('/game-runs/{runId}/resume-requests', 'post')"
               @click="resumeGameRun(target.runId)"
-            >恢复{{ allGames.find((game) => game.gameId === target.gameId)?.displayName ?? target.gameId }}</v-btn>
+            >恢复{{ allGames.find((game) => game.gameId === target.gameId)?.displayName ?? target.gameId }}{{ wwTargets.find((item) => item.runId === target.runId)?.accountLabel ?? '' }}</v-btn>
           </template>
           <v-btn v-else-if="canReviewBatch" color="warning" :loading="busy" @click="router.push('/agent-workbench')">打开运行复核</v-btn>
           <v-btn v-else-if="displayedExecutionBatch?.result?.batchActionAvailability?.cancel === true" color="error" variant="tonal" :loading="busy" :disabled="!manager.supports('/batches/{batchId}/cancel-requests', 'post')" @click="cancelBatch">{{ mustStartFreshAfterCancel ? '结束旧运行后重新开始' : (activeBatch ? '安全停止当前执行' : '停止遗留运行') }}</v-btn>
@@ -1131,8 +1179,8 @@ async function resumeGameRun(runId: string): Promise<void> {
 
     <v-card class="panel span-12">
       <div class="panel-title">
-        <div><h2>每日游戏配置</h2><p class="soft-note">勾选决定一键每日的范围；最右侧只显示今天的完成状态，不会被勾选操作改写。</p></div>
-        <span class="soft-note">修改会在本机自动保存</span>
+        <div><h2>每日游戏配置</h2><p class="soft-note">勾选决定一键每日的范围；鸣潮各账号共用每日选择，执行进度在下方按账号分别显示。</p></div>
+        <span class="soft-note">勾选自动保存；账号与参数可点击保存，开始前也会统一保存</span>
       </div>
       <div v-if="allGames.length" class="daily-game-config-list">
         <details v-for="game in allGames" :key="game.gameId" class="daily-game-config">
@@ -1237,7 +1285,7 @@ async function resumeGameRun(runId: string): Promise<void> {
                 :loading="resettingGameId === game.gameId"
                 :disabled="configurationLocked || !manager.supports('/todo-reset-preview', 'get') || !manager.supports('/todo-reset-requests', 'post')"
                 @click="requestTodayStatusReset(game.gameId, game.displayName)"
-              >重置今日状态</v-btn>
+              >{{ game.gameId === 'WW' ? '重置全部账号今日状态' : '重置今日状态' }}</v-btn>
             </div>
             <v-alert v-if="gameConfigErrors[game.gameId]" type="error" variant="tonal" density="compact">
               {{ gameConfigErrors[game.gameId] }}
@@ -1245,6 +1293,7 @@ async function resumeGameRun(runId: string): Promise<void> {
             <v-alert v-if="integrationForGame(game.gameId)?.mappingStatus !== 'registered'" type="info" variant="tonal" density="compact">
               {{ integrationSummary(game.gameId) }}。当前选择仍会保存，开始时会再次确认能否自动执行。
             </v-alert>
+            <GameAccountEditor v-if="game.gameId === 'WW'" :model-value="wwAccounts" :disabled="configurationLocked || savingGameConfigId === 'WW'" @update:model-value="updateWwAccounts" />
             <section v-if="game.gameId === 'WW'" class="tool-profile ok-ww-profile">
               <strong>OK-WW 每日配置映射</strong>
               <p class="soft-note">选好体力路线和材料后，软件会按这些选择自动完成每日；不需要按快捷键或操作底层导航。</p>
@@ -1391,17 +1440,19 @@ async function resumeGameRun(runId: string): Promise<void> {
                   <small v-else>这一步暂时不能自动执行</small>
                 </span>
                 <v-btn
+                  v-if="game.gameId !== 'WW'"
                   size="small"
                   variant="tonal"
                   color="info"
                   :disabled="!stepEvidenceForTodo(todo).length"
                   @click="openStepScreenshots(game.displayName, todo)"
                 >查看步骤截图</v-btn>
-                <span class="today-todo-state" :class="{ complete: todo.status === 'completed' }">{{ todayTodoState(todo) }}</span>
+                <span v-if="game.gameId !== 'WW'" class="today-todo-state" :class="{ complete: todo.status === 'completed' }">{{ todayTodoState(todo) }}</span>
+                <small v-else class="soft-note">各账号进度见下方</small>
               </div>
               <p v-if="!dailyConfigTodos(game.gameId).length" class="soft-note">这款游戏暂时没有可选的每日项目。</p>
             </div>
-            <section class="completion-evidence">
+            <section v-if="game.gameId !== 'WW'" class="completion-evidence">
               <div class="completion-evidence-heading">
                 <strong>今日完成截图</strong>
                 <small>领取完成后由 YeYu Gamer 截取；带北京时间水印并绑定本次运行</small>
@@ -1436,7 +1487,7 @@ async function resumeGameRun(runId: string): Promise<void> {
         <div class="panel-title">
           <div>
             <h2>重置今日状态</h2>
-            <span class="soft-note">只清除这款游戏今天的完成记录</span>
+            <span class="soft-note">只清除这款游戏今天的完成记录{{ pendingResetGame?.gameId === 'WW' ? '（包含全部账号）' : '' }}</span>
           </div>
         </div>
         <div class="panel-body">
@@ -1493,15 +1544,15 @@ async function resumeGameRun(runId: string): Promise<void> {
       <div class="panel-title"><h2>当前执行</h2><StatusBadge :state="displayedRunState" /></div>
       <div class="panel-body current-execution">
         <template v-if="humanTakeoverTargets.length">
-          <div class="primary-cell"><small>等待人工接管</small><strong>{{ activeGame?.displayName ?? '当前游戏' }}</strong></div>
+          <div class="primary-cell"><small>等待人工接管</small><strong>{{ activeGame?.displayName ?? '当前游戏' }} {{ currentAccountLabel }}</strong></div>
           <div class="primary-cell"><small>接下来</small><strong>{{ primaryNextAction }}</strong><span class="soft-note">已保留本次范围，后续游戏保持未启动。</span></div>
         </template>
         <template v-else-if="runResumeTargets.length">
-          <div class="primary-cell"><small>等待恢复</small><strong>{{ activeGame?.displayName ?? '当前游戏' }}</strong></div>
+          <div class="primary-cell"><small>等待恢复</small><strong>{{ activeGame?.displayName ?? '当前游戏' }} {{ currentAccountLabel }}</strong></div>
           <div class="primary-cell"><small>接下来</small><strong>{{ primaryNextAction }}</strong><span class="soft-note">仍使用本次锁定的游戏和每日项目。</span></div>
         </template>
         <template v-else-if="executionInProgress">
-          <div class="primary-cell"><small>正在执行的游戏</small><strong>{{ activeGame?.displayName ?? '正在确认当前游戏' }}</strong></div>
+          <div class="primary-cell"><small>正在执行的游戏</small><strong>{{ activeGame?.displayName ?? '正在确认当前游戏' }} {{ currentAccountLabel }}</strong></div>
           <div class="primary-cell"><small>当前步骤</small><strong>{{ cleanupView?.inProgress ? cleanupView.title : activeTodo?.title ?? '正在启动、等待下一项或安全停止' }}</strong></div>
           <div class="primary-cell"><small>执行保护</small><strong>已锁定本次范围</strong><span class="soft-note">避免重复启动或在途中改动参数。</span></div>
           <div class="primary-cell"><small>接下来</small><strong>{{ primaryNextAction }}</strong><span class="soft-note">请只使用上方的主按钮继续。</span></div>
@@ -1514,7 +1565,7 @@ async function resumeGameRun(runId: string): Promise<void> {
       <span>今日必做</span><strong>{{ todayScopeUsable ? `${todoCompleted}/${todoRequired}` : '—' }}</strong><small>仅今天与本次选择</small>
     </v-card>
     <v-card class="panel metric-card span-3">
-      <span>确认完成</span><strong>{{ todayScopeUsable ? acceptedCount : '—' }}</strong><small>每日项目与完成截图均已确认</small>
+      <span>确认完成</span><strong>{{ todayScopeUsable ? acceptedCount : '—' }}</strong><small>逐游戏账号确认，不跨账号复用</small>
     </v-card>
     <v-card class="panel metric-card span-3">
       <span>等待复核</span><strong>{{ todayScopeUsable ? reviewCount : '—' }}</strong><small>点顶部唯一动作进入复核</small>
@@ -1536,7 +1587,7 @@ async function resumeGameRun(runId: string): Promise<void> {
         />
         <template v-else>
           <div class="form-row">
-            <div class="primary-cell"><small>当前游戏</small><strong>{{ activeGame?.displayName ?? '等待调度' }}</strong></div>
+            <div class="primary-cell"><small>当前游戏</small><strong>{{ activeGame?.displayName ?? '等待调度' }} {{ currentAccountLabel }}</strong></div>
             <div class="primary-cell"><small>启动时间</small><strong>{{ formatTime(displayedExecutionBatch.startedAt) }}</strong></div>
             <div class="primary-cell"><small>当前情况</small><strong>{{ primaryStopReason }}</strong></div>
             <div class="primary-cell"><small>接下来</small><strong>{{ primaryNextAction }}</strong></div>
@@ -1553,43 +1604,59 @@ async function resumeGameRun(runId: string): Promise<void> {
         <table class="data-table">
           <thead><tr><th>游戏</th><th>每日进度</th><th>执行</th><th>完成</th><th>当前情况</th><th>接下来</th><th>更新</th></tr></thead>
           <tbody>
-            <template v-for="game in scopedGames" :key="game.gameId">
+            <template v-for="row in progressRows" :key="row.targetId">
               <tr>
                 <td class="primary-cell">
-                  <button class="game-link" @click="router.push(`/games/${encodeURIComponent(game.gameId)}`)"><strong>{{ game.displayName }}</strong></button>
+                  <button class="game-link" @click="router.push(accountRunLocation(row.game.gameId, row.game.runId, row.accountId))"><strong>{{ row.game.displayName }}</strong></button>
                 </td>
                 <td>
-                  <button v-if="todayScopeUsable" class="todo-toggle" @click="toggleTodo(game.gameId)">
-                    {{ gameTodoSummary(game.gameId).requiredCompleted }}/{{ gameTodoSummary(game.gameId).requiredTotal }} · 每日已执行项
-                    <span v-if="gameTodoSummary(game.gameId).counts.blocked">· 阻塞 {{ gameTodoSummary(game.gameId).counts.blocked }}</span>
-                    <span v-if="gameTodoSummary(game.gameId).counts.review_required">· 复核 {{ gameTodoSummary(game.gameId).counts.review_required }}</span>
+                  <button v-if="todayScopeUsable" class="todo-toggle" @click="toggleTodo(row.targetId)">
+                    {{ row.summary.requiredCompleted }}/{{ row.summary.requiredTotal }} · 每日已执行项
+                    <span v-if="row.summary.counts.blocked">· 阻塞 {{ row.summary.counts.blocked }}</span>
+                    <span v-if="row.summary.counts.review_required">· 复核 {{ row.summary.counts.review_required }}</span>
                   </button>
                   <span v-else class="soft-note">项目明细等待同步</span>
                 </td>
-                <td><StatusBadge :state="gameRuntimeState(game)" /></td>
-                <td><StatusBadge :state="knownDisplayState(game.acceptanceState, acceptanceDisplayStates)" /></td>
-                <td><StatusBadge :state="todayGameSituationState(game, gameTodos(game.gameId))" /></td>
+                <td><StatusBadge :state="todayRuntimeState(row.game, row.todos)" /></td>
+                <td><StatusBadge :state="knownDisplayState(row.game.acceptanceState, acceptanceDisplayStates)" /></td>
+                <td><StatusBadge :state="todayGameSituationState(row.game, row.todos)" /></td>
                 <td>
-                  <button v-if="todayRuntimeIsIssue(gameRuntimeState(game)) || ['human_required', 'human_takeover'].includes(gameRuntimeState(game))" class="game-link" @click="router.push(`/games/${encodeURIComponent(game.gameId)}`)">{{ gameNextActionLabel(game) }}</button>
-                  <template v-else>{{ gameNextActionLabel(game) }}</template>
+                  <button v-if="todayRuntimeIsIssue(todayRuntimeState(row.game, row.todos)) || ['human_required', 'human_takeover'].includes(todayRuntimeState(row.game, row.todos))" class="game-link" @click="router.push(accountRunLocation(row.game.gameId, row.game.runId, row.accountId))">{{ todayGameNextAction(row.game, row.todos) }}</button>
+                  <template v-else>{{ todayGameNextAction(row.game, row.todos) }}</template>
                 </td>
-                <td>{{ formatTime(game.updatedAt) }}</td>
+                <td>{{ formatTime(row.game.updatedAt) }}</td>
               </tr>
-              <tr v-if="expanded.has(game.gameId)" class="todo-detail-row">
+              <tr v-if="expanded.has(row.targetId)" class="todo-detail-row">
                 <td colspan="7">
                   <section class="daily-plan">
                     <div class="daily-plan-heading">
                       <div>
-                        <strong>本日需要完成的项目</strong>
-                        <p class="soft-note">{{ gameTodoSummary(game.gameId).requiredCompleted }}/{{ requiredGameTodos(game.gameId).length }} 项已完成；每一项都显示当前状态与下一动作。</p>
+                        <strong>{{ row.game.displayName }} · 本日需要完成的项目</strong>
+                        <p class="soft-note">{{ row.summary.requiredCompleted }}/{{ row.summary.requiredTotal }} 项已执行；每一项都显示当前状态与下一动作。</p>
                       </div>
-                      <StatusBadge :state="knownDisplayState(game.acceptanceState, acceptanceDisplayStates)" small />
+                      <StatusBadge :state="knownDisplayState(row.game.acceptanceState, acceptanceDisplayStates)" small />
                     </div>
-                    <TodoChecklist :items="requiredGameTodos(game.gameId)" compact product-mode />
-                    <details v-if="optionalGameTodos(game.gameId).length" class="optional-todos">
-                      <summary>查看 {{ optionalGameTodos(game.gameId).length }} 项可选每日项</summary>
-                      <TodoChecklist :items="optionalGameTodos(game.gameId)" compact product-mode />
+                    <TodoChecklist :items="row.todos.filter((todo) => todo.required)" compact product-mode />
+                    <details v-if="row.todos.some((todo) => !todo.required)" class="optional-todos">
+                      <summary>查看可选每日项</summary>
+                      <TodoChecklist :items="row.todos.filter((todo) => !todo.required)" compact product-mode />
                     </details>
+                    <div v-if="row.accountId" class="account-step-evidence">
+                      <div v-for="todo in row.todos" :key="todo.todoInstanceId">
+                        <span>{{ todo.title }} · {{ todayTodoState(todo) }}</span>
+                        <v-btn size="small" variant="tonal" :disabled="!stepEvidenceForTodo(todo).length" @click="openStepScreenshots(row.game.displayName, todo)">查看步骤截图</v-btn>
+                      </div>
+                    </div>
+                    <section v-if="row.accountId" class="completion-evidence">
+                      <strong>{{ row.game.displayName }} · 今日完成截图</strong>
+                      <div v-if="accountRewardEvidence(row.targetId).length" class="completion-evidence-grid">
+                        <a v-for="artifact in accountRewardEvidence(row.targetId)" :key="artifact.artifactId" class="completion-evidence-card" :href="artifactContentUrl(artifact.artifactId)" target="_blank" rel="noopener">
+                          <img :src="artifactContentUrl(artifact.artifactId)" :alt="`${row.game.displayName} ${evidenceKindLabel(artifact)}`" loading="lazy">
+                          <span>{{ evidenceKindLabel(artifact) }}</span><small>{{ formatTime(artifact.capturedAt) }}</small>
+                        </a>
+                      </div>
+                      <p v-else class="soft-note">本账号尚无同一次运行已经确认的完成截图；其他账号的截图不会显示在这里。</p>
+                    </section>
                     <p class="soft-note mt-3">所有必做项目完成后，还要确认同一次运行中的完成截图，才会显示为“确认完成”。</p>
                   </section>
                 </td>
@@ -1647,6 +1714,8 @@ async function resumeGameRun(runId: string): Promise<void> {
 .completion-evidence-card small { color: var(--muted); }
 .step-screenshot-dialog { overflow: hidden; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+.account-step-evidence { display: grid; gap: 8px; }
+.account-step-evidence > div { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .step-screenshot-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
 .step-screenshot-grid .completion-evidence-card img { aspect-ratio: 16 / 9; object-fit: contain; }
 .current-execution { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }

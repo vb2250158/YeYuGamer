@@ -11,10 +11,13 @@ import type {
   CompletionReviewPredicateContract,
   CompletionReviewRequiredTodo,
   EvidenceArtifact,
+  GameRunRecord,
   JsonObject,
   WorkItemClaim,
 } from '../api/contracts'
 import { useResource } from '../composables/useResource'
+import { managerApi } from '../api/client'
+import { reviewRunContextError } from '../utils/gameAccounts'
 import { useManagerStore } from '../stores/manager'
 import PageHeader from '../components/PageHeader.vue'
 import ResourceState from '../components/ResourceState.vue'
@@ -128,11 +131,29 @@ const selectedCompletionAdjudications = computed(() => completionAdjudications.i
   !!selected.value?.runId && item.runId === selected.value.runId))
 const selectedBlockers = computed(() => blockersFromDiagnostics(selectedTodoDiagnostics.value))
 const isCompletionReviewWorkItem = computed(() => selected.value?.kind === 'evidence_review')
-const currentSnapshotRunId = computed(() => manager.snapshot.games
-  .find((game) => game.gameId === selected.value?.gameId)?.runId)
+const reviewRun = ref<GameRunRecord>()
+const reviewRunLoadError = ref<string>()
+const reviewRunError = computed(() => reviewRunLoadError.value ?? reviewRunContextError(selected.value, reviewRun.value))
+// A different account may now occupy the game's snapshot row. Verify this work
+// item's immutable Run directly, instead of borrowing the game's current Run.
+const currentSnapshotRunId = computed(() => reviewRunError.value ? undefined : reviewRun.value?.runId)
+watch(selected, async (item, _previous, onCleanup) => {
+  let stale = false
+  onCleanup(() => { stale = true })
+  reviewRun.value = undefined
+  reviewRunLoadError.value = undefined
+  if (item?.kind !== 'evidence_review' || !item.runId) return
+  try {
+    const run = await managerApi.get<GameRunRecord>(`/game-runs/${encodeURIComponent(item.runId)}`)
+    if (!stale) reviewRun.value = run
+  } catch (error) {
+    if (!stale) reviewRunLoadError.value = `工作项运行核验失败：${error instanceof Error ? error.message : String(error)}`
+  }
+}, { immediate: true })
 const completionScope = computed(() => parseCompletionReviewScope(selected.value, currentSnapshotRunId.value))
 const completionContract = computed(() => parseCompletionReviewContract(selected.value, completionScope.value.value))
 const completionContextErrors = computed(() => [
+  ...(reviewRunError.value ? [reviewRunError.value] : []),
   ...completionScope.value.errors,
   ...completionContract.value.errors,
 ])
@@ -425,6 +446,7 @@ const decisionUnavailableReason = computed(() => {
     return 'accepted 的诊断工作项必须覆盖冻结范围内的全部 Todo。'
   }
   if (!isCompletionReviewWorkItem.value) return undefined
+  if (reviewRunError.value) return reviewRunError.value
   if (artifacts.loading.value) return '正在读取工作项 artifact 台账。'
   if (artifacts.error.value) return `无法读取工作项 artifact 台账：${artifacts.error.value}`
   if (completionReviews.loading.value || completionAdjudications.loading.value) return '正在读取当前完成复核台账。'
@@ -440,6 +462,7 @@ const requestMoreEvidenceUnavailableReason = computed(() => {
   if (isDiagnoseWorkItem.value && diagnosisBuild.value.errors.length) return diagnosisBuild.value.errors.join('；')
   if (isDiagnoseWorkItem.value && diagnosisBuild.value.value.length === 0) return '请至少提交一项 unknown/unsupported 诊断并说明缺少什么证据。'
   if (!isCompletionReviewWorkItem.value) return undefined
+  if (reviewRunError.value) return reviewRunError.value
   if (artifacts.loading.value) return '正在读取工作项 artifact 台账。'
   if (artifacts.error.value) return `无法读取工作项 artifact 台账：${artifacts.error.value}`
   if (reviewRequiredCompletionBuild.value.errors.length) return reviewRequiredCompletionBuild.value.errors.join('；')
@@ -767,6 +790,7 @@ async function requestCapability(): Promise<void> {
                 <span>Batch <code>{{ completionScope.value.batchId }}</code></span>
                 <span>Game <code>{{ completionScope.value.gameId }}</code></span>
                 <span>Run <code>{{ completionScope.value.runId }}</code></span>
+                <span>账号 <code>{{ reviewRun?.accountSnapshot?.label ?? reviewRun?.accountId ?? '当前账号' }}</code></span>
                 <span>Attempt <code>{{ completionScope.value.runAttemptId }}</code></span>
                 <span>GameDay <code>{{ completionScope.value.gameDayKey }}</code></span>
                 <span>Policy <code>{{ completionContract.value.policyId }}@{{ completionContract.value.policyVersion }}</code></span>

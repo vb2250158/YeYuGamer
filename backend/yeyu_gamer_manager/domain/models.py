@@ -190,8 +190,11 @@ class BatchRecord(ApiModel):
 
 
 class GameRunRecord(ApiModel):
+    completion_contract: dict[str, Any] | None = None
     run_id: str
     game_id: str
+    account_id: str = "default"
+    account_snapshot: dict[str, Any] = Field(default_factory=dict)
     cadence: Cadence
     state: EntityState
     mode: RequestMode
@@ -277,6 +280,7 @@ class CompletionPredicateReview(ApiModel):
 
 
 class CompletionReviewSubmission(ApiModel):
+    account_id: str | None = Field(default=None, min_length=1, max_length=80)
     game_id: str = Field(min_length=1, max_length=80)
     run_id: str = Field(min_length=1, max_length=160)
     run_attempt_id: str = Field(min_length=1, max_length=160)
@@ -300,6 +304,7 @@ class CompletionReviewSubmission(ApiModel):
 
 
 class CompletionReviewRecord(ApiModel):
+    account_id: str = "default"
     completion_review_id: str
     work_item_id: str
     claim_id: str
@@ -318,6 +323,7 @@ class CompletionReviewRecord(ApiModel):
 
 
 class CompletionAdjudicationRecord(ApiModel):
+    account_id: str = "default"
     completion_adjudication_id: str
     batch_id: str
     game_id: str
@@ -394,6 +400,7 @@ class IncidentRecord(ApiModel):
 
 
 class EvidenceArtifactRecord(ApiModel):
+    account_id: str = "default"
     artifact_id: str
     kind: str
     captured_at: datetime
@@ -473,6 +480,7 @@ def _reject_fencing_material(value: Any) -> Any:
 
 
 class RunAttemptRecord(ApiModel):
+    account_id: str = "default"
     run_attempt_id: str
     run_id: str
     game_id: str
@@ -625,6 +633,7 @@ class TodoActionAvailability(ApiModel):
 
 
 class TodoInstanceRecord(ApiModel):
+    account_id: str = "default"
     todo_instance_id: str
     todo_definition_id: str
     definition_version: int = Field(ge=1)
@@ -665,6 +674,7 @@ class TodoInstanceRecord(ApiModel):
 
 
 class TodoResetPreviewItem(ApiModel):
+    account_id: str = "default"
     todo_definition_id: str
     todo_instance_id: str
     game_id: str
@@ -877,7 +887,13 @@ class ConfigResponse(ApiModel):
     updated_at: datetime | None = None
 
 
+class GameAccountTargetRequest(ApiModel):
+    game_id: str = Field(min_length=1, max_length=40, pattern=r"^[A-Za-z0-9_-]+$")
+    account_id: str = Field(default="default", min_length=1, max_length=80)
+
+
 class BatchCreateRequest(ApiModel):
+    targets: list[GameAccountTargetRequest] | None = Field(default=None, max_length=100)
     cadence: Cadence = Cadence.DAILY
     kind: Cadence | None = None
     game_ids: list[str] | None = None
@@ -891,6 +907,7 @@ class BatchResumeRequest(ApiModel):
 
 
 class GameRunCreateRequest(ApiModel):
+    account_id: str = Field(default="default", min_length=1, max_length=80)
     game_id: str = Field(min_length=1, max_length=40, pattern=r"^[A-Za-z0-9_-]+$")
     cadence: Cadence = Cadence.DAILY
     mode: RequestMode = RequestMode.PLAN
@@ -898,6 +915,7 @@ class GameRunCreateRequest(ApiModel):
 
 
 class GameRunAliasRequest(ApiModel):
+    account_id: str = Field(default="default", min_length=1, max_length=80)
     kind: Cadence = Cadence.DAILY
     requested_by: str = Field(default="tray", min_length=1, max_length=80)
 
@@ -1307,7 +1325,15 @@ class DailyToolProfilesConfig(ApiModel):
     czn: CZNProfileConfig | None = None
 
 
+class GameAccountConfig(ApiModel):
+    account_id: str | None = Field(default=None, min_length=1, max_length=80)
+    label: str = Field(min_length=1, max_length=80)
+    enabled: bool = True
+    saved_account_label: str | None = Field(default=None, max_length=160)
+
+
 class ConfigPatchRequest(ApiModel):
+    game_accounts: dict[str, list[GameAccountConfig]] | None = None
     enabled: dict[str, bool] | None = None
     order: list[str] | None = None
     daily_schedule_enabled: bool | None = None
@@ -1345,6 +1371,7 @@ class TodoTransitionRequest(ApiModel):
 
 
 class TodoReconcileRequest(ApiModel):
+    account_id: str | None = Field(default=None, min_length=1, max_length=80)
     game_ids: list[str] | None = Field(default=None, max_length=50)
     cadence: Cadence | None = None
     reason: str = Field(default="operator-request", min_length=1, max_length=500)

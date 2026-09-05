@@ -53,7 +53,7 @@ $receipt = [ordered]@{
     packageId = 'legacy-night-rain-gamer'
     packageVersion = '0.1.0'
     buildId = 'fake-e2e'
-    supportedGameIds = @('StarRail')
+    supportedGameIds = @('StarRail', 'WW')
     payloadDigest = $payloadDigest
     replaySuiteDigest = 'sha256:' + ('1' * 64)
     shadowSuiteDigest = 'sha256:' + ('2' * 64)
@@ -80,7 +80,7 @@ $manifest = [ordered]@{
     minHostVersion = '0.2.0'
     entryPoint = 'runner.exe'
     files = @($payloadFiles) + @([ordered]@{ path='promotion-receipt.json'; sha256=$receiptHash; sizeBytes=(Get-Item -LiteralPath $receiptPath).Length })
-    supportedGameIds = @('StarRail')
+    supportedGameIds = @('StarRail', 'WW')
     operationBindings = [ordered]@{
         StarRail = [ordered]@{
             'observe-panel' = [ordered]@{
@@ -112,6 +112,7 @@ $manifest = [ordered]@{
     }
     executionReady = $true
 }
+$manifest.operationBindings['WW'] = $manifest.operationBindings.StarRail
 $manifest | ConvertTo-Json -Depth 12 -Compress | Set-Content -LiteralPath (Join-Path $runnerRoot 'install-manifest.json') -Encoding utf8NoBOM
 
 $todoId = 'todo-instance-33333333-3333-4333-8333-333333333333'
@@ -179,6 +180,62 @@ if ($events[-1].completedTodoInstanceIds[0] -ne $todoId) {
 }
 if (-not (Test-Path -LiteralPath (Join-Path $stagingRoot 'evidence.txt') -PathType Leaf)) {
     throw 'Fake runner did not use the Manager-owned staging directory.'
+}
+
+# Exercise the actual compiled Host stdin/package/child-transport chain. These
+# are synthetic labels in an isolated fixture package, never installed games.
+$wwRequest = $request | ConvertTo-Json -Depth 10 | ConvertFrom-Json -AsHashtable
+$wwRequest.gameId = 'WW'
+$wwRequest.accountId = '88888888-8888-4888-8888-888888888888'
+$wwRequest.accountSnapshot = @{label='Fixture A';saved_account_label='fixture****example.com'}
+$originalArguments = $startInfo.Arguments
+try {
+    $startInfo.Arguments = $originalArguments.Replace('--game-id StarRail', '--game-id WW')
+    $wwProcess = [Diagnostics.Process]::new()
+    $wwProcess.StartInfo = $startInfo
+    if (-not $wwProcess.Start()) { throw 'WW account Host fixture did not start.' }
+    $wwProcess.StandardInput.WriteLine(($wwRequest | ConvertTo-Json -Depth 10 -Compress))
+    $wwProcess.StandardInput.Close()
+    $wwOutput = $wwProcess.StandardOutput.ReadToEnd()
+    $wwError = $wwProcess.StandardError.ReadToEnd()
+    $wwProcess.WaitForExit()
+    $wwEvents = @($wwOutput -split "`r?`n" | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
+    $received = Get-Content -LiteralPath (Join-Path $stagingRoot 'account-scope-received.json') -Raw | ConvertFrom-Json
+    if ($wwProcess.ExitCode -ne 0 -or $wwError -or $wwEvents.Count -ne 5 -or
+        $wwEvents[-1].status -ne 'completed' -or $received.accountId -cne $wwRequest.accountId -or
+        $received.accountSnapshot.saved_account_label -cne $wwRequest.accountSnapshot.saved_account_label -or
+        $received.cancelAuthorityPresent) { throw 'Compiled Host did not preserve the WW account scope to its fixture Runner.' }
+    $wwProcess.Dispose()
+    foreach ($accountCase in @('other-game', 'noncanonical-id', 'extra-field', 'extra-top-field', 'scalar-snapshot', 'empty-selector', 'path-selector', 'unmasked-selector')) {
+        $invalid = $wwRequest | ConvertTo-Json -Depth 10 | ConvertFrom-Json -AsHashtable
+        switch ($accountCase) {
+            'other-game' { $invalid.gameId = 'StarRail' }
+            'noncanonical-id' { $invalid.accountId = 'NOT-A-UUID' }
+            'extra-field' { $invalid.accountSnapshot.password = 'placeholder' }
+            'extra-top-field' { $invalid.accountCommand = 'placeholder' }
+            'scalar-snapshot' { $invalid.accountSnapshot = 'invalid' }
+            'empty-selector' { $invalid.accountSnapshot.saved_account_label = '' }
+            'path-selector' { $invalid.accountSnapshot.saved_account_label = 'C:\fixture****' }
+            'unmasked-selector' { $invalid.accountSnapshot.saved_account_label = 'unmasked' }
+        }
+        $startInfo.Arguments = $originalArguments.Replace('--game-id StarRail', ('--game-id ' + $invalid.gameId))
+        $badAccountProcess = [Diagnostics.Process]::new()
+        $badAccountProcess.StartInfo = $startInfo
+        if (-not $badAccountProcess.Start()) { throw 'Invalid account fixture Host did not start.' }
+        $badAccountProcess.StandardInput.WriteLine(($invalid | ConvertTo-Json -Depth 10 -Compress))
+        $badAccountProcess.StandardInput.Close()
+        $badAccountOutput = $badAccountProcess.StandardOutput.ReadToEnd()
+        $badAccountError = $badAccountProcess.StandardError.ReadToEnd()
+        $badAccountProcess.WaitForExit()
+        $badAccountResult = $badAccountOutput | ConvertFrom-Json
+        if ($badAccountProcess.ExitCode -ne 64 -or $badAccountError -or
+            $badAccountResult.code -ne 'invalid_execute_request' -or $badAccountResult.adapterProcessStarted) {
+            throw "Compiled Host accepted invalid account scope: $accountCase"
+        }
+        $badAccountProcess.Dispose()
+    }
+} finally {
+    $startInfo.Arguments = $originalArguments
 }
 
 # Compatibility must not weaken receipt/payload integrity. Rebind the fixture
@@ -394,5 +451,7 @@ Remove-Item -LiteralPath $deliveredControl -Force
     controlAclProtected = $true
     priorHostPromotionAccepted = $true
     invalidPromotionRejected = $true
+    wwAccountScopeRelayed = $true
+    invalidAccountScopeRejected = $true
     gameProcessStarted = $false
 }

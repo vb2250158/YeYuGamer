@@ -46,6 +46,12 @@ namespace YeYuGamer.AdapterHost.Tests
             string staging = Environment.GetEnvironmentVariable("YEYU_GAMER_ADAPTER_STAGING_DIR");
             if (String.IsNullOrEmpty(staging)) return 65;
             Directory.CreateDirectory(staging);
+            if ((string)request["gameId"] == "WW" && request.ContainsKey("accountId")) {
+                File.WriteAllText(Path.Combine(staging, "account-scope-received.json"), Json.Serialize(new Dictionary<string, object> {
+                    { "accountId", request["accountId"] }, { "accountSnapshot", request["accountSnapshot"] },
+                    { "cancelAuthorityPresent", request.ContainsKey("cancelAuthority") }
+                }), new UTF8Encoding(false));
+            }
             string artifactPath = Path.Combine(staging, "evidence.txt");
             File.WriteAllText(artifactPath, "fresh fake evidence", new UTF8Encoding(false));
 

@@ -379,6 +379,7 @@ class AdapterArtifactImporter:
                 "kind": artifact_kind,
                 "contentType": content_type,
                 "gameId": plan.game_id,
+                "accountId": plan.account_id,
                 "runId": plan.run_id,
                 "runAttemptId": plan.run_attempt_id,
                 "todoAttemptId": str(event["todoAttemptId"]),

@@ -104,9 +104,16 @@ def todo_period(reset_rule: dict[str, Any], at: datetime | None = None) -> dict[
     }
 
 
-def todo_instance_id(todo_definition_id: str, period_key: str) -> str:
+def todo_instance_id(todo_definition_id: str, period_key: str, *, account_id: str = "default") -> str:
+    if not isinstance(account_id, str) or not account_id:
+        raise ValueError("account_id is required")
+    identity = (
+        f"yeyu-gamer/todo-instance/v1/{todo_definition_id}/{period_key}"
+        if account_id == "default"
+        else f"yeyu-gamer/todo-instance/v2/{account_id}/{todo_definition_id}/{period_key}"
+    )
     value = uuid.uuid5(
         TODO_INSTANCE_NAMESPACE,
-        f"yeyu-gamer/todo-instance/v1/{todo_definition_id}/{period_key}",
+        identity,
     )
     return f"todo-instance-{value}"

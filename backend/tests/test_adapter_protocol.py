@@ -235,6 +235,36 @@ class AdapterProtocolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.plan = AdapterExecutionPlan.from_document(plan_document())
 
+    def test_ww_account_scope_round_trip_and_legacy_wire_compatibility(self) -> None:
+        self.assertNotIn("accountId", self.plan.to_document())
+        self.assertNotIn("accountSnapshot", self.plan.to_document())
+        snapshot = {"label": "Account A", "saved_account_label": "alpha****example.com"}
+        plan = AdapterExecutionPlan.from_document(plan_document(
+            gameId="WW", accountId=RUN_ID, accountSnapshot=snapshot,
+        ))
+        parsed = parse_execute_request(serialize_execute_request(plan))
+        self.assertEqual(parsed.account_id, RUN_ID)
+        self.assertEqual(parsed.account_snapshot, snapshot)
+        legacy = AdapterExecutionPlan.from_document(plan_document(gameId="WW"))
+        self.assertEqual(legacy.account_id, "default")
+        self.assertNotIn("accountSnapshot", legacy.to_document())
+
+    def test_account_scope_rejects_other_games_and_non_display_inputs(self) -> None:
+        for update in (
+            {"gameId": "NTE", "accountId": "default"},
+            {"gameId": "WW", "accountId": "../elsewhere"},
+            {"gameId": "WW", "accountId": RUN_ID, "accountSnapshot": {}},
+            {"gameId": "WW", "accountSnapshot": {"label": "A", "saved_account_label": ""}},
+            {"gameId": "WW", "accountSnapshot": {"label": "A", "saved_account_label": "unmasked-name"}},
+            {"gameId": "WW", "accountSnapshot": []},
+            {"gameId": "WW", "accountSnapshot": {"label": "A", "saved_account_label": "x****", "password": "placeholder"}},
+            {"gameId": "WW", "accountSnapshot": {"label": "A", "saved_account_label": "C:\\account"}},
+            {"gameId": "WW", "accountSnapshot": {"label": "A\nB", "saved_account_label": "x****"}},
+            {"gameId": "WW", "accountSnapshot": {"label": "A" * 81, "saved_account_label": "x****"}},
+        ):
+            with self.subTest(update=update), self.assertRaises(AdapterProtocolError):
+                AdapterExecutionPlan.from_document(plan_document(**update))
+
     def test_durable_cancel_control_uses_separate_hmac_authority(self) -> None:
         at = "2099-08-28T10:00:02+08:00"
         reason = "manager_restart_cancel_recovery"

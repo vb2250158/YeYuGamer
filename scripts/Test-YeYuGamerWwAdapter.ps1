@@ -41,6 +41,14 @@ New-Item -ItemType Directory -Path $evidenceRoot -Force | Out-Null
 $validator = Join-Path $source 'adapter-host\tests\validate_openkuro_selected_daily.py'
 $staticOutput = & $PythonPath -X utf8 $validator 2>&1
 if ($LASTEXITCODE -ne 0) { throw "OpenKuro static selected-Todo suite failed: $($staticOutput -join ' ')" }
+$accountOutput = & $PythonPath -B -X utf8 (Join-Path $source 'adapter-host\tests\validate_ww_account_bridge.py') (Join-Path $candidate 'WwAccountYeYuBridge.py') 2>&1
+if ($LASTEXITCODE -ne 0) { throw "WW saved-account behavior suite failed: $($accountOutput -join ' ')" }
+$accountReplay = Join-Path $evidenceRoot 'ReplayWwAccountBridge.exe'
+$accountCompiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+& $accountCompiler /nologo /target:exe /r:System.Web.Extensions.dll /out:$accountReplay (Join-Path $source 'adapter-host\tests\ReplayWwAccountBridge.cs')
+if ($LASTEXITCODE -ne 0) { throw 'WW saved-account runner replay compilation failed.' }
+& $accountReplay $runner
+if ($LASTEXITCODE -ne 0) { throw 'WW saved-account runner replay failed.' }
 $patchReplay = Join-Path $evidenceRoot 'ReplayWwConditionalPatch.exe'
 $patchReplaySource = Join-Path $source 'adapter-host\tests\ReplayWwConditionalPatch.cs'
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
@@ -59,6 +67,7 @@ $replayReport = Join-Path $evidenceRoot 'selected-todo-contract.json'
     operationCount=($expected.Values | ForEach-Object { @($_).Count } | Measure-Object -Sum).Sum;
     validatorOutput=($staticOutput -join "`n"); conditionalStageOutput=($conditionalOutput -join "`n");
     conditionalReplaySha256=(Get-FileHash -LiteralPath $patchedDaily -Algorithm SHA256).Hash.ToLowerInvariant(); gameStarted=$false
+    accountBridgeOutput=($accountOutput -join "`n"); accountBridgeSha256=(Get-FileHash -LiteralPath (Join-Path $candidate 'WwAccountYeYuBridge.py') -Algorithm SHA256).Hash.ToLowerInvariant()
 } | ConvertTo-Json -Depth 5 -Compress), [Text.UTF8Encoding]::new($false))
 
 $before = @(Get-Process -Name 'Wuthering Waves','Endfield','GF2','ok-ww','ok-ef','ok-gf2' -ErrorAction SilentlyContinue | Select-Object Id,ProcessName,StartTime)

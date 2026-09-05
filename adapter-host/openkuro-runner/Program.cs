@@ -81,6 +81,16 @@ namespace YeYuGamer.LocalDailyAdapter
             public string InnerPython;
             public string InnerEntry;
             public string AppName;
+            public string AccountId = "default";
+            public IDictionary<string, object> AccountSnapshot;
+            public string AccountOperation;
+            public bool AccountVerified;
+            public bool AccountHumanRequired;
+            public bool? AccountAutoStartBefore;
+            public bool AccountEnabled { get { return AccountSnapshot != null && AccountSnapshot.Count != 0; } }
+        }
+        private sealed class AccountBridgeGate : Exception {
+            public AccountBridgeGate(string reason) : base(reason) { }
         }
 
         public static int Main(string[] args)
@@ -131,6 +141,7 @@ namespace YeYuGamer.LocalDailyAdapter
                 attempts.Add(id, attemptId);
                 todosByOperation.Add(operation, Tuple.Create(id, todo));
             }
+            ConfigureAccountBinding(binding, request, todos);
             var cancellationRequested = new ManualResetEvent(false);
             var controlReader = new Thread(() => {
                 try {
@@ -156,6 +167,26 @@ namespace YeYuGamer.LocalDailyAdapter
             };
             var wwCaptureEvidence = new Dictionary<string, List<Tuple<string, string, bool, string>>>(StringComparer.Ordinal);
             var wwCaptureErrors = new Dictionary<string, string>(StringComparer.Ordinal);
+            var accountArtifacts = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            var accountCapturePhases = new HashSet<string>(StringComparer.Ordinal);
+            Action<string, string, string> captureAccount = (operation, state, stageDetail) => {
+                Tuple<string, IDictionary<string, object>> target;
+                if (!binding.AccountEnabled || !todosByOperation.TryGetValue(operation, out target) || terminal.Contains(target.Item1)) return;
+                if (!accountCapturePhases.Add(state)) throw new AccountBridgeGate("ww_account_duplicate_capture_phase");
+                startTodo(operation);
+                string name; string marked; string at; string captureDetail;
+                bool captured = CaptureWwRewardEvidence(binding, staging, state, false, out name, out marked, out at, out captureDetail);
+                if (!captured) throw new AccountBridgeGate("ww_account_evidence_capture_failed");
+                string artifactId = Guid.NewGuid().ToString();
+                string imagePath = Path.Combine(staging, name);
+                Emit(Base(request, binding.GameId, "artifact_staged", sequence++, new Dictionary<string, object> {
+                    { "todoInstanceId", target.Item1 }, { "todoAttemptId", attempts[target.Item1] }, { "artifactId", artifactId },
+                    { "kind", "game-ui-account-switch" }, { "fileName", name }, { "mimeType", "image/png" },
+                    { "sizeBytes", new FileInfo(imagePath).Length }, { "sha256", Hash(imagePath) }, { "capturedAt", at }
+                }));
+                if (!accountArtifacts.ContainsKey(operation)) accountArtifacts[operation] = new List<string>();
+                accountArtifacts[operation].Add(artifactId);
+            };
             int wwDailyActivityPoints = -1;
             Action<string, string, string> captureWwEvidence = (operation, phase, stageDetail) => {
                 if (binding.GameId != "WW" || operation != "claim-daily-reward") return;
@@ -208,6 +239,7 @@ namespace YeYuGamer.LocalDailyAdapter
                 string id = target.Item1;
                 string attemptId = attempts[id];
                 var evidenceArtifactIds = new List<string>();
+                if (accountArtifacts.ContainsKey(operation)) evidenceArtifactIds.AddRange(accountArtifacts[operation]);
                 if (binding.GameId == "WW" && operation == "claim-daily-reward") {
                     List<Tuple<string, string, bool, string>> beforeEvidence;
                     List<Tuple<string, string, bool, string>> afterEvidence;
@@ -277,6 +309,7 @@ namespace YeYuGamer.LocalDailyAdapter
                 bool failed = state == "failed";
                 bool skipped = state == "skipped";
                 bool completedStage = state == "completed";
+                bool humanRequired = state == "human_required";
                 // A clean process exit is transport evidence only. Every
                 // supported upstream tool must emit a structured stage event
                 // before a selected Todo can be considered completed.
@@ -284,8 +317,8 @@ namespace YeYuGamer.LocalDailyAdapter
                 // selected conditional daily.  Preserve the upstream reason
                 // and artifact, but do not leave the current-day obligation
                 // permanently skipped/deferred.
-                string terminalStatus = failed ? "failed" : (skipped || completedStage) ? "completed" : "review_required";
-                string reasonCode = failed ? TypedFailureReason(safeStageDetail, "upstream_stage_failed") : skipped ? "upstream_stage_not_needed" : completedStage ? "upstream_stage_completed" : "upstream_stage_unverified";
+                string terminalStatus = humanRequired ? "human_required" : failed ? "failed" : (skipped || completedStage) ? "completed" : "review_required";
+                string reasonCode = humanRequired ? TypedFailureReason(safeStageDetail, "ww_account_human_required") : failed ? TypedFailureReason(safeStageDetail, "upstream_stage_failed") : skipped ? "upstream_stage_not_needed" : completedStage ? "upstream_stage_completed" : "upstream_stage_unverified";
                 Emit(Base(request, binding.GameId, "todo_terminal", sequence++, new Dictionary<string, object> {
                     { "todoInstanceId", id }, { "todoAttemptId", attemptId }, { "status", terminalStatus },
                     { "reasonCode", reasonCode },
@@ -293,7 +326,7 @@ namespace YeYuGamer.LocalDailyAdapter
                     // fresh full batch may retry the fixed GUI lifecycle from
                     // the beginning. Human-required outcomes are produced by
                     // the upstream stage bridge and remain non-retryable.
-                    { "reason", safeStageDetail }, { "retryable", failed || (!skipped && !completedStage) }, { "evidenceArtifactIds", evidenceArtifactIds.ToArray() }
+                    { "reason", safeStageDetail }, { "retryable", !humanRequired && (failed || (!skipped && !completedStage)) }, { "evidenceArtifactIds", evidenceArtifactIds.ToArray() }
                 }));
                 terminal.Add(id);
                 if (terminalStatus == "completed") completed.Add(id);
@@ -322,6 +355,46 @@ namespace YeYuGamer.LocalDailyAdapter
             int exitCode; string detail; bool cancelled;
             try {
                 exitCode = RunDaily(binding, todosByOperation.Keys.ToArray(), (operation, state, stageDetail) => {
+                    if (binding.AccountHumanRequired) return;
+                    if (binding.AccountEnabled && state.StartsWith("account_capture_", StringComparison.Ordinal)) {
+                        string captureOperation = terminal.Contains(todosByOperation[operation].Item1)
+                            ? todosByOperation.Keys.FirstOrDefault(value => !terminal.Contains(todosByOperation[value].Item1)) : operation;
+                        if (captureOperation == null) throw new AccountBridgeGate("ww_account_capture_without_unresolved_todo");
+                        captureAccount(captureOperation, state, stageDetail);
+                        return;
+                    }
+                    if (binding.AccountEnabled && state == "account_verified") {
+                        if (!accountArtifacts.ContainsKey(operation) ||
+                            !new [] { "account_capture_before", "account_capture_list", "account_capture_selected", "account_capture_after" }.All(accountCapturePhases.Contains))
+                            throw new AccountBridgeGate("ww_account_identity_evidence_missing");
+                        binding.AccountVerified = true;
+                        string receiptName = "ww-account-receipt-" + Guid.NewGuid().ToString("N") + ".txt";
+                        string receiptPath = Path.Combine(staging, receiptName);
+                        File.WriteAllText(receiptPath, Json.Serialize(new Dictionary<string, object> {
+                            { "accountId", binding.AccountId }, { "verificationMethod", "unique-saved-label-and-stable-world" },
+                            { "savedLabelVerified", true }, { "uidVerified", false }
+                        }), new UTF8Encoding(false));
+                        string receiptId = Guid.NewGuid().ToString();
+                        Tuple<string, IDictionary<string, object>> target = todosByOperation[operation];
+                        Emit(Base(request, binding.GameId, "artifact_staged", sequence++, new Dictionary<string, object> {
+                            { "todoInstanceId", target.Item1 }, { "todoAttemptId", attempts[target.Item1] }, { "artifactId", receiptId },
+                            { "kind", "account-switch-receipt" }, { "fileName", receiptName }, { "mimeType", "text/plain" },
+                            { "sizeBytes", new FileInfo(receiptPath).Length }, { "sha256", Hash(receiptPath) }, { "capturedAt", DateTime.UtcNow.ToString("o") }
+                        }));
+                        accountArtifacts[operation].Add(receiptId);
+                        progressTodo(operation, stageDetail);
+                        return;
+                    }
+                    if (binding.AccountEnabled && state == "human_required") {
+                        string gateOperation = todosByOperation.Keys.FirstOrDefault(value => !terminal.Contains(todosByOperation[value].Item1));
+                        if (gateOperation == null) throw new InvalidOperationException("ww_account_human_gate_without_unresolved_todo");
+                        startTodo(gateOperation);
+                        terminalTodo(gateOperation, state, stageDetail);
+                        binding.AccountHumanRequired = true;
+                        return;
+                    }
+                    if (binding.AccountEnabled && !binding.AccountVerified && state != "started" && state != "progress")
+                        throw new AccountBridgeGate("ww_account_identity_not_verified");
                     if (state == "started") startTodo(operation);
                     else if (state == "progress") progressTodo(operation, stageDetail);
                     else if (state == "capture_before") captureWwEvidence(operation, "before", stageDetail);
@@ -330,7 +403,14 @@ namespace YeYuGamer.LocalDailyAdapter
                 }, () => cancellationRequested.WaitOne(0), out detail, out cancelled);
             }
             catch (Exception error) { exitCode = -1; detail = "tool_start_failed: " + error.Message; cancelled = false; }
-            if (!cancelled) {
+            if (binding.AccountEnabled && !binding.AccountVerified && !binding.AccountHumanRequired && !cancelled) {
+                StopStaleFormalProcesses(binding);
+                startTodo(binding.AccountOperation);
+                terminalTodo(binding.AccountOperation, "human_required", "ww_account_switch_unverified: " + detail);
+                binding.AccountHumanRequired = true;
+                exitCode = 0;
+            }
+            if (!cancelled && !binding.AccountHumanRequired) {
                 foreach (string operation in todosByOperation.Keys) {
                     Tuple<string, IDictionary<string, object>> target = todosByOperation[operation];
                     if (attempted.Contains(target.Item1) && !terminal.Contains(target.Item1))
@@ -346,7 +426,7 @@ namespace YeYuGamer.LocalDailyAdapter
             bool wwFormalExitCompleted = binding.GameId == "WW" && exitCode == 70 && completed.Count == ids.Length;
             bool transportClean = exitCode == 0 || wwFormalExitCompleted;
             bool allCompleted = completed.Count == ids.Length && transportClean;
-            string runStatus = cancelled ? "cancelled" : (allCompleted ? "completed" : (transportClean ? "review_required" : "failed"));
+            string runStatus = binding.AccountHumanRequired ? "human_required" : cancelled ? "cancelled" : (allCompleted ? "completed" : (transportClean ? "review_required" : "failed"));
             int declaredExitCode = wwFormalExitCompleted ? 0 : exitCode;
             string[] attemptedIds = ids.Cast<string>().Where(id => attempted.Contains(id)).ToArray();
             string[] completedIds = ids.Cast<string>().Where(id => completed.Contains(id)).ToArray();
@@ -628,7 +708,32 @@ namespace YeYuGamer.LocalDailyAdapter
         private static bool SupportedGame(string gameId) { return gameId == "WW" || gameId == "Endfield" || gameId == "GF2"; }
         private static bool MatchesRequest(IDictionary<string, object> r, Dictionary<string, string> o) {
             return r != null && (r["protocolVersion"] as string) == ProtocolVersion && (r["gameId"] as string) == o["--game-id"] &&
-                (r["runId"] as string) == o["--run-id"] && (r["runAttemptId"] as string) == o["--run-attempt-id"] && r["preserveClientOnStop"] is bool && (bool)r["preserveClientOnStop"];
+                (r["runId"] as string) == o["--run-id"] && (r["runAttemptId"] as string) == o["--run-attempt-id"] && r["preserveClientOnStop"] is bool && (bool)r["preserveClientOnStop"] && ValidAccountRequest(r);
+        }
+        private static bool ValidAccountRequest(IDictionary<string, object> request) {
+            if (!request.ContainsKey("accountId") && !request.ContainsKey("accountSnapshot")) return true;
+            if ((request["gameId"] as string) != "WW") return false;
+            string id = request.ContainsKey("accountId") ? request["accountId"] as string : "default";
+            Guid parsed;
+            if (id != "default" && (!Guid.TryParseExact(id, "D", out parsed) || parsed.ToString("D") != id)) return false;
+            if (!request.ContainsKey("accountSnapshot")) return id == "default";
+            IDictionary<string, object> snapshot = request["accountSnapshot"] as IDictionary<string, object>;
+            if (snapshot == null) return false;
+            if (snapshot.Count == 0) return id == "default";
+            if (snapshot.Count != 2 || !snapshot.ContainsKey("label") || !snapshot.ContainsKey("saved_account_label")) return false;
+            foreach (string key in new [] { "label", "saved_account_label" }) {
+                string value = snapshot[key] as string;
+                if (String.IsNullOrWhiteSpace(value) || value != value.Trim() || value.Length > (key == "label" ? 80 : 160) || value.Any(ch => Char.IsControl(ch) || ch == '\\' || ch == '/')) return false;
+            }
+            return ((string)snapshot["saved_account_label"]).Contains("****");
+        }
+        private static void ConfigureAccountBinding(Binding binding, IDictionary<string, object> request, object[] todos) {
+            if (!request.ContainsKey("accountSnapshot")) return;
+            IDictionary<string, object> snapshot = request["accountSnapshot"] as IDictionary<string, object>;
+            if (snapshot == null || snapshot.Count == 0) return;
+            binding.AccountId = request.ContainsKey("accountId") ? (string)request["accountId"] : "default";
+            binding.AccountSnapshot = snapshot;
+            binding.AccountOperation = ((IDictionary<string, object>)todos[0])["operation"] as string;
         }
         private static bool MatchesCancel(IDictionary<string, object> control, IDictionary<string, object> request) {
             return control != null && request != null && (control["protocolVersion"] as string) == ProtocolVersion &&
@@ -771,12 +876,20 @@ namespace YeYuGamer.LocalDailyAdapter
             File.WriteAllText(stageFile, String.Empty, new UTF8Encoding(false));
             var seenStageLines = new HashSet<string>(StringComparer.Ordinal);
             DateTime formalStartedAtUtc = DateTime.UtcNow;
+            try {
             if (shellLaunchedFormal) {
                 // Endfield's formal updater can replace the working tree before
                 // auto-starting Python. Hold auto-start until that update pass is
                 // complete, then inject the run bridge and reopen the same formal
                 // GUI entry. This keeps both updating and execution visible.
                 if (binding.GameId == "Endfield") SetFormalAutoStart(binding, false);
+                if (binding.AccountEnabled) {
+                    IDictionary<string, object> update = Json.DeserializeObject(File.ReadAllText(binding.UpdateState, Encoding.UTF8)) as IDictionary<string, object>;
+                    if (update == null || !update.ContainsKey("auto_start") || !(update["auto_start"] is bool))
+                        throw new AccountBridgeGate("ww_account_formal_autostart_contract_unverified");
+                    binding.AccountAutoStartBefore = (bool)update["auto_start"];
+                    SetFormalAutoStart(binding, false);
+                }
                 WriteFormalRunSidecar(binding, stageFile, selectedOperations);
             }
             else {
@@ -784,7 +897,6 @@ namespace YeYuGamer.LocalDailyAdapter
                 start.EnvironmentVariables["YEYU_GAMER_SELECTED_OPERATIONS"] = Json.Serialize(selectedOperations);
                 ConfigureToolOutput(start);
             }
-            try {
                 var process = Process.Start(start);
                 if (!shellLaunchedFormal) DrainToolOutput(process);
                 Process formalProcess = null;
@@ -792,7 +904,7 @@ namespace YeYuGamer.LocalDailyAdapter
                 // Each fixed entry starts the upstream Qt GUI and selects its
                 // first one-time DailyTask. The GUI remains visible while its
                 // own updater/startup path runs and emits finer-grained stages.
-                onStage(attachOperation, "started", binding.GameId + " formal GUI launched; waiting for its DailyTask runtime");
+                onStage(binding.AccountEnabled ? binding.AccountOperation : attachOperation, "started", binding.GameId + " formal GUI launched; waiting for its DailyTask runtime");
                 string formalHandoff = String.Empty;
                 if (shellLaunchedFormal) {
                     formalProcess = process;
@@ -828,6 +940,12 @@ namespace YeYuGamer.LocalDailyAdapter
                         return process.HasExited ? process.ExitCode : -1;
                     }
                     DrainOkWWStageEvents(stageFile, seenStageLines, onStage);
+                    if (binding.AccountHumanRequired) {
+                        StopToolProcess(process);
+                        StopToolProcess(formalProcess);
+                        detail = "ww_account_human_required";
+                        return 0;
+                    }
                 }
                 DrainOkWWStageEvents(stageFile, seenStageLines, onStage);
                 StopToolProcess(formalProcess);
@@ -838,9 +956,18 @@ namespace YeYuGamer.LocalDailyAdapter
                 }
                 detail = "fixedTask=daily; gameId=" + binding.GameId + "; toolExitCode=" + toolExitCode +
                     (String.IsNullOrEmpty(formalHandoff) ? String.Empty : "; " + formalHandoff); return toolExitCode;
+            } catch (AccountBridgeGate error) {
+                StopStaleFormalProcesses(binding);
+                onStage(binding.AccountOperation, "human_required", error.Message);
+                detail = error.Message;
+                return 0;
             } finally {
                 if (binding.GameId == "Endfield") {
                     try { SetFormalAutoStart(binding, true); }
+                    catch (Exception) { }
+                }
+                if (binding.AccountAutoStartBefore.HasValue) {
+                    try { SetFormalAutoStart(binding, binding.AccountAutoStartBefore.Value); }
                     catch (Exception) { }
                 }
                 if (shellLaunchedFormal) ClearFormalRunSidecars(binding);
@@ -1051,13 +1178,14 @@ namespace YeYuGamer.LocalDailyAdapter
                     if (binding.GameId == "WW") {
                         EnsureWwGuiStreamGuard(binding);
                         EnsureWwConditionalStageBoundaries(binding);
+                        EnsureWwAccountBridge(binding);
                     }
                     if (binding.GameId == "Endfield") EnsureEndfieldManagerBridge(binding);
                     EnsureFormalGuiManagerBridge(binding);
                     WriteFormalRunSidecar(binding, stageFile, selectedOperations);
                     DateTime innerStartedAfterUtc = formalStartedAtUtc;
-                    if (binding.GameId == "Endfield" || binding.GameId == "GF2") {
-                        if (binding.GameId == "Endfield") SetFormalAutoStart(binding, true);
+                    if (binding.GameId == "Endfield" || binding.GameId == "GF2" || binding.AccountEnabled) {
+                        if (binding.GameId == "Endfield" || binding.AccountEnabled) SetFormalAutoStart(binding, true);
                         StopToolProcess(formal);
                         innerStartedAfterUtc = DateTime.UtcNow;
                         var restart = new ProcessStartInfo {
@@ -1284,6 +1412,35 @@ namespace YeYuGamer.LocalDailyAdapter
             if (!File.ReadAllText(binding.InnerEntry, Encoding.UTF8).Contains(marker))
                 throw new InvalidOperationException("ww_gui_manager_bridge_write_failed");
         }
+        private static void EnsureWwAccountBridge(Binding binding) {
+            if (!binding.AccountEnabled) return;
+            string resource = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "WwAccountYeYuBridge.py");
+            if (!File.Exists(resource)) throw new AccountBridgeGate("ww_account_bridge_resource_missing");
+            string target = Path.Combine(Path.GetDirectoryName(binding.InnerEntry), "WwAccountYeYuBridge.py");
+            string temporary = target + ".yeyu.tmp";
+            File.WriteAllBytes(temporary, File.ReadAllBytes(resource));
+            if (File.Exists(target)) File.Replace(temporary, target, null); else File.Move(temporary, target);
+            string source = File.ReadAllText(binding.InnerEntry, Encoding.UTF8);
+            string updated = PatchWwAccountEntry(source);
+            if (updated == source) return;
+            string original = binding.InnerEntry + ".pre-ww-account-" + Hash(binding.InnerEntry) + ".txt";
+            if (!File.Exists(original)) File.WriteAllText(original, source, new UTF8Encoding(false));
+            string entryTemporary = binding.InnerEntry + ".yeyu.tmp";
+            File.WriteAllText(entryTemporary, updated, new UTF8Encoding(false));
+            File.Replace(entryTemporary, binding.InnerEntry, null);
+        }
+        private static string PatchWwAccountEntry(string source) {
+            const string marker = "# YEYU_GAMER_WW_ACCOUNT_BRIDGE_V1";
+            if (source.Contains(marker)) return source;
+            string normalized = source.Replace("\r\n", "\n");
+            const string anchor = "    ok = OK(config)\n";
+            if (normalized.Split(new[] { anchor }, StringSplitOptions.None).Length != 2)
+                throw new AccountBridgeGate("ww_account_gui_entry_shape_changed");
+            string patch = "    " + marker + "\n" +
+                "    from WwAccountYeYuBridge import install as _yeyu_install_account_bridge\n" +
+                "    _yeyu_install_account_bridge(config, __file__)\n";
+            return normalized.Replace(anchor, patch + anchor);
+        }
         private static void SetFormalAutoStart(Binding binding, bool enabled) {
             IDictionary<string, object> state = Json.DeserializeObject(File.ReadAllText(binding.UpdateState, Encoding.UTF8)) as IDictionary<string, object>;
             if (state == null) throw new InvalidOperationException("formal_gui_update_state_invalid");
@@ -1362,6 +1519,11 @@ namespace YeYuGamer.LocalDailyAdapter
                 { "stageFile", Path.GetFullPath(stageFile) },
                 { "selectedOperations", selectedOperations }
             };
+            if (binding.AccountEnabled) {
+                document["accountId"] = binding.AccountId;
+                document["accountSnapshot"] = binding.AccountSnapshot;
+                document["accountOperation"] = binding.AccountOperation;
+            }
             File.WriteAllText(temporary, Json.Serialize(document), new UTF8Encoding(false));
             if (File.Exists(path)) File.Replace(temporary, path, null);
             else File.Move(temporary, path);
@@ -1605,7 +1767,7 @@ namespace YeYuGamer.LocalDailyAdapter
                 string detail = record.ContainsKey("detail") ? record["detail"] as string : String.Empty;
                 if (!String.IsNullOrEmpty(operation) && !String.IsNullOrEmpty(state)) {
                     onStage(operation, state, detail ?? String.Empty);
-                    if (state == "capture_before" || state == "capture_after") {
+                    if (state == "capture_before" || state == "capture_after" || state == "account_verified" || state.StartsWith("account_capture_", StringComparison.Ordinal)) {
                         File.WriteAllText(
                             stageFile + ".capture.ack",
                             state + "; capturedAt=" + DateTime.UtcNow.ToString("o"),

@@ -87,6 +87,7 @@ class CompletionPredicateCode(StrEnum):
 
 
 class EvidenceExclusionReason(StrEnum):
+    ACCOUNT_MISMATCH = "account_mismatch"
     GAME_MISMATCH = "game_mismatch"
     RUN_MISMATCH = "run_mismatch"
     ATTEMPT_MISMATCH = "attempt_mismatch"
@@ -160,6 +161,7 @@ class GameDayWindow(ContractModel):
 
 
 class RunAttemptCompletionFact(ContractModel):
+    account_id: str = Field(default="default", min_length=1, max_length=80)
     run_attempt_id: str = Field(min_length=1, max_length=160)
     run_id: str = Field(min_length=1, max_length=160)
     game_id: str = Field(min_length=1, max_length=80)
@@ -175,6 +177,7 @@ class RunAttemptCompletionFact(ContractModel):
 
 
 class TodoCompletionFact(ContractModel):
+    account_id: str = Field(default="default", min_length=1, max_length=80)
     todo_instance_id: str = Field(min_length=1, max_length=200)
     game_id: str = Field(min_length=1, max_length=80)
     game_day_key: str = Field(min_length=1, max_length=160)
@@ -193,6 +196,7 @@ class TodoCompletionFact(ContractModel):
 
 
 class EvidenceArtifactFact(ContractModel):
+    account_id: str = Field(default="default", min_length=1, max_length=80)
     artifact_id: str = Field(min_length=1, max_length=200)
     kind: str = Field(min_length=1, max_length=160)
     content_type: str = Field(min_length=1, max_length=160)
@@ -266,6 +270,7 @@ class AgentTodoReview(ContractModel):
 
 
 class AgentReviewFact(ContractModel):
+    account_id: str = Field(default="default", min_length=1, max_length=80)
     review_id: str = Field(min_length=1, max_length=160)
     reviewer_principal_id: str = Field(min_length=1, max_length=160)
     decision: AgentReviewDecision
@@ -289,6 +294,7 @@ class AgentReviewFact(ContractModel):
 
 
 class CompletionBlockerFact(ContractModel):
+    account_id: str = Field(default="default", min_length=1, max_length=80)
     blocker_id: str = Field(min_length=1, max_length=160)
     kind: BlockerKind
     code: str = Field(min_length=1, max_length=160)
@@ -303,6 +309,7 @@ class CompletionBlockerFact(ContractModel):
 
 
 class CompletionContractSnapshot(ContractModel):
+    account_id: str = Field(default="default", min_length=1, max_length=80)
     game_id: str = Field(min_length=1, max_length=80)
     run_id: str = Field(min_length=1, max_length=160)
     cadence: Literal["daily", "weekly"] = "daily"
@@ -343,6 +350,7 @@ class ExcludedEvidence(ContractModel):
 
 
 class CompletionContractDecision(ContractModel):
+    account_id: str = Field(default="default", min_length=1, max_length=80)
     outcome: CompletionOutcome
     accepted_done: bool
     policy_id: str = ""

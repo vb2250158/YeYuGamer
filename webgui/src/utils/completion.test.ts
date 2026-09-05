@@ -132,6 +132,17 @@ function todo(overrides: Partial<TodoInstance> = {}): TodoInstance {
 }
 
 describe('CompletionReview boundary', () => {
+  it('keeps the Manager account scope in typed review submissions and rejects conflicting identities', () => {
+    const item = workItem({ accountId: 'account-B' })
+    const scope = item.result!.completionReviewScope as Record<string, unknown>
+    scope.accountId = 'account-B'
+    expect(parseCompletionReviewScope(item, 'run-1').value?.accountId).toBe('account-B')
+    expect(buildCompletionReviewSubmission(item, emptyCompletionReviewForm(), [], 'review_required', 'run-1').value?.accountId).toBe('account-B')
+    scope.accountId = 'account-A'
+    expect(parseCompletionReviewScope(item).errors).toContain('scope accountId 与工作项不一致')
+    scope.accountId = '../account'
+    expect(parseCompletionReviewScope(item).value).toBeUndefined()
+  })
   it('parses the Manager contract and builds its typed predicates from matching work-item artifacts', () => {
     const item = workItem()
     const scope = parseCompletionReviewScope(item, 'run-1').value

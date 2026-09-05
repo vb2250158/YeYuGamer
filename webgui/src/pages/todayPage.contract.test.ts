@@ -13,7 +13,7 @@ describe('Today page mutation safety wiring', () => {
     expect(source).toContain("actions?.humanTakeover === true ? actions.humanTakeoverTargets ?? [] : []")
     expect(source).toContain('v-if="humanTakeoverTargets.length"')
     expect(source.indexOf('<template v-if="humanTakeoverTargets.length">')).toBeLessThan(source.indexOf('<v-btn v-else-if="canReviewEvidence"'))
-    expect(source).toContain('router.push(`/games/${encodeURIComponent(target.gameId)}`)')
+    expect(source).toContain('router.push(accountRunLocation(target.gameId, target.runId))')
     expect(source).toContain('人工接管详情')
     expect(source).toContain("if (mode === 'execute' && executionInProgress.value) return")
     expect(source).toContain("if (['human_required', 'human_takeover'].includes(gameRuntimeState(game))) return false")

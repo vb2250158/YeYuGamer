@@ -370,6 +370,7 @@ def _attempt_is_in_scope(
 ) -> bool:
     return (
         attempt.game_id == snapshot.game_id
+        and attempt.account_id == snapshot.account_id
         and attempt.cadence == snapshot.cadence
         and _inside_game_day(snapshot, attempt.started_at)
         and (
@@ -429,6 +430,8 @@ def _classify_evidence(
         reasons: list[EvidenceExclusionReason] = []
         if evidence.game_id != snapshot.game_id:
             reasons.append(EvidenceExclusionReason.GAME_MISMATCH)
+        if evidence.account_id != snapshot.account_id:
+            reasons.append(EvidenceExclusionReason.ACCOUNT_MISMATCH)
         if scoped_attempt_runs.get(evidence.run_attempt_id) != evidence.run_id:
             reasons.append(EvidenceExclusionReason.RUN_MISMATCH)
         if evidence.run_attempt_id not in scoped_attempt_runs:
@@ -522,6 +525,7 @@ def _attempt_evaluations(
     scope_valid = (
         attempt.run_id == snapshot.run_id
         and attempt.game_id == snapshot.game_id
+        and attempt.account_id == snapshot.account_id
         and attempt.cadence == snapshot.cadence
         and _inside_game_day(snapshot, attempt.started_at)
         and (
@@ -633,6 +637,7 @@ def _todo_evaluations(
         item
         for item in required
         if item.game_id != snapshot.game_id
+        or item.account_id != snapshot.account_id
         or item.run_attempt_id not in scoped_attempt_ids
         or scoped_attempt_runs.get(item.run_attempt_id) != item.run_id
     )
@@ -752,6 +757,7 @@ def _review_evaluations(
         terminal_fact_times.append(snapshot.current_attempt.completed_at)
     scope_valid = (
         review.game_id == snapshot.game_id
+        and review.account_id == snapshot.account_id
         and review.run_id == snapshot.run_id
         and review.run_attempt_id == current_attempt_id
         and review.game_day_key == snapshot.game_day.period_key
@@ -1138,6 +1144,7 @@ def adjudicate_completion(
         for item in snapshot.blockers
         if item.active
         and item.game_id == snapshot.game_id
+        and item.account_id == snapshot.account_id
         and item.run_id == snapshot.run_id
         and item.run_attempt_id in scoped_attempt_ids
         and item.game_day_key == snapshot.game_day.period_key
@@ -1267,6 +1274,7 @@ def adjudicate_completion(
         policy_id=policy_id,
         policy_version=policy_version,
         game_id=snapshot.game_id,
+        account_id=snapshot.account_id,
         run_id=snapshot.run_id,
         run_attempt_id=current_attempt_id,
         attempt_lineage_ids=tuple(

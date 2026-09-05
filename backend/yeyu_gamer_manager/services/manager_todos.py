@@ -26,6 +26,7 @@ from ..domain.models import (
 )
 from ..domain.todos import todo_instance_id, todo_period
 from ..store.sqlite_store import SqliteStore
+from .account_scopes import enabled_account_ids, game_accounts, resolve_game_account
 from .adapter_host import ManagerAdapterHost
 from .current_completion import project_current_game_completion
 from .integration_catalog import (
@@ -185,73 +186,88 @@ class ManagerTodosService:
         cadence: str | None = None,
         *,
         at: datetime | None = None,
+        account_id: str | None = None,
     ) -> list[dict[str, Any]]:
         selected = set(self._validated_todo_game_ids(game_ids))
         instant = at or datetime.now(timezone.utc)
         if instant.tzinfo is None:
             instant = instant.replace(tzinfo=timezone.utc)
-        existing_by_definition: dict[str, dict[str, Any]] = {}
+        config = self.store.get_config()["values"]
+        accounts_by_game = {}
+        for game_id in selected:
+            if account_id is None:
+                accounts_by_game[game_id] = enabled_account_ids(config, game_id)
+            else:
+                if game_ids is None and not any(item["account_id"] == account_id for item in game_accounts(config, game_id)):
+                    accounts_by_game[game_id] = []
+                    continue
+                resolve_game_account(config, game_id, account_id)
+                accounts_by_game[game_id] = [account_id]
+        existing_by_definition: dict[tuple[str, str], dict[str, Any]] = {}
         for existing in self.store.list_todo_instances(
             cadence=cadence, limit=10000
         ):
             if existing["game_id"] not in selected:
                 continue
             existing_by_definition.setdefault(
-                existing["todo_definition_id"], existing
+                (existing["todo_definition_id"], existing["account_id"]), existing
             )
         definitions = self.store.list_todo_definitions(cadence=cadence)
         candidates: list[dict[str, Any]] = []
         for definition in definitions:
             if definition["game_id"] not in selected:
                 continue
-            configured_rule = self._configured_todo_reset_rule(definition)
-            active_instance = existing_by_definition.get(
-                definition["todo_definition_id"]
-            )
-            effective_rule = configured_rule
-            policy_change_deferred = False
-            if active_instance is not None:
-                active_start = datetime.fromisoformat(
-                    str(active_instance["period_starts_at"])
+            for selected_account_id in accounts_by_game[definition["game_id"]]:
+                configured_rule = self._configured_todo_reset_rule(definition)
+                active_instance = existing_by_definition.get(
+                    (definition["todo_definition_id"], selected_account_id)
                 )
-                active_end = datetime.fromisoformat(
-                    str(active_instance["period_ends_at"])
+                effective_rule = configured_rule
+                policy_change_deferred = False
+                if active_instance is not None:
+                    active_start = datetime.fromisoformat(
+                        str(active_instance["period_starts_at"])
+                    )
+                    active_end = datetime.fromisoformat(
+                        str(active_instance["period_ends_at"])
+                    )
+                    if active_start <= instant < active_end:
+                        effective_rule = dict(active_instance["reset_rule"])
+                        policy_change_deferred = effective_rule != configured_rule
+                period = todo_period(effective_rule, instant)
+                definition_snapshot = {
+                    key: value
+                    for key, value in definition.items()
+                    if key
+                    not in {
+                        "active",
+                        "updated_at",
+                        "initial_status",
+                        "initial_reason",
+                    }
+                }
+                definition_snapshot["reset_rule"] = dict(effective_rule)
+                candidates.append(
+                    {
+                        "todo_instance_id": todo_instance_id(
+                            definition["todo_definition_id"], period["periodKey"],
+                            account_id=selected_account_id
+                        ),
+                        "todo_definition_id": definition["todo_definition_id"],
+                        "game_id": definition["game_id"],
+                        "account_id": selected_account_id,
+                        "cadence": definition["cadence"],
+                        "period_key": period["periodKey"],
+                        "period_starts_at": period["startsAt"],
+                        "period_ends_at": period["endsAt"],
+                        "definition_snapshot": definition_snapshot,
+                        "status": definition["initial_status"],
+                        "reason": definition["initial_reason"],
+                        "effective_reset_rule": dict(effective_rule),
+                        "next_period_reset_rule": dict(configured_rule),
+                        "policy_change_deferred": policy_change_deferred,
+                    }
                 )
-                if active_start <= instant < active_end:
-                    effective_rule = dict(active_instance["reset_rule"])
-                    policy_change_deferred = effective_rule != configured_rule
-            period = todo_period(effective_rule, instant)
-            definition_snapshot = {
-                key: value
-                for key, value in definition.items()
-                if key
-                not in {
-                    "active",
-                    "updated_at",
-                    "initial_status",
-                    "initial_reason",
-                }
-            }
-            definition_snapshot["reset_rule"] = dict(effective_rule)
-            candidates.append(
-                {
-                    "todo_instance_id": todo_instance_id(
-                        definition["todo_definition_id"], period["periodKey"]
-                    ),
-                    "todo_definition_id": definition["todo_definition_id"],
-                    "game_id": definition["game_id"],
-                    "cadence": definition["cadence"],
-                    "period_key": period["periodKey"],
-                    "period_starts_at": period["startsAt"],
-                    "period_ends_at": period["endsAt"],
-                    "definition_snapshot": definition_snapshot,
-                    "status": definition["initial_status"],
-                    "reason": definition["initial_reason"],
-                    "effective_reset_rule": dict(effective_rule),
-                    "next_period_reset_rule": dict(configured_rule),
-                    "policy_change_deferred": policy_change_deferred,
-                }
-            )
         return candidates
 
     def list_todo_definitions(
@@ -424,6 +440,7 @@ class ManagerTodosService:
         self,
         *,
         game_id: str | None = None,
+        account_id: str | None = None,
         cadence: str | None = None,
         period_key: str | None = None,
         status: str | None = None,
@@ -434,16 +451,23 @@ class ManagerTodosService:
             self._validated_todo_game_ids([game_id])
         records = self.store.list_todo_instances(
             game_id=game_id,
+            account_id=account_id,
             cadence=cadence,
             period_key=period_key,
             status=status,
             limit=limit,
         )
+        config = self.store.get_config()["values"]
+        if account_id is None:
+            allowed = {game["game_id"]: set(enabled_account_ids(config, game["game_id"])) for game in self.store.list_games()}
+            records = [record for record in records if record["account_id"] in allowed.get(record["game_id"], set())]
+        elif game_id is not None:
+            resolve_game_account(config, game_id, account_id)
         if current:
             candidate_ids = {
                 item["todo_instance_id"]
                 for item in self._todo_instance_candidates(
-                    [game_id] if game_id is not None else None, cadence
+                    [game_id] if game_id is not None else None, cadence, account_id=account_id
                 )
             }
             records = [
@@ -620,6 +644,7 @@ class ManagerTodosService:
                     "catalogVersion": item.catalog_version,
                     "sourceHash": item.source_hash,
                     "gameId": item.game_id,
+                    "accountId": item.account_id,
                     "periodKey": item.period_key,
                     "periodStartsAt": item.period_starts_at.isoformat(),
                     "periodEndsAt": item.period_ends_at.isoformat(),
@@ -651,6 +676,7 @@ class ManagerTodosService:
                     "catalogVersion": item.catalog_version,
                     "sourceHash": item.source_hash,
                     "gameId": item.game_id,
+                    "accountId": item.account_id,
                     "operation": item.operation,
                     "title": item.title,
                     "category": item.category,
@@ -682,9 +708,9 @@ class ManagerTodosService:
             ],
         }
 
-    def todo_summary(self, game_id: str, cadence: str) -> dict[str, Any]:
+    def todo_summary(self, game_id: str, cadence: str, *, account_id: str = "default") -> dict[str, Any]:
         items = self.list_todo_instances(
-            game_id=game_id, cadence=cadence, current=True, limit=1000
+            game_id=game_id, account_id=account_id, cadence=cadence, current=True, limit=1000
         )
         return self._todo_summary_from_items(items, cadence)
 
@@ -776,6 +802,7 @@ class ManagerTodosService:
             "instances": [
                 {
                     "todoInstanceId": item.todo_instance_id,
+                    **({"accountId": item.account_id} if item.account_id != "default" else {}),
                     "todoDefinitionId": item.todo_definition_id,
                     "definitionVersion": item.definition_version,
                     "sourceHash": item.source_hash,
@@ -912,13 +939,27 @@ class ManagerTodosService:
     def _todo_plans_for_games(
         self, game_ids: list[str], cadence: str
     ) -> dict[str, dict[str, Any]]:
-        plans: dict[str, dict[str, Any]] = {}
+        return {plan["gameId"]: plan for plan in self._todo_plans_for_targets(
+            [{"gameId": game_id, "accountId": "default"} for game_id in game_ids], cadence
+        )}
+
+    def _todo_plans_for_targets(
+        self, targets: list[dict[str, Any]], cadence: str
+    ) -> list[dict[str, Any]]:
+        plans: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
         sealed_batches = (
             self._projection_history()[1] if cadence == "daily" else []
         )
-        for game_id in game_ids:
+        for target in targets:
+            game_id = str(target["gameId"])
+            account_id = str(target.get("accountId", "default"))
+            if (game_id, account_id) in seen:
+                raise ManagerValidation("targets contains duplicate game accounts")
+            seen.add((game_id, account_id))
+            resolve_game_account(self.store.get_config()["values"], game_id, account_id)
             all_items = self.list_todo_instances(
-                game_id=game_id, cadence=cadence, current=True, limit=1000
+                game_id=game_id, account_id=account_id, cadence=cadence, current=True, limit=1000
             )
             items = self._selected_todo_scope_items(
                 game_id=game_id,
@@ -935,6 +976,7 @@ class ManagerTodosService:
             if cadence == "daily" and scope.get("periodKeys"):
                 current_completion = project_current_game_completion(
                     game_id=game_id,
+                    account_id=account_id,
                     current_scope=scope,
                     sealed_batches=sealed_batches,
                     invalidated_at=self.store.latest_todo_reset_at(
@@ -1032,8 +1074,9 @@ class ManagerTodosService:
             executable_ids = {
                 candidate.todo_instance_id for candidate in executable
             }
-            plans[game_id] = {
+            plans.append({
                 "gameId": game_id,
+                "accountId": account_id,
                 "cadence": cadence,
                 "selectedTodoDefinitionIds": sorted(selected_definition_ids),
                 "periodKeys": sorted({item.period_key for item in items}),
@@ -1054,6 +1097,7 @@ class ManagerTodosService:
                     "items": [
                         {
                             "todoInstanceId": item.todo_instance_id,
+                            **({"accountId": item.account_id} if item.account_id != "default" else {}),
                             "todoDefinitionId": item.todo_definition_id,
                             "definitionVersion": item.definition_version,
                             "catalogVersion": item.catalog_version,
@@ -1148,7 +1192,7 @@ class ManagerTodosService:
                     for item in pending
                     if item.dispatch_disposition == "reconcile_required"
                 ],
-            }
+            })
         return plans
 
     @staticmethod
@@ -1159,7 +1203,9 @@ class ManagerTodosService:
             "schemaVersion": 1,
             "games": [
                 {
-                    "gameId": game_id,
+                    "gameId": todo_plans[game_id].get("gameId", game_id),
+                    **({"accountId": todo_plans[game_id]["accountId"], "targetId": game_id}
+                       if todo_plans[game_id].get("accountId", "default") != "default" else {}),
                     "scopeKey": todo_plans[game_id]["scopeKey"],
                     "scopeFingerprint": todo_plans[game_id]["scopeFingerprint"],
                     "periodKeys": list(todo_plans[game_id]["periodKeys"]),

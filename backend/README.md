@@ -18,9 +18,12 @@ Manager 不实现游戏画面识别、坐标点击或游戏规则。这些属于
 | `gamePaths` | 每个游戏的游戏/工具路径 |
 | `dailyToolProfiles` | 工具参数，例如 OK-WW 的体力路线 |
 | `dailyTodoSelection` | 用户今天勾选的步骤 |
+| `gameAccounts` | 本机账号列表、顺序、启用状态与记住账号的标签；首版仅鸣潮允许显式配置 |
 | Run / Todo 状态 | 本次队列和每一步的 `pending`、`running`、`completed`、`failed`、`skipped` |
 
-WebGUI 通过 API 编辑前三项；Adapter 通过结构化事件更新最后一项。任何页面或外部调用者都不应直接写 SQLite 或伪造完成状态。
+WebGUI 通过 API 编辑配置；Adapter 通过结构化事件更新运行事实。任何页面或外部调用者都不应直接写 SQLite 或伪造完成状态。
+
+批次冻结游戏/账号目标，每个账号单独建立 Run、Todo 与完成合同。默认账号保留历史 ID；新账号不得引用其他账号的完成记录。执行 Run 创建后锁住登录标签，切换身份需新增账号并停用旧项。账号选择与逐 Todo 完成复核是不同的验收条件。
 
 ## 开发与验证
 

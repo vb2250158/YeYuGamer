@@ -30,8 +30,8 @@ class BatchPlanningDecision:
         """Return a small public reason document for an execute rejection."""
 
         return {
-            "candidateGameIds": list(self.candidate_game_ids),
-            "deferredGameIds": list(self.deferred_game_ids),
+            "candidateGameIds": list(dict.fromkeys(str(todo_plans[key].get("gameId", key)) for key in self.candidate_game_ids)),
+            "deferredGameIds": list(dict.fromkeys(str(todo_plans[key].get("gameId", key)) for key in self.deferred_game_ids)),
             "games": [
                 _unavailable_game_details(game_id, todo_plans[game_id])
                 for game_id in self.deferred_game_ids
@@ -109,7 +109,8 @@ def _unavailable_game_details(
         else "No selected Todo has a verified executable binding."
     )
     return {
-        "gameId": game_id,
+        "gameId": plan.get("gameId", game_id),
+        **({"accountId": plan["accountId"]} if "accountId" in plan else {}),
         "reasonCode": reason_code,
         "reason": reason,
         "reasonCodes": reason_codes or [reason_code],
