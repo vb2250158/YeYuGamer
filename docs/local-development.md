@@ -49,7 +49,9 @@ pnpm run build
 .\scripts\Publish-YeYuGamerLocalRelease.ps1 -AdapterGroups Classic,OpenKuro,NTE,FGO,CZN,BD2
 ```
 
-省略 `AdapterGroups` 会请求默认全部组，仍需满足 StarRail 等组的输入条件。该入口在本机生成独立源码快照，检查依赖与构建工具，构建并测试主程序和所选 Adapter，再进行事务安装和 Manager 诊断晋级。它会更新已安装程序，已有运行配置应按本机流程保留，不能用样例覆盖；执行中的任务应先通过正式界面完成或安全暂停。
+省略 `AdapterGroups` 会请求默认全部组，仍需满足 StarRail 等组的输入条件。该入口在本机生成独立源码快照，检查依赖与构建工具，构建并测试主程序和所选 Adapter，再进行事务安装和 Manager 诊断晋级。它会更新已安装程序，已有运行配置应按本机流程保留，不能用样例覆盖；当前批次须已结束，或通过正式界面安全停止。仍未结束的人工暂停批次也会阻止安装。
+
+发布时使用已测试快照中的客户端向现有 Manager 申请安全停机，以便升级旧客户端自身的生命周期修复。未显式指定状态版本的停止请求遇到 HTTP 412 时，最多重读并发送三次，保持同一幂等键与请求内容；HTTP 409 仍立即停止发布，不取消新出现的任务，也不强制结束宿主。
 
 需要指定工具时，可使用脚本声明的 `PythonPath`、`NodePath`、`PnpmPath` 和 `CSharpCompilerPath` 参数，指向本机已验证工具。构建或验证失败时修复维护源码，不在快照或安装目录临时打补丁。
 

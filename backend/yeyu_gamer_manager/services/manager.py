@@ -231,7 +231,7 @@ def _dump(model: Any) -> dict[str, Any]:
 
 
 class ManagerService:
-    VERSION = "0.3.2"
+    VERSION = "0.3.3"
     # A pending Agent completion review may delay the batch seal (and the round
     # mail) for at most this long.  After that the machine adjudication seals
     # the batch; unreviewed runs stay review_required.
@@ -6747,7 +6747,10 @@ class ManagerService:
         plan: AdapterExecutionPlan,
         result: AdapterRunResult,
         command_id: str | None = None,
-    ) -> None:
+        manager_control_outcome: str | None = None,
+    ) -> AdapterRunResult | None:
+        if manager_control_outcome not in {None, "human_required", "cancelled"}:
+            raise ValueError("Manager control may only preserve a human or cancellation boundary")
         result_document = {
             "status": result.status,
             "transportOutcome": result.transport_outcome,
@@ -6758,7 +6761,9 @@ class ManagerService:
             "code": result.code,
             "message": result.message,
         }
-        attempt_state = result.status if result.protocol_valid else "failed"
+        attempt_state = manager_control_outcome or (result.status if result.protocol_valid else "failed")
+        if manager_control_outcome is not None:
+            result_document["managerControlOutcome"] = manager_control_outcome
         _log.info(
             "attempt.result status=%s protocolValid=%s code=%s attemptState=%s",
             result.status,
@@ -6777,10 +6782,28 @@ class ManagerService:
         }
         run_state = (
             run_state_by_result.get(result.status, EntityState.FAILED)
-            if result.protocol_valid
+            if result.protocol_valid or manager_control_outcome is not None
             else EntityState.FAILED
         )
         with self.store.atomic():
+            if self.store.get_run_attempt(plan.run_attempt_id)["state"] not in {"starting", "running", "cancelling"}:
+                _log.info("attempt.result.ignored_terminal attempt=%s", plan.run_attempt_id)
+                return None
+            # Recheck under the state writer's lock: takeover/cancel may have
+            # arrived after the process closer returned its final receipt.
+            try:
+                self._terminal_game_cleanup_gate(plan)
+                for member in self.store.list_batch_run_memberships(run_id=plan.run_id, limit=5000):
+                    if member.get("latest_run_attempt_id") == plan.run_attempt_id:
+                        self._terminal_game_cleanup_gate(plan, str(member["batch_id"]))
+            except (GameLaunchHumanRequired, GameLaunchCancelled) as control:
+                manager_control_outcome = "human_required" if isinstance(control, GameLaunchHumanRequired) else "cancelled"
+                result = replace(result, status=manager_control_outcome, completed_todo_instance_ids=(),
+                    code=f"game_cleanup_{manager_control_outcome}", message=str(control))
+                attempt_state = manager_control_outcome
+                run_state = run_state_by_result[manager_control_outcome]
+                result_document.update({"status": result.status, "completedTodoInstanceIds": [],
+                    "code": result.code, "message": result.message, "managerControlOutcome": manager_control_outcome})
             prior_attempt = self.store.get_run_attempt(plan.run_attempt_id)
             prior_result = prior_attempt.get("result", {})
             prior_advance = (
@@ -6842,7 +6865,7 @@ class ManagerService:
                 run_attempt_id=plan.run_attempt_id, limit=500
             ):
                 if todo_attempt["state"] == "running":
-                    human_gate = result.protocol_valid and result.status == "human_required"
+                    human_gate = (result.protocol_valid or manager_control_outcome is not None) and result.status == "human_required"
                     todo_attempt = self.store.finish_todo_attempt(
                         todo_attempt["todo_attempt_id"],
                         status=("human_required" if human_gate else "blocked"),
@@ -6912,7 +6935,7 @@ class ManagerService:
             self._terminalize_unsealed_batch_memberships(
                 run_id=plan.run_id,
                 run_attempt_id=plan.run_attempt_id,
-                outcome=(result.status if result.protocol_valid else "failed"),
+                outcome=(manager_control_outcome or (result.status if result.protocol_valid else "failed")),
             )
         # A completed Adapter attempt still enters the per-Todo semantic review
         # contract.  Automatic accepted reviews stay disabled until every
@@ -6926,6 +6949,7 @@ class ManagerService:
             ),
             result.message,
         )
+        return result
 
     def _ensure_promoted_adapter_completion_review(
         self, plan: AdapterExecutionPlan
@@ -7724,6 +7748,29 @@ class ManagerService:
         game_launch: GameLaunchReceipt | EmulatorLaunchReceipt | None = None
         capture_pids: frozenset[int] | None = None
 
+        def cleanup_game(preserve_status: str | None = None) -> tuple[GameCloseReceipt | EmulatorCloseReceipt, str | None]:
+            try:
+                self._terminal_game_cleanup_gate(plan)
+                if preserve_status in {"human_required", "cancelled"}:
+                    state = "preserved-human-required" if preserve_status == "human_required" else "preserved-cooperative-cancel"
+                    return GameCloseReceipt(state, (), ()), None
+                if game_launch is None:
+                    return GameCloseReceipt("not-started", (), ()), None
+                if emulator_binding is not None:
+                    return self.emulator_launcher.close_started(emulator_binding, game_launch), None
+                return self._close_finished_batch_game(
+                    plan, game_launch, installation_binding.get("gamePath"),
+                ), None
+            except GameLaunchHumanRequired as error:
+                _log.info("attempt.cleanup.preserved_human code=%s message=%s", error.reason_code, error)
+                return GameCloseReceipt("preserved-human-required", (), ()), "human_required"
+            except GameLaunchCancelled as error:
+                _log.info("attempt.cleanup.preserved_cancel message=%s", error)
+                return GameCloseReceipt("preserved-cooperative-cancel", (), ()), "cancelled"
+            except Exception as error:
+                _log.warning("attempt.cleanup.failed error=%s: %s", type(error).__name__, error)
+                return GameCloseReceipt("close-failed", (), ()), None
+
         def finished(result: AdapterRunResult) -> None:
             with bind_log_context(**log_fields, phase="finish"):
                 _finished(result)
@@ -7731,6 +7778,7 @@ class ManagerService:
 
         def _finished(result: AdapterRunResult) -> None:
             effective_result = result
+            manager_control_outcome: str | None = None
             _log.info(
                 "attempt.adapter_finished status=%s transport=%s code=%s exit=%s "
                 "completed=%s unresolved=%s message=%s",
@@ -7744,35 +7792,33 @@ class ManagerService:
             )
             try:
                 attempt = self.store.get_run_attempt(plan.run_attempt_id)
-                if game_launch is None:
-                    cleanup = GameCloseReceipt("not-started", (), ())
-                elif result.status in {"human_required", "cancelled"} or attempt["state"] == "cancelling":
-                    cleanup = GameCloseReceipt(
-                        "preserved-human-required"
-                        if result.status == "human_required"
-                        else "preserved-cooperative-cancel",
-                        (), (),
+                if attempt["state"] not in {"starting", "running", "cancelling"}:
+                    effective_result = None
+                    return
+                cleanup, manager_control_outcome = cleanup_game(result.status)
+                if manager_control_outcome is not None:
+                    effective_result = replace(
+                        result, status=manager_control_outcome,
+                        completed_todo_instance_ids=(),
+                        code=f"game_cleanup_{manager_control_outcome}",
+                        message="Manager preserved the client at the durable human/cancellation boundary.",
                     )
-                elif emulator_binding is not None:
-                    cleanup = self.emulator_launcher.close_started(
-                        emulator_binding, game_launch
-                    )
-                else:
-                    cleanup = self.game_launcher.close_started(game_launch)
                 _log.info(
                     "attempt.game_cleanup state=%s requested=%s remaining=%s",
                     cleanup.state,
                     list(cleanup.requested_process_ids),
                     list(cleanup.remaining_process_ids),
                 )
-                if attempt["state"] in {"starting", "running", "cancelling"}:
-                    self.store.update_run_attempt(
-                        plan.run_attempt_id,
-                        state=str(attempt["state"]),
-                        result={"gameCleanup": cleanup.as_result()},
-                        completed=False,
-                    )
-                if cleanup.state == "close-failed":
+                with self.store.atomic():
+                    attempt = self.store.get_run_attempt(plan.run_attempt_id)
+                    if attempt["state"] in {"starting", "running", "cancelling"}:
+                        self.store.update_run_attempt(
+                            plan.run_attempt_id,
+                            state=str(attempt["state"]),
+                            result={"gameCleanup": cleanup.as_result()},
+                            completed=False,
+                        )
+                if self._game_cleanup_failed(cleanup):
                     effective_result = replace(
                         result,
                         status="failed",
@@ -7780,12 +7826,13 @@ class ManagerService:
                         protocol_valid=False,
                         code="game_cleanup_failed",
                         message=(
-                            "The automation tool ended, but Manager-owned game "
-                            "processes could not be closed."
+                            "The automation tool ended, but game process closure "
+                            "could not be fully verified."
                         ),
                     )
-                self._finish_adapter_result(
-                    plan, effective_result, command_id=command_id
+                effective_result = self._finish_adapter_result(
+                    plan, effective_result, command_id=command_id,
+                    manager_control_outcome=manager_control_outcome,
                 )
             except Exception as error:  # defensive persistence boundary
                 failure = f"Adapter result persistence failed: {type(error).__name__}"
@@ -7820,7 +7867,7 @@ class ManagerService:
                 except Exception:
                     pass
             finally:
-                if completed_callback is not None:
+                if completed_callback is not None and effective_result is not None:
                     completed_callback(effective_result)
 
         launch_log_scope = contextlib.ExitStack()
@@ -8032,56 +8079,130 @@ class ManagerService:
                 exc_info=not isinstance(error, (GameLaunchError, EmulatorBindingError)),
             )
             cleanup: GameCloseReceipt | EmulatorCloseReceipt | None = None
+            preserved_state: str | None = None
             if game_launch is not None:
                 try:
-                    cleanup = (
-                        self.emulator_launcher.close_started(
-                            emulator_binding, game_launch
-                        )
-                        if emulator_binding is not None
-                        else self.game_launcher.close_started(game_launch)
-                    )
-                    if cleanup.state == "close-failed":
+                    cleanup, preserved_state = cleanup_game()
+                    if self._game_cleanup_failed(cleanup):
                         failure_code = "game_cleanup_failed"
                 except Exception:
                     cleanup = None
                     failure_code = "game_cleanup_failed"
-            attempt = self.store.get_run_attempt(plan.run_attempt_id)
-            if attempt["state"] in {"starting", "running", "cancelling"}:
-                self.store.update_run_attempt(
-                    plan.run_attempt_id,
-                    state="failed",
-                    result={
-                        "code": failure_code,
-                        "message": f"{type(error).__name__}: {error}",
-                        **(
-                            {"gameCleanup": cleanup.as_result()}
-                            if cleanup is not None
-                            else {}
-                        ),
-                    },
-                    completed=True,
+            with self.store.atomic():
+                try:
+                    self._terminal_game_cleanup_gate(plan)
+                    for member in self.store.list_batch_run_memberships(run_id=plan.run_id, limit=5000):
+                        if member.get("latest_run_attempt_id") == plan.run_attempt_id:
+                            self._terminal_game_cleanup_gate(plan, str(member["batch_id"]))
+                except (GameLaunchHumanRequired, GameLaunchCancelled) as control:
+                    preserved_state = "human_required" if isinstance(control, GameLaunchHumanRequired) else "cancelled"
+                attempt = self.store.get_run_attempt(plan.run_attempt_id)
+                if preserved_state is not None:
+                    failure_code = f"game_cleanup_{preserved_state}"
+                if attempt["state"] in {"starting", "running", "cancelling"}:
+                    self.store.update_run_attempt(
+                        plan.run_attempt_id,
+                        state=preserved_state or "failed",
+                        result={
+                            "code": failure_code,
+                            "message": f"{type(error).__name__}: {error}",
+                            **(
+                                {"gameCleanup": cleanup.as_result()}
+                                if cleanup is not None
+                                else {}
+                            ),
+                        },
+                        completed=True,
+                    )
+                self.store.update_game_run(
+                    run_id,
+                    state=EntityState(preserved_state) if preserved_state else EntityState.FAILED,
+                    message=f"Manager Adapter start failed: {type(error).__name__}: {error}",
                 )
-            self.store.update_game_run(
-                run_id,
-                state=EntityState.FAILED,
-                message=f"Manager Adapter start failed: {type(error).__name__}: {error}",
-            )
-            self._end_controller_lease(
-                plan.run_attempt_id,
-                state=LeaseState.REVOKED,
-                reason_code=failure_code,
-                reason=f"{type(error).__name__}: {error}",
-            )
-            self._terminalize_unsealed_batch_memberships(
-                run_id=run_id,
-                run_attempt_id=plan.run_attempt_id,
-                outcome="failed",
-            )
+                self._end_controller_lease(
+                    plan.run_attempt_id,
+                    state=LeaseState.REVOKED,
+                    reason_code=failure_code,
+                    reason=f"{type(error).__name__}: {error}",
+                )
+                self._terminalize_unsealed_batch_memberships(
+                    run_id=run_id,
+                    run_attempt_id=plan.run_attempt_id,
+                    outcome=preserved_state or "failed",
+                )
             self._close_attempt_log(plan.run_attempt_id)
             raise
         finally:
             launch_log_scope.close()
+
+    @staticmethod
+    def _game_cleanup_failed(cleanup: GameCloseReceipt | EmulatorCloseReceipt) -> bool:
+        if isinstance(cleanup, EmulatorCloseReceipt):
+            return cleanup.state == "close-failed"
+        if cleanup.state.startswith("preserved-") or cleanup.state == "not-started":
+            return False
+        return bool(
+            cleanup.state not in {"closed", "already-closed"}
+            or cleanup.remaining_process_ids
+            or getattr(cleanup, "zombie_process_ids", ())
+            or getattr(cleanup, "unverified_process_ids", ())
+        )
+
+    def _terminal_game_cleanup_gate(self, plan: AdapterExecutionPlan, batch_id: str | None = None) -> bool:
+        run = self.store.get_game_run(plan.run_id)
+        attempt = self.store.get_run_attempt(plan.run_attempt_id)
+        if run["state"] == EntityState.HUMAN_REQUIRED or attempt["state"] == "human_required" or any(
+            blocker["kind"] == "human_required"
+            for blocker in self.store.list_todo_blockers(run_id=plan.run_id, active_only=True, limit=5000)
+        ):
+            raise GameLaunchHumanRequired("terminal_cleanup_human_required", "Human takeover preserves the game during terminal cleanup.")
+        if self._launch_cancel_requested(plan.run_attempt_id) or run["state"] in {EntityState.CANCELLING, EntityState.CANCELLED}:
+            raise GameLaunchCancelled("Durable cancellation stopped terminal game cleanup.")
+        if batch_id is not None:
+            batch = self.store.get_batch(batch_id)
+            members = self.store.list_batch_run_memberships(run_id=plan.run_id, limit=5000)
+            if (
+                batch["result"].get("sealVersion") is not None
+                or batch["state"] == EntityState.CANCELLED
+                or self.store.get_active_batch_cancel_request(batch_id) is not None
+                or not any(member["batch_id"] == batch_id and member["state"] == "active"
+                    and member.get("latest_run_attempt_id") == plan.run_attempt_id for member in members)
+            ):
+                raise GameLaunchCancelled("The frozen queue no longer authorizes terminal game cleanup.")
+        return False
+
+    def _close_finished_batch_game(
+        self, plan: AdapterExecutionPlan, launch: GameLaunchReceipt, game_path: object,
+    ) -> GameCloseReceipt:
+        """Close the current native game, including a preexisting final client, within its frozen queue."""
+        memberships = self.store.list_batch_run_memberships(run_id=plan.run_id, limit=5000)
+        if not memberships:
+            return self.game_launcher.close_started(launch)
+        batches = [self.store.get_batch(str(member["batch_id"])) for member in memberships
+            if member["state"] == "active" and member.get("latest_run_attempt_id") == plan.run_attempt_id]
+        if len(batches) != 1:
+            raise GameLaunchCancelled("No unique active queue owns this terminal attempt; preserve the client.")
+        batch = batches[0]
+        batch_id = str(batch["batch_id"])
+        self._terminal_game_cleanup_gate(plan, batch_id)
+        candidates = batch["result"].get("candidateGameIds")
+        if (batch["mode"] != RequestMode.EXECUTE or not isinstance(candidates, list)
+            or not all(isinstance(value, str) and value for value in candidates)
+            or len(set(candidates)) != len(candidates) or plan.game_id not in candidates
+            or not isinstance(game_path, str) or not game_path):
+            raise GameLaunchHumanRequired("terminal_cleanup_scope_unavailable", "The frozen queue or installation binding cannot authorize closing this game.")
+        cleanup = self.game_launcher.close_for_queue(
+            plan.game_id, game_path,
+            cancel_requested=lambda: self._terminal_game_cleanup_gate(plan, batch_id),
+        )
+        if not isinstance(cleanup, GameCloseReceipt):
+            raise GameLaunchError("Terminal queue cleanup returned an invalid receipt")
+        if cleanup.state not in {"closed", "already-closed", "close-failed"}:
+            raise GameLaunchError("Terminal queue cleanup returned an unsupported closure state")
+        self.store.append_event("game-run.queue-cleanup", "run-attempt", plan.run_attempt_id,
+            {"runId": plan.run_id, "gameId": plan.game_id, "batchId": batch_id, **cleanup.as_result()})
+        self._terminal_game_cleanup_gate(plan, batch_id)
+        return cleanup
 
     def _close_other_batch_games(
         self, plan: AdapterExecutionPlan, configured_paths: dict[str, Any]

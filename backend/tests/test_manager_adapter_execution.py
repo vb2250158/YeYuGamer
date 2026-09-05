@@ -186,6 +186,9 @@ class ManagerAdapterExecutionTests(unittest.TestCase):
         self.manager.game_launcher.close_started.return_value = GameCloseReceipt(
             "closed", (4321,), ()
         )
+        self.manager.game_launcher.close_for_queue.return_value = GameCloseReceipt(
+            "closed", (4321,), ()
+        )
         self.manager.game_launcher.list_zombies.return_value = {}
         self.manager.game_launcher.reap_zombies.return_value = {
             "attempted": {},
@@ -1096,6 +1099,145 @@ class ManagerAdapterExecutionTests(unittest.TestCase):
         self.manager.game_launcher.close_for_queue.return_value = GameCloseReceipt("closed", (321,), ())
         self.manager.adapter_host.execute = mock.Mock(return_value=8765)
         return run, batch
+
+    def _terminal_cleanup_fixture(self):
+        run, batch = self._queue_cleanup_fixture([GAME_ID])
+        self.manager.game_launcher.ensure_started.return_value = GameLaunchReceipt(
+            "already-running", 4321, "starrail.exe",
+        )
+        results = []
+        plan, _ = self.manager._start_game_run(str(run["run_id"]), completed_callback=results.append)
+        callback = self.manager.adapter_host.execute.call_args.args[2]
+        result = AdapterRunResult(
+            run_id=plan.run_id, run_attempt_id=plan.run_attempt_id, game_id=plan.game_id,
+            status="completed", transport_outcome="completed", attempted_todo_instance_ids=(),
+            completed_todo_instance_ids=(), unresolved_todo_instance_ids=(),
+            exit_code=0, protocol_valid=True, code="fixture_complete", message="tool ended",
+        )
+        return run, batch, plan, callback, result, results
+
+    def test_terminal_cleanup_closes_preexisting_last_game_using_start_binding(self) -> None:
+        run, _, plan, callback, result, results = self._terminal_cleanup_fixture()
+        self.store.update_config({"game_paths": {GAME_ID: {"game_path": r"C:\Other\StarRail.exe"}}})
+        callback(result)
+        self.manager.game_launcher.close_for_queue.assert_called_once()
+        call = self.manager.game_launcher.close_for_queue.call_args
+        self.assertEqual(call.args, (GAME_ID, r"C:\\Games\\StarRail.exe"))
+        self.assertTrue(callable(call.kwargs["cancel_requested"]))
+        self.manager.game_launcher.close_started.assert_not_called()
+        self.assertEqual(self.store.get_run_attempt(plan.run_attempt_id)["result"]["gameCleanup"]["state"], "closed")
+        self.assertEqual(self.store.get_game_run(run["run_id"])["state"], "review_required")
+        self.assertEqual(results[0].status, "completed")
+
+    def test_terminal_cleanup_preserves_durable_human_gate_despite_late_completed_callback(self) -> None:
+        run, _, plan, callback, result, results = self._terminal_cleanup_fixture()
+        self.store.update_game_run(run["run_id"], state="human_required", message="operator takeover")
+        callback(replace(result, protocol_valid=False))
+        self.manager.game_launcher.close_for_queue.assert_not_called()
+        self.manager.game_launcher.close_started.assert_not_called()
+        attempt = self.store.get_run_attempt(plan.run_attempt_id)
+        self.assertEqual(attempt["state"], "human_required")
+        self.assertFalse(attempt["result"]["protocolValid"])
+        self.assertEqual(attempt["result"]["managerControlOutcome"], "human_required")
+        self.assertEqual(self.store.get_game_run(run["run_id"])["state"], "human_required")
+        self.assertEqual(results[0].status, "human_required")
+
+    def test_terminal_cleanup_control_interrupts_are_preserved_not_persistence_failures(self) -> None:
+        for control in ["cancelled", "human_required", "sealed"]:
+            with self.subTest(control=control):
+                run, batch, plan, callback, result, results = self._terminal_cleanup_fixture()
+                def close(game_id, game_path, *, cancel_requested):
+                    if control == "human_required":
+                        self.store.update_game_run(run["run_id"], state="human_required", message="operator takeover")
+                    elif control == "sealed":
+                        self.store.update_batch(batch["batch_id"], state="cancelled", result={"sealVersion": 1})
+                    else:
+                        self.store.update_run_attempt(plan.run_attempt_id, state="cancelling", result={}, completed=False)
+                    cancel_requested()
+                    self.fail("control must interrupt closure")
+                self.manager.game_launcher.close_for_queue.side_effect = close
+                callback(result)
+                expected = "human_required" if control == "human_required" else "cancelled"
+                attempt = self.store.get_run_attempt(plan.run_attempt_id)
+                self.assertEqual(attempt["state"], expected)
+                self.assertEqual(results[0].status, expected)
+                self.assertNotEqual(attempt["result"]["code"], "manager_persistence_failed")
+                self.manager.game_launcher.close_started.assert_not_called()
+                self.manager.game_launcher.close_for_queue.reset_mock(side_effect=True)
+
+    def test_terminal_cleanup_rechecks_takeover_after_close_before_result_commit(self) -> None:
+        run, _, plan, callback, result, results = self._terminal_cleanup_fixture()
+        finish = self.manager._finish_adapter_result
+        def takeover_then_finish(*args, **kwargs):
+            self.store.update_game_run(run["run_id"], state="human_required", message="takeover at result handoff")
+            return finish(*args, **kwargs)
+        self.manager._finish_adapter_result = mock.Mock(side_effect=takeover_then_finish)
+        callback(result)
+        self.assertEqual(self.store.get_run_attempt(plan.run_attempt_id)["state"], "human_required")
+        self.assertEqual(self.store.get_game_run(run["run_id"])["state"], "human_required")
+        self.assertEqual(results[0].status, "human_required")
+
+    def test_terminal_cleanup_duplicate_completion_cannot_reclose_or_cancel_finished_run(self) -> None:
+        run, _, plan, callback, result, results = self._terminal_cleanup_fixture()
+        callback(result)
+        before = self.store.get_run_attempt(plan.run_attempt_id)
+        callback(result)
+        self.assertEqual(self.store.get_run_attempt(plan.run_attempt_id), before)
+        self.assertEqual(self.store.get_game_run(run["run_id"])["state"], "review_required")
+        self.manager.game_launcher.close_for_queue.assert_called_once()
+        self.assertEqual(len(results), 1)
+
+    def test_terminal_cleanup_invalid_adapter_human_claim_does_not_create_manager_authority(self) -> None:
+        run, _, plan, callback, result, _ = self._terminal_cleanup_fixture()
+        callback(replace(result, status="human_required", protocol_valid=False))
+        attempt = self.store.get_run_attempt(plan.run_attempt_id)
+        self.assertEqual(attempt["state"], "failed")
+        self.assertNotIn("managerControlOutcome", attempt["result"])
+        self.assertEqual(self.store.get_game_run(run["run_id"])["state"], "failed")
+        self.manager.game_launcher.close_for_queue.assert_not_called()
+
+    def test_terminal_cleanup_refuses_foreign_frozen_scope_or_inactive_membership(self) -> None:
+        for boundary in ["foreign", "inactive", "sealed"]:
+            with self.subTest(boundary=boundary):
+                run, batch, plan, callback, result, _ = self._terminal_cleanup_fixture()
+                if boundary == "foreign":
+                    self.store.update_batch(batch["batch_id"], state="running", result={"candidateGameIds": ["WW"]})
+                elif boundary == "sealed":
+                    self.store.update_batch(batch["batch_id"], state="cancelled", result={"sealVersion": 1})
+                else:
+                    self.store.update_batch_run_membership(batch["batch_id"], run["run_id"], state="reconciliation_required")
+                callback(result)
+                self.manager.game_launcher.close_for_queue.assert_not_called()
+                self.manager.game_launcher.close_started.assert_not_called()
+                self.assertNotEqual(self.store.get_run_attempt(plan.run_attempt_id)["result"]["gameCleanup"]["state"], "closed")
+
+    def test_terminal_cleanup_residuals_or_errors_never_report_success(self) -> None:
+        for receipt in [GameCloseReceipt("close-failed", (42,), (42,)), GameCloseReceipt("closed", (), (), (42,)), GameCloseReceipt("closed", (), (), (), (42,)), RuntimeError("fixture close failed")]:
+            with self.subTest(receipt=receipt):
+                _, _, plan, callback, result, results = self._terminal_cleanup_fixture()
+                if isinstance(receipt, Exception):
+                    self.manager.game_launcher.close_for_queue.side_effect = receipt
+                else:
+                    self.manager.game_launcher.close_for_queue.return_value = receipt
+                callback(result)
+                attempt = self.store.get_run_attempt(plan.run_attempt_id)
+                self.assertEqual(attempt["state"], "failed")
+                self.assertEqual(attempt["result"]["code"], "game_cleanup_failed")
+                self.assertEqual(results[0].status, "failed")
+                self.manager.game_launcher.close_started.assert_not_called()
+                self.manager.game_launcher.close_for_queue.reset_mock(side_effect=True)
+
+    def test_terminal_cleanup_closes_preexisting_game_when_host_start_fails(self) -> None:
+        run, _ = self._queue_cleanup_fixture([GAME_ID])
+        self.manager.game_launcher.ensure_started.return_value = GameLaunchReceipt("already-running", 4321, "starrail.exe")
+        self.manager.adapter_host.execute.side_effect = RuntimeError("fixture host start failed")
+        with self.assertRaisesRegex(RuntimeError, "host start failed"):
+            self.manager._start_game_run(run["run_id"])
+        self.manager.game_launcher.close_for_queue.assert_called_once()
+        self.manager.game_launcher.close_started.assert_not_called()
+        attempt = self.store.list_run_attempts(run_id=run["run_id"], limit=1)[0]
+        self.assertEqual(attempt["state"], "failed")
+        self.assertEqual(attempt["result"]["gameCleanup"]["state"], "closed")
 
     def test_queue_cleanup_uses_frozen_scope_before_game_and_adapter(self) -> None:
         run, batch = self._queue_cleanup_fixture()

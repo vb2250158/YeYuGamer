@@ -1205,22 +1205,32 @@ class ManagerApiClient:
         idempotency_key: str,
         expected_state_version: int | None = None,
     ) -> CommandAccepted:
-        expected_state_version = self._resolve_expected_state_version(
-            expected_state_version
-        )
-        payload = self._request(
-            "POST",
-            "manager/stop-requests",
-            body={
-                "requestedBy": self.actor,
-                "reason": "operator-request",
-            },
-            idempotency_key=idempotency_key,
-            expected_state_version=expected_state_version,
-        )
-        return CommandAccepted.from_payload(
-            self._object(payload, resource="manager stop request")
-        )
+        # Background events may advance the CAS version between snapshot and
+        # POST. A 412 rolls back before storing a receipt, so refresh only that
+        # precondition and keep the exact same operation key and body. An
+        # explicit caller-supplied version remains pinned, including on 412.
+        attempts = 3 if expected_state_version is None else 1
+        for attempt in range(attempts):
+            version = self._resolve_expected_state_version(expected_state_version)
+            try:
+                payload = self._request(
+                    "POST",
+                    "manager/stop-requests",
+                    body={"requestedBy": self.actor, "reason": "operator-request"},
+                    idempotency_key=idempotency_key,
+                    expected_state_version=version,
+                )
+            except ManagerApiError as error:
+                # Busy work (409), authentication and unknown transport outcomes
+                # must surface to the operator. Never cancel a batch or change
+                # the idempotency key to make a stop request succeed.
+                if error.status_code != 412 or attempt + 1 == attempts:
+                    raise
+                continue
+            return CommandAccepted.from_payload(
+                self._object(payload, resource="manager stop request")
+            )
+        raise AssertionError("safe-stop retry budget must be positive")
 
     def request_restart(
         self,

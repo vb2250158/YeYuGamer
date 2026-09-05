@@ -381,7 +381,9 @@ if ('BD2' -in $AdapterGroups) {
 $installedStop = Join-Path $installRoot 'app\scripts\Stop-YeYuGamer.ps1'
 $installedConfig = Join-Path $runtimeRoot 'config\platform.json'
 if ((Test-Path -LiteralPath $installedStop -PathType Leaf) -and (Test-Path -LiteralPath $installedConfig -PathType Leaf)) {
-    & $installedStop -InstallRoot $installRoot -RuntimeRoot $runtimeRoot
+    # Bootstrap lifecycle fixes from the tested snapshot before replacing the
+    # old installation; all stop requests still use the installed Manager API.
+    & (Join-Path $localScripts 'Stop-YeYuGamer.ps1') -InstallRoot $installRoot -RuntimeRoot $runtimeRoot -UseSourceClient
 } else {
     Assert-YeYuGamerInstallLifecycleStopped -RuntimeRoot $runtimeRoot
 }

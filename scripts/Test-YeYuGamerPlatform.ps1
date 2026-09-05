@@ -26,6 +26,18 @@ Get-ChildItem -LiteralPath $platformSource -Recurse -File | ForEach-Object {
     Copy-Item -LiteralPath $_.FullName -Destination $destination -Force
 }
 
+# Script behavior tests resolve their fixtures beside the staged platform.
+# Copy only their fixed dependencies from this same source snapshot.
+$stagedScripts = Join-Path $testResolved 'scripts'
+New-Item -ItemType Directory -Path $stagedScripts -Force | Out-Null
+foreach ($scriptName in @(
+    'YeYuGamer.Common.ps1',
+    'Stop-YeYuGamer.ps1',
+    'Invoke-YeYuGamerScheduledDaily.ps1'
+)) {
+    Copy-Item -LiteralPath (Join-Path $SourceRoot "scripts\$scriptName") -Destination (Join-Path $stagedScripts $scriptName) -Force
+}
+
 $rejectedBuildRoots = @(
     [System.IO.Path]::GetPathRoot($env:WINDIR),
     $env:WINDIR,

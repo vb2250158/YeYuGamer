@@ -2,7 +2,8 @@
 param(
     [string]$InstallRoot,
     [string]$RuntimeRoot,
-    [ValidateRange(5, 300)][int]$TimeoutSeconds = 45
+    [ValidateRange(5, 300)][int]$TimeoutSeconds = 45,
+    [switch]$UseSourceClient
 )
 
 $ErrorActionPreference = 'Stop'
@@ -19,15 +20,38 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf) -or -not (Test-Path -Li
     throw 'YeYu Gamer is not installed or its lifecycle configuration is missing.'
 }
 
-& $python -I -B -m yeyu_gamer_platform.cli --config $configPath health *> $null
+function Get-YeYuGamerStopCliArguments {
+    param([switch]$UseSourceClient)
+
+    if (-not $UseSourceClient) { return @('-I', '-B', '-m', 'yeyu_gamer_platform.cli') }
+    # The unified publisher has already tested this immutable local snapshot.
+    # Load its repaired client without altering the installed package, endpoint,
+    # credentials or Python environment while the old host still owns runtime.
+    $platformSource = Assert-YeYuGamerLocalTarget `
+        -Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'platform') `
+        -Purpose 'safe-stop source client'
+    if ([System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($platformSource)).DriveType -ne [System.IO.DriveType]::Fixed) {
+        throw 'The safe-stop source client must be on a fixed local disk.'
+    }
+    foreach ($relative in @('yeyu_gamer_platform\__init__.py', 'yeyu_gamer_platform\cli.py', 'yeyu_gamer_platform\api_client.py', 'yeyu_gamer_platform\config.py')) {
+        $sourceFile = Join-Path $platformSource $relative
+        Assert-YeYuGamerNoReparseAncestors -Path $sourceFile -Purpose 'safe-stop source client' | Out-Null
+        if (-not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) { throw 'The tested safe-stop source client is incomplete.' }
+    }
+    $bootstrap = "import runpy,sys; sys.path.insert(0,sys.argv.pop(1)); runpy.run_module('yeyu_gamer_platform.cli',run_name='__main__')"
+    return @('-I', '-B', '-c', $bootstrap, $platformSource)
+}
+
+$cliArguments = @(Get-YeYuGamerStopCliArguments -UseSourceClient:$UseSourceClient)
+& $python @cliArguments --config $configPath health *> $null
 if ($LASTEXITCODE -eq 0) {
-    & $python -I -B -m yeyu_gamer_platform.cli --config $configPath manager-stop
+    & $python @cliArguments --config $configPath manager-stop
     if ($LASTEXITCODE -ne 0) { throw 'YeYu Gamer rejected the safe stop request.' }
 }
 
 $trayProcesses = @(Get-YeYuGamerPythonModuleProcesses -ModuleName 'yeyu_gamer_platform.tray')
 if ($trayProcesses.Count -gt 0) {
-    & $python -I -B -m yeyu_gamer_platform.cli --config $configPath tray-exit
+    & $python @cliArguments --config $configPath tray-exit
     if ($LASTEXITCODE -ne 0) { throw 'YeYu Gamer rejected the authenticated tray-exit request.' }
 }
 
