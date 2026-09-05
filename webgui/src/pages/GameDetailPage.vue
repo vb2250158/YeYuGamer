@@ -11,6 +11,7 @@ import {
   type GameDetail,
   type GameRunRecord,
   type PageResult,
+  type RunAttempt,
 } from '../api/contracts'
 import { useResource } from '../composables/useResource'
 import { useAutomationAssessments } from '../composables/useAutomationAssessments'
@@ -25,7 +26,7 @@ import { formatTime } from '../utils/format'
 import { cadenceSummary, resetCountdown, todoDiagnostics, todoSummaryFromItems } from '../utils/todos'
 import { blockersFromDiagnostics, blockersFromTodos } from '../utils/completion'
 import { artifactContentPath } from '../utils/managerResources'
-import { accountIdOf, accountTodos, scopeGameDetailToAccount } from '../utils/gameAccounts'
+import { accountIdOf, accountTodos, loadedAttemptCounts, scopeGameDetailToAccount } from '../utils/gameAccounts'
 
 const manager = useManagerStore()
 const { snapshot, executionInProgress, executionBusyReason } = storeToRefs(manager)
@@ -87,7 +88,7 @@ const dailySummary = computed(() => detail.value?.todoSummary?.daily
   ?? todoSummaryFromItems(dailyTodos.value, 'daily'))
 const weeklySummary = computed(() => detail.value?.todoSummary?.weekly
   ?? todoSummaryFromItems(weeklyTodos.value, 'weekly'))
-const attemptSummary = computed(() => shown.value?.attemptAnalysis?.summary)
+const attemptCounts = computed(() => loadedAttemptCounts(shown.value))
 const diagnosticBlockers = computed(() => blockersFromDiagnostics(todoDiagnostics(
   shown.value?.attemptAnalysis ? { attemptAnalysis: shown.value.attemptAnalysis } : undefined,
 )))
@@ -98,8 +99,7 @@ const completionBlockers = computed(() => {
   ]
   return [...new Map(values.map((item) => [`${item.source}:${item.blockerId}`, item])).values()]
 })
-const humanRequiredAttemptCount = computed(() => (shown.value?.attemptAnalysis?.problemSignals ?? [])
-  .reduce((total, signal) => total + (signal.humanRequiredCount ?? 0), 0))
+const humanRequiredAttemptCount = computed(() => attemptCounts.value.humanRequiredAttemptCount ?? '尚未读取')
 
 type PagePayload<T> = T[] | PageResult<T> | { data?: T[] }
 
@@ -147,7 +147,11 @@ async function load(): Promise<void> {
           .filter((todo) => todo.runId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0]?.runId
         if (latest) run = await managerApi.get<GameRunRecord>(`/game-runs/${encodeURIComponent(latest)}`)
       }
-      loaded = scopeGameDetailToAccount(loaded, accountId, run)
+      // The game-wide detail history is bounded and may omit the selected Run.
+      const attempts = run ? extractItems(await managerApi.get<PagePayload<RunAttempt>>(
+        `/game-runs/${encodeURIComponent(run.runId)}/attempts?limit=500`,
+      )) : undefined
+      loaded = scopeGameDetailToAccount({ ...loaded, runAttempts: attempts }, accountId, run)
     }
     if (revision !== loadRevision) return
     detail.value = loaded
@@ -302,10 +306,12 @@ async function captureScreenshot(): Promise<void> {
       </div>
       <div class="panel-body">
         <CompletionLedger
+          v-if="completionReviews.length || completionAdjudications.length || completionLedgerLoading || completionLedgerError || completionBlockers.length"
           :reviews="completionReviews"
           :adjudications="completionAdjudications"
           :blockers="completionBlockers"
         />
+        <EmptyState v-else title="尚无完成复核记录" detail="当前运行尚未产生复核或裁定记录；验收状态以上方本次运行的完成合同为准，等待同次执行的证据。" />
       </div>
     </v-card>
 
@@ -342,14 +348,14 @@ async function captureScreenshot(): Promise<void> {
     <v-card class="panel span-6">
       <div class="panel-title">
         <h2>执行历史与问题信号</h2>
-        <span class="soft-note">{{ attemptSummary?.problemSignalCount ?? 0 }} 个需关注环节 · human_required {{ humanRequiredAttemptCount }} 次</span>
+        <span class="soft-note">已载入运行尝试 {{ attemptCounts.runAttemptCount ?? '尚未读取' }} · Todo 尝试 {{ attemptCounts.todoAttemptCount ?? '尚未读取' }} · 人工门尝试 {{ humanRequiredAttemptCount }}</span>
       </div>
       <div class="panel-body">
         <JsonPanel title="Checkpoints" :value="shown.checkpoints ?? []" open />
         <JsonPanel title="Game runs" :value="shown.attempts ?? []" />
         <JsonPanel title="Run attempts" :value="shown.runAttempts ?? []" />
         <JsonPanel title="Todo attempts" :value="shown.todoAttempts ?? []" />
-        <JsonPanel title="Problem signals" :value="shown.attemptAnalysis?.problemSignals ?? []" open />
+        <JsonPanel v-if="shown.attemptAnalysis" title="Problem signals" :value="shown.attemptAnalysis.problemSignals" open />
         <p class="soft-note mt-3">反复尝试、阻塞和可重试失败只用于诊断；Todo 完成和 accepted_done 仍必须分别通过同一次执行的证据合同。</p>
       </div>
     </v-card>

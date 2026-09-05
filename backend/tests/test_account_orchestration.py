@@ -112,6 +112,40 @@ class AccountOrchestrationTests(unittest.TestCase):
         self.assertEqual(len(coverage), 2)
         self.assertEqual({item["accountId"] for item in coverage}, {run["account_id"] for run in runs})
 
+    def test_typed_attempt_reads_preserve_the_nondefault_run_account(self):
+        self.register()
+        _, runs, _, _ = self.make_batch()
+        run = runs[1]
+        todo_id = run["todo_instance_ids"][0]
+        attempt_id = str(uuid.uuid4())
+        self.store.create_run_attempt({
+            "run_attempt_id": attempt_id, "run_id": run["run_id"],
+            "game_id": run["game_id"], "account_id": run["account_id"], "cadence": "daily",
+            "fencing_token_hash": "a" * 64, "cancel_authority_hash": "sha256:" + "b" * 64,
+            "plan": {"accountId": run["account_id"], "executableTodoInstanceIds": [todo_id],
+                     "todos": [{"todoInstanceId": todo_id}]},
+        })
+        self.store.update_run_attempt(attempt_id, state="human_required", completed=True)
+        token = (self.settings.actor_tokens_dir / "cli.token").read_text(encoding="ascii").strip()
+        headers = {"Authorization": f"Bearer {token}", "X-YeYu-Gamer-Actor": "cli"}
+
+        run_response = self.client.get(f'/api/v1/game-runs/{run["run_id"]}', headers=headers)
+        self.assertEqual(run_response.status_code, 200, run_response.text)
+        self.assertEqual(run_response.json()["accountId"], run["account_id"])
+        responses = [
+            (f'/api/v1/game-runs/{run["run_id"]}/attempts', lambda body: body["items"]),
+            (f'/api/v1/run-attempts/{attempt_id}', lambda body: [body]),
+            ('/api/v1/games/WW', lambda body: body["runAttempts"]),
+        ]
+        for path, records in responses:
+            with self.subTest(path=path):
+                response = self.client.get(path, headers=headers)
+                self.assertEqual(response.status_code, 200, response.text)
+                attempt = next(item for item in records(response.json()) if item["runAttemptId"] == attempt_id)
+                self.assertEqual(attempt["accountId"], run["account_id"])
+                self.assertEqual(attempt["runId"], run["run_id"])
+                self.assertEqual(attempt["state"], "human_required")
+
     def test_missing_saved_label_blocks_before_runs_are_created(self):
         accounts = self.register()
         accounts[0]["saved_account_label"] = ""

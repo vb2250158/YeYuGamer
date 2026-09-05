@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import type { AccountTarget, BatchRun, CompletionContractDecision, GameAccount, GameDetail, GameRunRecord, GameState, TodoInstance } from '../api/contracts'
-import { accountBindingLabel, accountCompletionEvidence, accountGameState, accountRunLocation, accountTodos, configuredGameAccounts, gameAccountsPatch, moveGameAccount, reviewRunContextError, scopeGameDetailToAccount, todayAccountTargets } from './gameAccounts'
+import type { AccountTarget, BatchRun, CompletionContractDecision, GameAccount, GameDetail, GameRunRecord, GameState, RunAttempt, TodoAttempt, TodoInstance } from '../api/contracts'
+import { accountBindingLabel, accountCompletionEvidence, accountGameState, accountRunLocation, accountTodos, configuredGameAccounts, gameAccountsPatch, loadedAttemptCounts, moveGameAccount, reviewRunContextError, scopeGameDetailToAccount, todayAccountTargets } from './gameAccounts'
 import { currentStepEvidence } from './todayEvidence'
 import { buildTodayScope } from './todayScope'
 
@@ -185,6 +185,36 @@ describe('account Run details', () => {
 
   it('preserves Run context in links rather than selecting the latest whole-game run', () => {
     expect(accountRunLocation('WW', 'run-B', 'B')).toEqual({ path: '/games/WW', query: { runId: 'run-B', accountId: 'B' } })
+  })
+
+  it('shows a pre-Todo human gate from the exact account Run and its blocked completion contract', () => {
+    const record = { ...run('B', false), state: 'human_required' }
+    record.completionContract = { ...record.completionContract!, outcome: 'blocked' }
+    const attempt = { runAttemptId: 'attempt-B', runId: record.runId, accountId: 'B', gameId: 'WW', state: 'human_required' } as RunAttempt
+    const result = scopeGameDetailToAccount({ ...mixed, runAttempts: [
+      attempt, { ...attempt, runAttemptId: 'attempt-A', runId: 'run-A', accountId: 'default' },
+      { ...attempt, runAttemptId: 'foreign-account', accountId: 'default' },
+      { ...attempt, runAttemptId: 'foreign-game', gameId: 'PGR' },
+    ], todoAttempts: [] }, 'B', record)
+    expect(result.runAttempts).toEqual([attempt])
+    expect(loadedAttemptCounts(result)).toEqual({ runAttemptCount: 1, todoAttemptCount: 0, humanRequiredAttemptCount: 1 })
+    expect(result.runtimeState).toBe('human_required')
+    expect(result.acceptanceState).toBe('evidence_pending')
+    expect(result.attemptAnalysis).toBeUndefined()
+  })
+
+  it('keeps unread attempt counts unknown and counts one human gate once across Run and Todo records', () => {
+    const record = run('B', false)
+    const unknown = scopeGameDetailToAccount({ ...mixed, runAttempts: undefined, todoAttempts: [] }, 'B', record)
+    expect(loadedAttemptCounts(unknown)).toEqual({ runAttemptCount: undefined, todoAttemptCount: undefined, humanRequiredAttemptCount: undefined })
+    const attempt = { runAttemptId: 'attempt-B', runId: record.runId, accountId: 'B', gameId: 'WW', state: 'human_required' } as RunAttempt
+    const step = { todoAttemptId: 'step-B', todoInstanceId: todo('B').todoInstanceId, runAttemptId: attempt.runAttemptId, state: 'human_required' } as TodoAttempt
+    const result = scopeGameDetailToAccount({ ...mixed, runAttempts: [attempt], todoAttempts: [step,
+      { ...step, todoAttemptId: 'foreign-todo', todoInstanceId: todo().todoInstanceId },
+      { ...step, todoAttemptId: 'foreign-attempt', runAttemptId: 'attempt-A' },
+    ] }, 'B', record)
+    expect(result.todoAttempts).toEqual([step])
+    expect(loadedAttemptCounts(result)).toEqual({ runAttemptCount: 1, todoAttemptCount: 1, humanRequiredAttemptCount: 1 })
   })
 
   it('validates a review against its exact Run even when another account owns the game snapshot', () => {

@@ -74,7 +74,7 @@ export function accountGameState(game: GameState, target: AccountTarget, todos: 
   const validDecision = decision && decision.gameId === target.gameId && decision.runId === runId
     && accountIdOf(decision) === target.accountId && scoped.some((todo) => todo.periodKey === decision.gameDayKey)
   const acceptanceState = validDecision && decision.acceptedDone === true ? 'accepted_done'
-    : validDecision && decision.outcome === 'review_required' ? 'evidence_pending' : 'not_started'
+    : validDecision && ['review_required', 'blocked'].includes(decision.outcome) ? 'evidence_pending' : 'not_started'
   return {
     ...game, displayName: `${game.displayName} · ${target.accountLabel}`,
     runId: runId ?? undefined, runtimeState: run?.state ?? target.state ?? 'planned',
@@ -118,8 +118,10 @@ export function scopeGameDetailToAccount(detail: GameDetail, accountId: string, 
     : accountId === defaultAccountId ? '当前账号' : '所选账号'
   const target: AccountTarget = { targetId: accountTargetId(detail.gameId, accountId), gameId: detail.gameId, accountId, accountLabel: label, runId: run?.runId }
   const projected = accountGameState(detail, target, todos, run ? [run] : [])
-  const runAttempts = (detail.runAttempts ?? []).filter((attempt) => attempt.runId === run?.runId)
-  const attemptIds = new Set(runAttempts.map((attempt) => attempt.runAttemptId))
+  const runAttempts = detail.runAttempts?.filter((attempt) => run && attempt.runId === run.runId
+    && attempt.gameId === run.gameId && accountIdOf(attempt) === accountId)
+  const attemptIds = new Set(runAttempts?.map((attempt) => attempt.runAttemptId))
+  const scopedTodoIds = new Set(todos.map((todo) => todo.todoInstanceId))
   const artifacts = (detail.artifacts ?? []).filter((artifact) => run && artifact.runId === run.runId && artifact.gameId === run.gameId)
   const sameCurrentRun = Boolean(run && detail.runId === run.runId)
   return {
@@ -128,11 +130,27 @@ export function scopeGameDetailToAccount(detail: GameDetail, accountId: string, 
     activeRun: undefined, todoInstances: todos, todoSummary: undefined,
     progress: undefined, nextResetAt: undefined, unresolvedRequiredTodoIds: undefined,
     attempts: run ? [{ ...run }] : [], runAttempts,
-    todoAttempts: (detail.todoAttempts ?? []).filter((attempt) => attemptIds.has(attempt.runAttemptId)),
+    todoAttempts: runAttempts && detail.todoAttempts?.filter((attempt) => attemptIds.has(attempt.runAttemptId) && scopedTodoIds.has(attempt.todoInstanceId)),
     attemptAnalysis: undefined, artifacts, evidenceCount: artifacts.length,
     controllerLease: sameCurrentRun ? detail.controllerLease : undefined,
     windowBinding: sameCurrentRun ? detail.windowBinding : undefined,
     checkpoints: sameCurrentRun ? detail.checkpoints : [],
     findings: [],
+  }
+}
+
+/** Count loaded attempts, including human gates reached before any Todo starts. */
+export function loadedAttemptCounts(detail?: Pick<GameDetail, 'runAttempts' | 'todoAttempts'>) {
+  const runAttempts = detail?.runAttempts
+  const todoAttempts = detail?.todoAttempts
+  const humanAttempts = runAttempts && new Set([
+    ...runAttempts.filter((attempt) => attempt.state === 'human_required').map((attempt) => attempt.runAttemptId),
+    ...(todoAttempts ?? []).filter((attempt) => attempt.state === 'human_required'
+      && runAttempts.some((runAttempt) => runAttempt.runAttemptId === attempt.runAttemptId)).map((attempt) => attempt.runAttemptId),
+  ])
+  return {
+    runAttemptCount: runAttempts?.length,
+    todoAttemptCount: todoAttempts?.length,
+    humanRequiredAttemptCount: humanAttempts?.size,
   }
 }

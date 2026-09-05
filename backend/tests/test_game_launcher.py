@@ -4,6 +4,7 @@ from pathlib import Path
 from contextlib import contextmanager
 import os
 import base64
+import ctypes
 import json
 import subprocess
 import sys
@@ -1260,7 +1261,7 @@ class QueueGameCloseTests(unittest.TestCase):
         before = {"availablePhysicalBytes": 100, "availableCommitBytes": 200}
         after = {"availablePhysicalBytes": 150, "availableCommitBytes": 250}
         with mock.patch.object(self.launcher, "_queue_close_snapshot", side_effect=[present, present, ({}, set()), ({}, set())]), mock.patch.object(
-            self.launcher, "_close_verified_queue_processes",
+            self.launcher, "_close_verified_queue_processes", return_value=(),
         ) as close, mock.patch.object(self.launcher, "_available_memory", side_effect=[before, after]):
             result = self.launcher.close_for_queue("StarRail", str(self.executable))
         self.assertEqual(result.state, "closed")
@@ -1278,6 +1279,7 @@ class QueueGameCloseTests(unittest.TestCase):
             nonlocal closed
             stages.append(force)
             closed = force
+            return ()
         with mock.patch.object(self.launcher, "_queue_close_snapshot", side_effect=lambda *_: ({}, set()) if closed else ({42: self.identity}, set())), mock.patch.object(
             self.launcher, "_close_verified_queue_processes", side_effect=close,
         ):
@@ -1287,7 +1289,7 @@ class QueueGameCloseTests(unittest.TestCase):
 
     def test_successful_termination_request_does_not_hide_remaining_process(self) -> None:
         with mock.patch.object(self.launcher, "_queue_close_snapshot", return_value=({42: self.identity}, set())), mock.patch.object(
-            self.launcher, "_close_verified_queue_processes", return_value=True,
+            self.launcher, "_close_verified_queue_processes", return_value=(),
         ) as close:
             result = self.launcher.close_for_queue("StarRail", str(self.executable))
         self.assertEqual(close.call_count, 3)
@@ -1338,29 +1340,123 @@ class QueueGameCloseTests(unittest.TestCase):
         self.assertEqual(result.remaining_process_ids, (42,))
 
     def test_handle_identity_is_rechecked_before_wm_close_or_termination(self) -> None:
-        for force in (False, True):
-            with self.subTest(force=force):
+        replacement = _QueueProcessIdentity(self.executable, self.identity.created_at + 1)
+        for force, observed in ((False, replacement), (True, replacement), (True, None)):
+            with self.subTest(force=force, identity=observed):
                 api = mock.Mock()
                 api.OpenProcess.return_value = 99
-                replacement = _QueueProcessIdentity(self.executable, self.identity.created_at + 1)
                 with mock.patch.object(self.launcher, "_queue_process_api", return_value=api), mock.patch.object(
-                    self.launcher, "_queue_identity_from_handle", return_value=replacement,
+                    self.launcher, "_queue_identity_from_handle", return_value=observed,
                 ), mock.patch.object(self.launcher, "_request_graceful_close") as graceful:
-                    self.launcher._close_verified_queue_processes({42: self.identity}, force=force, cancel_requested=None)
+                    report = self.launcher._close_verified_queue_processes({42: self.identity}, force=force, cancel_requested=None)
+                self.assertEqual(report[0]["outcome"], "identity-unavailable" if observed is None else "identity-mismatch")
                 graceful.assert_not_called()
                 api.TerminateProcess.assert_not_called()
+                api.WaitForSingleObject.assert_not_called()
                 api.CloseHandle.assert_called_once_with(99)
 
     def test_force_uses_verified_handle_and_does_not_spawn_taskkill(self) -> None:
         api = mock.Mock()
         api.OpenProcess.return_value = 99
+        api.TerminateProcess.return_value = 1
+        api.WaitForSingleObject.return_value = 258
         with mock.patch.object(self.launcher, "_queue_process_api", return_value=api), mock.patch.object(
             self.launcher, "_queue_identity_from_handle", return_value=self.identity,
         ), mock.patch("yeyu_gamer_manager.services.game_launcher.subprocess.run") as run:
             self.launcher._close_verified_queue_processes({42: self.identity}, force=True, cancel_requested=None)
         api.TerminateProcess.assert_called_once_with(99, 1)
+        api.OpenProcess.assert_called_once_with(0x101001, False, 42)
+        self.assertEqual(api.WaitForSingleObject.call_args_list, [mock.call(99, 0), mock.call(99, 0)])
         api.CloseHandle.assert_called_once_with(99)
         run.assert_not_called()
+
+    def test_native_termination_result_and_wait_cannot_hide_enumerated_residual(self) -> None:
+        for returned, wait_value in ((0, 258), (1, 258), (1, 0)):
+            with self.subTest(terminate_return=returned, wait_value=wait_value):
+                api = mock.Mock()
+                api.OpenProcess.return_value = 99
+                def terminate(*_):
+                    ctypes.set_last_error(5)
+                    return returned
+                def wait(*_):
+                    # A subsequent call changes last error; failure must already
+                    # have been captured, and success must ignore stale errors.
+                    ctypes.set_last_error(87)
+                    return wait_value
+                api.TerminateProcess.side_effect = terminate
+                api.WaitForSingleObject.side_effect = wait
+                with mock.patch.object(self.launcher, "_queue_close_snapshot", return_value=({42: self.identity}, set())), mock.patch.object(
+                    self.launcher, "_queue_process_api", return_value=api,
+                ), mock.patch.object(self.launcher, "_queue_identity_from_handle", return_value=self.identity), mock.patch.object(
+                    self.launcher, "_request_graceful_close",
+                ):
+                    receipt = self.launcher.close_for_queue("StarRail", str(self.executable))
+                self.assertEqual(receipt.state, "close-failed")
+                self.assertEqual(receipt.remaining_process_ids, (42,))
+                observations = receipt.as_result()["processCloseObservations"]
+                self.assertEqual([item["phase"] for item in observations], ["wm-close", "wm-close", "terminate"])
+                last = observations[-1]
+                self.assertEqual(last["terminateProcess"], {"apiReturn": returned, "succeeded": bool(returned), "winError": None if returned else 5})
+                self.assertEqual(last["outcome"], "termination-request-accepted" if returned else "termination-request-failed")
+                self.assertEqual(last["waitAfter"], {"value": wait_value, "state": "signaled" if wait_value == 0 else "not-signaled", "winError": None})
+                api.TerminateProcess.assert_called_once_with(99, 1)
+                self.assertEqual(api.WaitForSingleObject.call_args_list, [mock.call(99, 0), mock.call(99, 0)])
+                self.assertEqual(api.CloseHandle.call_count, 3)
+
+    def test_native_open_failure_records_error_without_dispatch(self) -> None:
+        api = mock.Mock()
+        def denied(*_):
+            ctypes.set_last_error(5)
+            return 0
+        api.OpenProcess.side_effect = denied
+        with mock.patch.object(self.launcher, "_queue_process_api", return_value=api):
+            report = self.launcher._close_verified_queue_processes({42: self.identity}, force=True, cancel_requested=None)
+        self.assertEqual(report[0]["outcome"], "open-process-failed")
+        self.assertEqual(report[0]["openProcess"], {"accessMask": 0x101001, "succeeded": False, "winError": 5})
+        api.TerminateProcess.assert_not_called()
+        api.WaitForSingleObject.assert_not_called()
+        api.CloseHandle.assert_not_called()
+
+    def test_native_wait_failure_is_explicit_and_does_not_add_wait_time(self) -> None:
+        api = mock.Mock()
+        api.OpenProcess.return_value = 99
+        api.TerminateProcess.return_value = 1
+        def wait_failed(*_):
+            ctypes.set_last_error(6)
+            return 0xFFFFFFFF
+        api.WaitForSingleObject.side_effect = wait_failed
+        with mock.patch.object(self.launcher, "_queue_process_api", return_value=api), mock.patch.object(
+            self.launcher, "_queue_identity_from_handle", return_value=self.identity,
+        ):
+            report = self.launcher._close_verified_queue_processes({42: self.identity}, force=True, cancel_requested=None)
+        self.assertEqual(report[0]["waitBefore"], {"value": 0xFFFFFFFF, "state": "failed", "winError": 6})
+        self.assertEqual(report[0]["waitAfter"], report[0]["waitBefore"])
+        self.assertEqual(api.WaitForSingleObject.call_args_list, [mock.call(99, 0), mock.call(99, 0)])
+        api.CloseHandle.assert_called_once_with(99)
+
+    def test_cancel_or_human_during_wait_observation_prevents_termination(self) -> None:
+        for exception in (GameLaunchCancelled("cancelled"), GameLaunchHumanRequired("login", "preserve")):
+            with self.subTest(kind=type(exception).__name__):
+                pending = False
+                api = mock.Mock()
+                api.OpenProcess.return_value = 99
+                def wait(*_):
+                    nonlocal pending
+                    pending = True
+                    return 258
+                def cancelled():
+                    if pending:
+                        raise exception
+                    return False
+                api.WaitForSingleObject.side_effect = wait
+                with mock.patch.object(self.launcher, "_queue_process_api", return_value=api), mock.patch.object(
+                    self.launcher, "_queue_identity_from_handle", return_value=self.identity,
+                ):
+                    with self.assertRaises(type(exception)) as caught:
+                        self.launcher._close_verified_queue_processes({42: self.identity}, force=True, cancel_requested=cancelled)
+                self.assertIs(caught.exception, exception)
+                api.TerminateProcess.assert_not_called()
+                api.CloseHandle.assert_called_once_with(99)
 
     def test_cancellation_or_new_human_gate_during_identity_query_prevents_action(self) -> None:
         for exception in (GameLaunchCancelled("cancelled"), GameLaunchHumanRequired("login", "preserve")):
@@ -1454,6 +1550,7 @@ class QueueGameCloseTests(unittest.TestCase):
         names = {10: "NTEGame.exe", 20: "HTGame.exe"}
         def close(_targets, **_):
             names.pop(10, None)
+            return ()
         with mock.patch.object(GameLaunchService, "_list_enumerated", side_effect=lambda _: dict(names)), mock.patch.object(
             GameLaunchService, "_queue_process_identity", side_effect=identities.get,
         ), mock.patch.object(self.launcher, "_close_verified_queue_processes", side_effect=close) as action:
@@ -1476,6 +1573,7 @@ class QueueGameCloseTests(unittest.TestCase):
         def close(targets, **_):
             for pid in targets:
                 names.pop(pid)
+            return ()
         with mock.patch.object(GameLaunchService, "_list_enumerated", side_effect=lambda _: dict(names)), mock.patch.object(
             GameLaunchService, "_queue_process_identity", side_effect=identities.get,
         ), mock.patch.object(self.launcher, "_close_verified_queue_processes", side_effect=close) as action:

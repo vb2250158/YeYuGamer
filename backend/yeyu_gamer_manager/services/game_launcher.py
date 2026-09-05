@@ -78,9 +78,10 @@ class GameCloseReceipt:
     unverified_process_ids: tuple[int, ...] = ()
     memory_before: dict[str, int] | None = None
     memory_after: dict[str, int] | None = None
+    process_close_observations: tuple[dict[str, object], ...] = ()
 
     def as_result(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "state": self.state,
             "requestedProcessIds": list(self.requested_process_ids),
             "remainingProcessIds": list(self.remaining_process_ids),
@@ -89,6 +90,9 @@ class GameCloseReceipt:
             "memoryBefore": self.memory_before,
             "memoryAfter": self.memory_after,
         }
+        if self.process_close_observations:
+            result["processCloseObservations"] = list(self.process_close_observations)
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,10 +392,8 @@ try {
     # driven by the launcher keep the action hidden too, so this bound stays
     # generous.
     LAUNCHER_UI_READY_TIMEOUT_SECONDS = 900.0
-    # Process-list probes see a client in kernel teardown as "running" for as
-    # long as a driver holds its last thread.  Such a process has already
-    # exited (GetExitCodeProcess != STILL_ACTIVE) and can never expose a game
-    # window, so launch/ready/close gates must not treat it as a live client.
+    # Exit-code probes inform readiness only. An enumerated residual with an
+    # unusual exit state does not establish why it remains or free its resources.
     STILL_ACTIVE = 259
     ENDFIELD_STALE_HEADLESS_SECONDS = 300.0
     # Current official public-desktop shortcut targets the root Launcher.exe.
@@ -2194,6 +2196,7 @@ exit 4
         initial, unknown = self._queue_close_snapshot(root, names)
         self._raise_if_cancelled(cancel_requested)
         requested: set[int] = set()
+        observations: list[dict[str, object]] = []
         remaining = set(initial) | unknown
         had_candidates = bool(remaining)
         # A finite sequence: normal WM_CLOSE, one second pass for late windows,
@@ -2211,7 +2214,9 @@ exit 4
                 remaining = set(current) | unknown
                 break
             requested.update(targets)
-            self._close_verified_queue_processes(targets, force=force, cancel_requested=cancel_requested)
+            observations.extend(self._close_verified_queue_processes(
+                targets, force=force, cancel_requested=cancel_requested,
+            ))
             deadline = time.monotonic() + timeout
             while True:
                 self._raise_if_cancelled(cancel_requested)
@@ -2233,6 +2238,7 @@ exit 4
             tuple(sorted(requested)), tuple(sorted(remaining)),
             unverified_process_ids=tuple(sorted(unknown)),
             memory_before=memory_before, memory_after=self._available_memory(),
+            process_close_observations=tuple(observations),
         )
 
     @classmethod
@@ -2350,6 +2356,8 @@ exit 4
         kernel32.GetProcessTimes.restype = wintypes.BOOL
         kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
         kernel32.TerminateProcess.restype = wintypes.BOOL
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
         return kernel32
@@ -2382,26 +2390,67 @@ exit 4
     def _close_verified_queue_processes(
         self, targets: dict[int, _QueueProcessIdentity], *, force: bool,
         cancel_requested: LaunchCancellationCheck | None,
-    ) -> None:
+    ) -> tuple[dict[str, object], ...]:
         kernel32 = self._queue_process_api()
+        observations: list[dict[str, object]] = []
         for pid, identity in sorted(targets.items()):
             self._raise_if_cancelled(cancel_requested)
-            handle = kernel32.OpenProcess(0x1000 | (0x0001 if force else 0), False, pid)
+            # SYNCHRONIZE permits a zero-time observation on the very handle
+            # used for identity verification and termination; it adds no wait.
+            access = 0x1000 | (0x100001 if force else 0)
+            ctypes.set_last_error(0)
+            handle = kernel32.OpenProcess(access, False, pid)
+            open_error = ctypes.get_last_error() if not handle else None
+            observation: dict[str, object] = {
+                "processId": pid,
+                "phase": "terminate" if force else "wm-close",
+                "expectedCreationFiletime": identity.created_at,
+                "openProcess": {"accessMask": access, "succeeded": bool(handle), "winError": open_error},
+                "outcome": "open-process-failed",
+            }
+            observations.append(observation)
             if not handle:
                 continue
             try:
-                if self._queue_identity_from_handle(kernel32, handle) != identity:
+                observed_identity = self._queue_identity_from_handle(kernel32, handle)
+                if observed_identity != identity:
+                    observation["outcome"] = "identity-unavailable" if observed_identity is None else "identity-mismatch"
                     continue
                 self._require_queue_local_path(identity.executable)
+                observation["identityVerified"] = True
+                self._raise_if_cancelled(cancel_requested)
+                if force:
+                    observation["waitBefore"] = self._queue_wait_observation(kernel32, handle)
                 self._raise_if_cancelled(cancel_requested)
                 if force:
                     # Act on the same handle that supplied the verified image
                     # and creation time, so PID reuse cannot retarget the kill.
-                    kernel32.TerminateProcess(handle, 1)
+                    ctypes.set_last_error(0)
+                    returned = int(kernel32.TerminateProcess(handle, 1))
+                    accepted = bool(returned)
+                    terminate_error = ctypes.get_last_error() if not accepted else None
+                    observation["terminateProcess"] = {"apiReturn": returned, "succeeded": accepted, "winError": terminate_error}
+                    observation["outcome"] = "termination-request-accepted" if accepted else "termination-request-failed"
+                    observation["waitAfter"] = self._queue_wait_observation(kernel32, handle)
                 else:
                     self._request_graceful_close({pid})
+                    # The legacy WM_CLOSE helper does not return dispatch ACKs.
+                    # Do not claim a window existed or accepted its message.
+                    observation["outcome"] = "graceful-close-helper-returned"
             finally:
                 kernel32.CloseHandle(handle)
+        return tuple(observations)
+
+    @staticmethod
+    def _queue_wait_observation(kernel32: Any, handle: Any) -> dict[str, object]:
+        ctypes.set_last_error(0)
+        value = int(kernel32.WaitForSingleObject(handle, 0))
+        error = ctypes.get_last_error() if value == 0xFFFFFFFF else None
+        return {
+            "value": value,
+            "state": {0: "signaled", 258: "not-signaled", 0xFFFFFFFF: "failed"}.get(value, "unexpected"),
+            "winError": error,
+        }
 
     @staticmethod
     def _available_memory() -> dict[str, int] | None:

@@ -252,6 +252,7 @@ export interface RunAttempt extends JsonObject {
   runAttemptId: string
   runId: string
   gameId: string
+  accountId?: string
   cadence: TodoCadence
   state: RunAttemptState
   executableTodoInstanceIds: string[]
