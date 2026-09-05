@@ -21,7 +21,7 @@ namespace YeYuGamer.AdapterHost
     internal static class Program
     {
         private const string ProtocolVersion = "1.1";
-        private const string HostVersion = "0.3.5";
+        private const string HostVersion = "0.3.6";
         private const string ExecutionPackageId = "legacy-night-rain-gamer";
         private const int MaxRequestBytes = 262144;
         private const int MaxEventBytes = 65536;

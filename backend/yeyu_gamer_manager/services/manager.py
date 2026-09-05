@@ -235,7 +235,7 @@ def _dump(model: Any) -> dict[str, Any]:
 
 
 class ManagerService:
-    VERSION = "0.3.5"
+    VERSION = "0.3.6"
     # A pending Agent completion review may delay the batch seal (and the round
     # mail) for at most this long.  After that the machine adjudication seals
     # the batch; unreviewed runs stay review_required.

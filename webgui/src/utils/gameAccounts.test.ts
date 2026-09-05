@@ -81,6 +81,22 @@ describe('account-scoped Today progress', () => {
     expect(accountGameState(game, target('B'), todos, [run('B')]).acceptanceState).toBe('accepted_done')
   })
 
+  it('keeps blocked accounts without a started attempt out of the evidence queue', () => {
+    for (const [state, runAttemptId] of [
+      ['queued', null], ['planned', null], ['human_required', null],
+      ['queued', 'older-attempt'], ['planned', 'older-attempt'],
+    ] as const) {
+      const record = { ...run('B', false), state }
+      record.completionContract = { ...record.completionContract!, outcome: 'blocked', runAttemptId }
+      const frozen = { ...target('B'), runId: record.runId, state, completionContract: record.completionContract }
+      for (const runs of [[record], []]) {
+        const projected = accountGameState(game, frozen, [todo('B')], runs)
+        expect(projected.runtimeState).toBe(state)
+        expect(projected.acceptanceState).toBe('not_started')
+      }
+    }
+  })
+
   it.each(['account', 'game', 'run', 'day'])('rejects a mismatched completion %s identity', (field) => {
     const record = run('B')
     record.completionContract = { ...record.completionContract!, ...({ account: { accountId: 'default' }, game: { gameId: 'PGR' }, run: { runId: 'other' }, day: { gameDayKey: 'daily:2026-09-04' } }[field]) }
@@ -189,7 +205,7 @@ describe('account Run details', () => {
 
   it('shows a pre-Todo human gate from the exact account Run and its blocked completion contract', () => {
     const record = { ...run('B', false), state: 'human_required' }
-    record.completionContract = { ...record.completionContract!, outcome: 'blocked' }
+    record.completionContract = { ...record.completionContract!, outcome: 'blocked', runAttemptId: 'attempt-B' }
     const attempt = { runAttemptId: 'attempt-B', runId: record.runId, accountId: 'B', gameId: 'WW', state: 'human_required' } as RunAttempt
     const result = scopeGameDetailToAccount({ ...mixed, runAttempts: [
       attempt, { ...attempt, runAttemptId: 'attempt-A', runId: 'run-A', accountId: 'default' },

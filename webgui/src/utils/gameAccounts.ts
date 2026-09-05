@@ -73,11 +73,14 @@ export function accountGameState(game: GameState, target: AccountTarget, todos: 
   const decision = run?.completionContract ?? target.completionContract
   const validDecision = decision && decision.gameId === target.gameId && decision.runId === runId
     && accountIdOf(decision) === target.accountId && scoped.some((todo) => todo.periodKey === decision.gameDayKey)
+  const runtimeState = run?.state ?? target.state ?? 'planned'
+  const blockedAttempt = decision?.outcome === 'blocked' && Boolean(decision.runAttemptId)
+    && !['planned', 'queued'].includes(runtimeState)
   const acceptanceState = validDecision && decision.acceptedDone === true ? 'accepted_done'
-    : validDecision && ['review_required', 'blocked'].includes(decision.outcome) ? 'evidence_pending' : 'not_started'
+    : validDecision && (decision.outcome === 'review_required' || blockedAttempt) ? 'evidence_pending' : 'not_started'
   return {
     ...game, displayName: `${game.displayName} · ${target.accountLabel}`,
-    runId: runId ?? undefined, runtimeState: run?.state ?? target.state ?? 'planned',
+    runId: runId ?? undefined, runtimeState,
     acceptanceState, reviewState: 'none', policy: {},
     updatedAt: run?.updatedAt ?? target.updatedAt,
   }
