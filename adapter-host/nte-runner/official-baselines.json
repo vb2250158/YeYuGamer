@@ -1,0 +1,14 @@
+{
+  "repository": "https://github.com/BnanZ0/ok-nte.git",
+  "templateRepository": "https://github.com/BnanZ0/ok-neverness-to-everness-coco-labeling.git",
+  "releases": {
+    "v1.3.11": {
+      "commit": "44de38e583e72f1ba921f2df2eb0e9cec6d4ab81",
+      "templateCommit": "24898e1e7a3509649157313ade4821e405731a18"
+    },
+    "v1.3.18": {
+      "commit": "096287d9f3ba218392a1ac0d809f763434499962",
+      "templateCommit": "7fc840af157cd80ff54ee0634ff76fd77161c576"
+    }
+  }
+}
