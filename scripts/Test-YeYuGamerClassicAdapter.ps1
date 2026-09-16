@@ -2,7 +2,7 @@
 param(
     [string]$SourceRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$CandidateRoot = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'YeYuGamer\adapter-build\classic-selected-daily-candidate'),
-    [string]$Python = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\Python\Python312\python.exe'),
+    [string]$Python = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\YeYuGamer\.venv\Scripts\python.exe'),
     [string]$CSharpCompilerPath = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe',
     [string]$EvidenceDirectory = ''
 )
