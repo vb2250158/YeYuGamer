@@ -162,6 +162,10 @@ class GameDayReportManagerTests(unittest.TestCase):
         self.client = self.context.__enter__()
         self.manager = self.client.app.state.manager
         self.store = self.manager.store
+        # Keep the test single threaded: the app also runs the dispatcher worker,
+        # and a claim taken by it in the middle of an assertion is a race, not a
+        # behaviour under test.
+        self.manager.notification_dispatcher.stop()
 
     def tearDown(self) -> None:
         self.context.__exit__(None, None, None)
@@ -404,6 +408,27 @@ class GameDayReportManagerTests(unittest.TestCase):
         )
         self.assertEqual("superseded", self.day_rows()["body late"]["state"])
 
+    def test_the_snapshot_covers_exactly_the_enabled_games(self) -> None:
+        """The real snapshot must run: the dispatcher calls it on every seal."""
+
+        day, entries = self.manager._game_day_report_snapshot()
+        self.assertEqual(["PGR"], [entry["gameId"] for entry in entries])
+        self.assertTrue(entries[0]["allRequiredCompleted"] in {True, False})
+        for entry in entries:
+            self.assertLessEqual(
+                int(entry["requiredCompleted"]), int(entry["requiredTotal"]), entry
+            )
+            self.assertIn(
+                entry["runtimeState"],
+                {"completed", "done", "failed", "review_required", "human_required",
+                 "unknown", "planned", "not_started", "in_progress"},
+                entry,
+            )
+        # Empty means the enabled game has no current daily window yet; a value
+        # must be a daily period key, never the Manager scope fingerprint.
+        if day:
+            self.assertRegex(day, r"^\d{4}-\d{2}-\d{2}$")
+
     def test_a_report_for_an_unreached_day_is_never_mailed(self) -> None:
         self.seal_day_report(tag="future", report_day="2026-10-01")
         self.assertEqual(0, self.dispatch(GAME_DAY, [game_entry("PGR", completed=5, total=7)]))
@@ -420,6 +445,10 @@ class GameDayReportManagerTests(unittest.TestCase):
         self.manager.notification_dispatcher.run_once()
         sent = list(self.transport.sent)
         self.assertEqual(1, len(sent))
+        self.assertEqual("body only", sent[0].text_body)
+        # A day report spans several seals, so it can never carry the frozen
+        # screenshot bytes of just one of them.
+        self.assertEqual((), sent[0].attachments)
         self.assertEqual("body only", sent[0].text_body)
         # A day report spans several seals, so it can never carry the frozen
         # screenshot bytes of just one of them.

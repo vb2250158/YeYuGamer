@@ -5060,7 +5060,9 @@ class ManagerService:
             current[str(record["game_id"])] = self.list_todo_instances(
                 game_id=str(record["game_id"]), cadence="daily", current=True, limit=1000
             )
-        overview = self.todo_overview(games=games, current_items_by_game=current)
+        overview = self.manager_todos.todo_overview(
+            games=games, current_items_by_game=current
+        )
         summaries: dict[str, Any] = overview.get("games") or {}
         day_key = ""
         entries: list[dict[str, Any]] = []
