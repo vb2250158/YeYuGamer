@@ -136,6 +136,7 @@ C:/Users/Admin/.workbuddy/binaries/python/versions/3.13.12/python.exe scripts/he
    ```
    装机文件 mtime 必须**早于** Manager 进程启动时间（`scripts/heartbeat/hb-status.py` 的 `startedAt`），否则跑的还是旧构建。全量测试：`PYTHONPATH=backend/tests .cache/build-python/Scripts/python.exe -m pytest backend/tests -q`（`platform/tests`、`adapter-host/tests` 按改动范围另跑；该 venv 若被清掉就重建一个再跑）。
 7. ⛔ **不要再用 `.cache/publish-watch.py`**：那套"后台 watcher + `release-pending.flag`"会卡在自己的等待循环里、把标志一直留着，2026-09-22 实际压住过整条心跳几十分钟。发布就按上面 1–6 步前台跑完、自己收尾。
+8. ⚠️ **网络：`pypi.org` 可能不通，先备镜像（2026-09-22 22:1x 实测）**。脚本第 1 步是 `pip install --require-hashes` 装 release tools（`Publish-YeYuGamerLocalRelease.ps1:520`，**没有 `--index-url`**）。若日志出现 `SSLError(SSLEOFError(8, ...UNEXPECTED_EOF_WHILE_READING))` / `No matching distribution found for <pkg>`，先做 10 秒只读诊断：`https://pypi.org/simple/<pkg>/` 是否 SSL EOF，而 `pypi.tuna.tsinghua.edu.cn` / `mirrors.aliyun.com` 是否 200。**修法（已验证可用）**：在 driver `.cmd` 里加 `set PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple` 再跑（镜像与 PyPI 同文件同 hash，`-I`/`-E` 只屏蔽 `PYTHON*` 不屏蔽 `PIP_*`）。**不要**改系统级 `pip.ini`。注意环境里 `HTTP(S)_PROXY=http://127.0.0.1:7897` 是 Clash Verge，重启后这条路可能变了；**游戏服务器是国内的，pypi 不通不影响玩游戏**。
 
 ## 7. "客户端秒退 / 不建窗口"这一族：结论已定，别再重查
 
@@ -162,6 +163,13 @@ C:/Users/Admin/.workbuddy/binaries/python/versions/3.13.12/python.exe scripts/he
 1. **自动登录真的成功了**：`hb-uptime.py` 显示刚开机，且存在交互会话（`hb-status.py` 能连上 API、`hb-windows.py` 能看到 explorer 的 `Shell_TrayWnd`）。**连不上 API 且开机时长很短 ⇒ 自动登录失败，机器停在锁屏，这是最高级别事故**，必须在简报第一行写明并给秋雨最小动作（登录一次）。
 2. **Manager 被拉起来了**：`Invoke-YeYuGamerDailySupervisor.py` 已带"先探活、不在才拉"的恢复分支（冷却 15 分钟、每日上限 12 次）；核对 `netstat -ano | grep 8877` 有 LISTENING。
 3. **残留真的没了**：`hb-mutex.py probe comkurogameharukuro "ilium-GF2-Game-GF2-Exilium-exe-SingleInstanceMutex-Default"` 都应为未被占；`hb-pids.py "pgr|gf2_exilium"` 不应再有 `exit=<非259>` 的条目。之后等 supervisor 的 5 分钟 tick 自动补批，**不要手动发批次**。
+
+**★★ 2026-09-22 第一次真实重启的实测结果：修好了，也暴露了最大的单点风险。**
+
+- **修好了（判决性证据）**：重启后 22:24:06 supervisor 自动补批 `475df8c1`，首个目标 PGR `22:26:13.939 launch.ready elapsed=82.4s pids=[26544]` 并跑起真实上游待办（`pgr-formal-entry`/`pgr-official-depatch`/`attach-home`）。同一份装机代码、同一配置，唯一变量是"互斥体被重启清空" ⇒ **"秒退 / 不建窗口 = 单实例互斥体被卡死的残留占着"由自然实验证实**。以后这一族只做 §7 那三步（探互斥体 → 记残留 → 需要时 handle64），别再查图形层/hook/观察层。
+- **自恢复链也是通的**：重启后自愈器因互斥体已释放而正确不动手；`DailySupervisor` 的 tick 自动 `manager recovery: started`（22:04:56 起 Manager）；22:24 自动补批。⇒ 机器只要起来了，什么都自己接上，**心跳不需要手动救**。
+- **但机器 7 小时 46 分没有起来**：`06:12:14Z` 干净关机（事件 6006；最近一条 `6008` 非正常关机还是 09-05）→ 直到 `14:00:16Z` 才 `6005` 启动，中间**没有任何系统事件**（OS 没在跑）、冷启动（无唤醒历史）。软件无法阻止 POST ⇒ 属电源/固件/外部层面（AC 被切、或人为断电），但代价是**当天下午整段报废**。机器无电池（`BatteryFlag 0x80`），任务上"电池模式停止"是失效设置，已排除。
+- **结论与要求**：**按"重启可能回不来"来设计，不要当成必然恢复。** 心跳能做的只有"起来之后核对 + 记档"；真正的兜底需要秋雨决定：BIOS `Restore on AC Power Loss` 改成来电即上电，或给机器加可远程控制的电源。**心跳仍然不要自己 `shutdown`**（自愈器的守卫比人肉严），但也**不要再把重启当作零成本动作**——它现在已知可能吃掉一整个游戏日。
 
 ## 8. 工具与环境坑
 
