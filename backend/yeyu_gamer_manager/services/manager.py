@@ -8,6 +8,7 @@ import os
 import secrets
 import stat
 import threading
+import time
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -38,6 +39,10 @@ from ..domain.models import (
     ConfigPatchRequest,
     ConfigResponse,
     CZNProfileConfig,
+    FGOProfileConfig,
+    StarRailProfileConfig,
+    EndfieldProfileConfig,
+    Gf2ProfileConfig,
     DiagnosticBundleCreateRequest,
     EntityState,
     EvidenceReviewRequest,
@@ -145,8 +150,9 @@ from ..store.sqlite_store import (
 from .adapter_host import AdapterPromotionRejected, ManagerAdapterHost
 from .batch_planning import BatchPlanningDecision, classify_batch_todo_plans
 from .batch_projection import project_batch_record
+from .integration_results import integration_results
 from .account_scopes import (
-    DEFAULT_ACCOUNT_ID, account_target_id, daily_account_targets,
+    DEFAULT_ACCOUNT_ID, account_execution_availability, account_target_id, daily_account_targets,
     enabled_account_ids, game_accounts, resolve_game_account, run_target_id, validate_account_patch,
     freeze_account_snapshot, frozen_run_tool_profiles, initialize_ww_account_configs,
 )
@@ -176,12 +182,14 @@ from .notifications import (
 from .notifications.artifacts import _has_reparse_point, _same_file_snapshot
 from .notifications.screenshots import is_reward_capture
 from .notifications.secrets import NotificationSecretProvider
+from .notifications.template import render_game_day_notification
 from .notifications.transport import NotificationTransport
 from .completion_contract import (
     COMPLETION_REVIEW_EVIDENCE_CONTENT_TYPES,
     CompletionPolicyRegistry,
     GameCompletionPolicy,
     adjudicate_completion,
+    has_upstream_task_results,
     policy_for_frozen_game_day,
     policy_review_contract,
 )
@@ -194,7 +202,7 @@ from .execution_control import (
     raise_todo_blocker,
     transition_controller_lease,
 )
-from .todo_catalog import catalog as todo_catalog
+from .todo_catalog import RETIRED_DAILY_TODO_IDS, catalog as todo_catalog
 from .todo_dispatch import HUMAN_TAKEOVER_RELEASED_REOBSERVE_REASON
 from .todo_reset_scheduler import TodoResetScheduler
 from .game_launcher import (
@@ -213,7 +221,7 @@ from .emulator_binding import (
     LDPlayerBinding,
     LDPlayerBindingService,
 )
-from .window_capture import WindowCaptureError, WindowsGameWindowCapture
+from .window_capture import CapturedWindow, WindowCaptureError, WindowsGameWindowCapture
 from ..logging_setup import (
     AttemptLogSession,
     bind_log_context,
@@ -344,6 +352,13 @@ class ManagerService:
         # Initialization is a Manager lifecycle mutation, never a GET side
         # effect. Long-running processes use the explicit reconcile/reset API
         # when a new game period begins.
+        current_selection = self.store.get_config()["values"].get("daily_todo_selection", {})
+        migrated_selection = {
+            game_id: [item for item in ids if item not in RETIRED_DAILY_TODO_IDS]
+            for game_id, ids in current_selection.items()
+        }
+        if migrated_selection != current_selection:
+            self.store.update_config({"daily_todo_selection": migrated_selection})
         if "WW" in known_game_ids:
             current_config = self.store.get_config()["values"]
             account_config = initialize_ww_account_configs(current_config, [
@@ -1480,7 +1495,7 @@ class ManagerService:
         )
 
     def health(self) -> HealthResponse:
-        database_check = self.store.quick_check()
+        database_check = self.store.read_check()
         database_ok = database_check == "ok"
         legacy_status = self.legacy_report.status
         status = "ok" if database_ok and legacy_status != "error" else "degraded"
@@ -1492,7 +1507,9 @@ class ManagerService:
             checked_at=utc_now(),
             checks={
                 "database": HealthCheck(
-                    status="ok" if database_ok else "error", detail=database_check
+                    status="ok" if database_ok else "error",
+                    detail=("storage readable; integrity check is available in diagnostics"
+                            if database_ok else database_check),
                 ),
                 "legacyImport": HealthCheck(
                     status=("ok" if legacy_status == "ok" else "degraded"),
@@ -1510,17 +1527,38 @@ class ManagerService:
         )
 
     def snapshot(self) -> SnapshotResponse:
+        started = time.monotonic()
+        timings: dict[str, float] = {}
+        checkpoint = started
+        def mark(phase: str) -> None:
+            nonlocal checkpoint
+            current = time.monotonic()
+            timings[phase] = round((current - checkpoint) * 1000, 1)
+            checkpoint = current
         data = self.store.snapshot_data()
+        mark("store")
         recent_runs, sealed_batches = self._projection_history()
+        mark("history")
+        # Cards and totals describe the same request-local Todo observations.
+        # Do not query attempts/blockers twice or retain these across refreshes.
+        current_daily_todos = {
+            str(game["game_id"]): self.list_todo_instances(
+                game_id=str(game["game_id"]), cadence="daily", current=True, limit=1000,
+            )
+            for game in data["games"]
+        }
         games = [
             self._game_projection(
                 game,
                 recent_runs=recent_runs,
                 sealed_batches=sealed_batches,
+                current_todos=current_daily_todos[str(game["game_id"])],
             )
             for game in data["games"]
         ]
+        mark("games")
         batch_execution_readiness = self._batch_action_execution_readiness()
+        mark("readiness")
         # The home page refreshes this projection frequently.  A complete batch
         # result can contain frozen Todo/evidence contracts for many runs; those
         # belong to ``GET /batches/{batch_id}``, which Queue already loads when a
@@ -1561,7 +1599,10 @@ class ManagerService:
                 1 for game in games if game.acceptance_state == "accepted_done"
             ),
         }
-        todo = self.todo_overview()
+        todo = self.manager_todos.todo_overview(
+            games=data["games"], current_items_by_game=current_daily_todos,
+        )
+        mark("batches_and_todos")
         counters.update(
             {
                 "todoRequired": int(todo["requiredTotal"]),
@@ -1572,7 +1613,7 @@ class ManagerService:
                 "todoHumanRequired": int(todo["humanRequired"]),
             }
         )
-        return SnapshotResponse(
+        response = SnapshotResponse(
             state_version=state_version,
             generated_at=utc_now(),
             event_cursor=str(state_version),
@@ -1585,7 +1626,13 @@ class ManagerService:
             counters=counters,
             todo=todo,
             execution_control=self.store.execution_control_summary(),
+            account_execution_availability=self.account_execution_availability(),
         )
+        mark("response")
+        elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+        if elapsed_ms >= 1000:
+            _log.info("snapshot.slow stateVersion=%s elapsedMs=%s phasesMs=%s", state_version, elapsed_ms, timings)
+        return response
 
     # Snapshot/game projections only need the runs and sealed batches that can
     # still describe a *current* Todo period (daily or weekly).  Reading the
@@ -1643,7 +1690,19 @@ class ManagerService:
         )
 
     def _current_human_batch(self, batch: dict[str, Any]) -> bool:
-        """A paused batch owns Today only while its frozen member Todos are current."""
+        """A paused batch owns Today only while a human release can still unblock it.
+
+        The Batch coordinator refuses a new Batch while a paused one owns the
+        game day, and it deliberately keeps later members ``queued`` so a typed
+        resume can dispatch them once the gate is released.  Once every member is
+        terminal *and* the gate is released there is nothing left to resume, so
+        the Batch must stop claiming Today.  Before this contract it kept
+        answering ``409 explicit_human_release_required`` forever: on 2026-09-22
+        Batch ``4ddab5cd`` held the whole game day with eight terminal members
+        after its NIKKE gate was released, and it also kept the five-minute
+        supervisor reading ``activeBatch`` as busy.
+        """
+
         if (
             batch.get("state") != EntityState.HUMAN_REQUIRED
             or batch.get("mode") != RequestMode.EXECUTE
@@ -1653,9 +1712,16 @@ class ManagerService:
         memberships = batch.get("run_memberships", [])
         if not memberships:
             return False
+        unresumed_members = [
+            item
+            for item in memberships
+            if str(item.get("state")) not in {"terminal", "cancelled"}
+        ]
+        gate_still_open = False
         now = utc_now()
         for membership in memberships:
-            run = self.store.get_game_run(str(membership["run_id"]))
+            run_id = str(membership["run_id"])
+            run = self.store.get_game_run(run_id)
             if not run["todo_instance_ids"]:
                 return False
             for todo_id in run["todo_instance_ids"]:
@@ -1667,6 +1733,17 @@ class ManagerService:
                     < self._contract_datetime(todo["period_ends_at"])
                 ):
                     return False
+            if str(run["state"]) == EntityState.HUMAN_REQUIRED:
+                gate_still_open = True
+            if any(
+                item["kind"] == "human_required"
+                for item in self.store.list_todo_blockers(
+                    run_id=run_id, active_only=True, limit=5000
+                )
+            ):
+                gate_still_open = True
+        if not unresumed_members and not gate_still_open:
+            return False
         return True
 
     def state_version_snapshot(self) -> SnapshotResponse:
@@ -1695,13 +1772,15 @@ class ManagerService:
         *,
         recent_runs: list[dict[str, Any]] | None = None,
         sealed_batches: list[dict[str, Any]] | None = None,
+        current_todos: list[TodoInstanceRecord] | None = None,
     ) -> GameSummary:
-        current_todos = self.list_todo_instances(
-            game_id=str(record["game_id"]),
-            cadence="daily",
-            current=True,
-            limit=1000,
-        )
+        if current_todos is None:
+            current_todos = self.list_todo_instances(
+                game_id=str(record["game_id"]),
+                cadence="daily",
+                current=True,
+                limit=1000,
+            )
         current_todo_ids = {item.todo_instance_id for item in current_todos}
         active_run_states = {
             str(EntityState.PENDING_EXECUTION),
@@ -2000,16 +2079,79 @@ class ManagerService:
                 for item in self.manager_todos._todo_plans_for_targets(targets, cadence)}
 
     def _validate_account_execution_targets(self, targets: list[dict[str, Any]]) -> None:
-        configured = self.store.get_config()["values"]
-        for target in targets:
-            if target["gameId"] != "WW":
+        unavailable = [item for item in self._account_availability_for_targets(targets)
+                       if not item["executable"]]
+        if unavailable:
+            raise ManagerValidation("；".join(str(item["reason"]) for item in unavailable))
+
+    def _account_availability_for_targets(self, targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        supported = False
+        if ("WW" in self.adapter_host.compatibility_adapter.allowed_game_ids
+                and any(item.get("gameId") == "WW" for item in targets)):
+            runtime = self.adapter_host.execution_bindings("WW")
+            bindings = runtime.get("bindings", [])
+            if not bindings:
+                runtime = self.adapter_host.execution_bindings("WW")
+                bindings = runtime.get("bindings", [])
+            supported = (
+                runtime.get("manifestVerified") is True
+                and runtime.get("status") == "promoted"
+                and bool(bindings)
+                and any(
+                    item.get("handlerId") == "ww.account_daily_task"
+                    for item in bindings
+                )
+            )
+        return account_execution_availability(targets, ww_account_selector_supported=supported)
+
+    def account_execution_availability(self) -> list[dict[str, Any]]:
+        """Read-only UI/plan projection from the same target rule as execute."""
+        config = self.store.get_config()["values"]
+        return self._account_availability_for_targets(daily_account_targets(config, ["WW"]))
+
+    def _ww_official_multi_observation(
+        self, run: dict[str, Any], owning_batch: dict[str, Any] | None
+    ) -> tuple[Path | None, str | None]:
+        """Return the batch-scoped official MultiAccount observation file.
+
+        Specified WW GameRuns share one official ``--task 7`` process. The first
+        writes this file; later specified GameRuns replay it instead of starting
+        the official tool again.
+        """
+        if run.get("game_id") != "WW":
+            return None, None
+        snapshot = run.get("account_snapshot") or {}
+        if not str(snapshot.get("saved_account_label") or ""):
+            return None, None
+        if owning_batch is None:
+            return None, None
+        batch_id = str(owning_batch.get("batch_id") or owning_batch.get("batchId") or "")
+        if not batch_id:
+            return None, None
+        path = self.settings.data_dir / "ww-official-multi-account" / f"{batch_id}.jsonl"
+        if str(path).startswith("\\\\"):
+            return None, None
+        memberships = self.store.list_batch_run_memberships(batch_id=batch_id, limit=5000)
+        specified: list[dict[str, Any]] = []
+        for item in memberships:
+            member = self.store.get_game_run(str(item["run_id"]))
+            if member.get("game_id") != "WW":
                 continue
-            # Once additional accounts exist, even a lone enabled default must
-            # select its identity: the client may still hold another account.
-            needs_selection = (target["accountId"] != DEFAULT_ACCOUNT_ID or
-                               len(game_accounts(configured, "WW")) > 1)
-            if needs_selection and not target["accountSnapshot"].get("saved_account_label"):
-                raise ManagerValidation("鸣潮账号“" + target["accountLabel"] + "”尚未绑定登录页已记住的账号标签，请在每日配置中填写后开始。")
+            member_snapshot = member.get("account_snapshot") or {}
+            if not str(member_snapshot.get("saved_account_label") or ""):
+                continue
+            specified.append(item)
+        if len(specified) < 2:
+            return None, None
+        earlier = [
+            item for item in specified
+            if str(item["run_id"]) != str(run["run_id"])
+            and item.get("state") not in {"queued", "resume_pending"}
+        ]
+        if earlier and path.is_file():
+            return path, "read"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path, "write"
 
     def _validate_run_account_identity(self, run: dict[str, Any]) -> None:
         if run["game_id"] != "WW":
@@ -2221,6 +2363,53 @@ class ManagerService:
             expected_state_version=expected_state_version,
         )
 
+    def _release_replaced_adapter_failure(
+        self, current: dict[str, Any], request: TodoTransitionRequest,
+        runtime: dict[str, Any],
+    ) -> list[str]:
+        """Explicit operator preparation for a fresh attempt, never completion."""
+        if request.status != "pending" or not request.reason.strip():
+            raise ManagerValidation("Technical recovery requires pending and an explicit repair reason")
+        if request.increment_attempt or request.evidence_refs or request.run_id:
+            raise ManagerValidation("Technical recovery preserves the prior attempt, evidence, and run ownership")
+        if current["status"] not in {"blocked", "review_required"} or current["risk"] not in {"routine_action", "observe_only"}:
+            raise ManagerConflict("Only an unfinished routine technical failure can be released")
+        if datetime.fromisoformat(str(current["period_ends_at"])) <= utc_now():
+            raise ManagerConflict("Historical periods cannot be reopened by technical recovery")
+        if not current.get("run_id"):
+            raise ManagerConflict("Technical recovery requires an owned prior run")
+        run = self.store.get_game_run(current["run_id"])
+        attempts = self.store.list_run_attempts(run_id=run["run_id"], limit=1)
+        if run["state"] not in {"failed", "blocked", "review_required", "cancelled"} or not attempts:
+            raise ManagerConflict("The prior run must have ended before technical recovery")
+        attempt = attempts[0]
+        result = attempt["result"]
+        if not attempt.get("completed_at") or attempt["state"] != "failed" or result.get("protocolValid") is not False:
+            raise ManagerConflict("This recovery only applies to a recorded Adapter protocol failure")
+        digest = runtime.get("packageDigest")
+        if (runtime.get("manifestVerified") is not True or runtime.get("status") != "promoted"
+                or not result.get("packageDigest") or not digest or digest == result["packageDigest"]
+                or not any(item.get("operation") == current["operation"] for item in runtime.get("bindings", []))):
+            raise ManagerConflict("A different verified promoted Adapter with this operation is required")
+        blockers = self.store.list_todo_blockers(todo_instance_id=current["todo_instance_id"], active_only=True, limit=5000)
+        if any(item["kind"] not in {"review_required", "contract_invariant"}
+               or item["run_attempt_id"] != attempt["run_attempt_id"] for item in blockers):
+            raise ManagerConflict("Unrelated, policy, or human blockers require their own resolution")
+        release_id = str(uuid.uuid4())
+        for blocker in blockers:
+            self.store.resolve_todo_blocker(
+                blocker["blocker_id"], resolution_code="operator_replaced_adapter_protocol_failure",
+                resolution_reason=request.reason, release_id=release_id,
+                explicit_release=True, released_by=request.requested_by,
+            )
+        self.store.append_event("todo.technical_recovery", "todo-instance", current["todo_instance_id"], {
+            "releaseId": release_id, "requestedBy": request.requested_by, "reason": request.reason,
+            "priorRunAttemptId": attempt["run_attempt_id"], "priorPackageDigest": result["packageDigest"],
+            "replacementPackageDigest": digest, "executionRequested": False, "completionChanged": False,
+            "resolvedBlockerIds": [item["blocker_id"] for item in blockers],
+        })
+        return [item["blocker_id"] for item in blockers]
+
     def transition_todo(
         self,
         todo_instance_id_value: str,
@@ -2232,6 +2421,12 @@ class ManagerService:
         expected_state_version: int | None,
     ) -> CommandReceipt:
         current = self.store.get_todo_instance(todo_instance_id_value)
+        if request.status == "pending" and current["status"] != "pending" and not request.release_technical_blocker:
+            raise ManagerConflict("Reopening a Todo requires explicit validated technical recovery")
+        # Package I/O stays outside the idempotent Store transaction. Execution
+        # revalidates the installed package again when a new batch is requested.
+        repair_runtime = (self.adapter_host.execution_bindings(current["game_id"])
+                          if request.release_technical_blocker else {})
         if request.status in {"in_progress", "completed"}:
             raise ManagerConflict(
                 "Todo execution state is written only by a fenced Manager Adapter attempt"
@@ -2262,12 +2457,15 @@ class ManagerService:
             raise ManagerValidation("completed Todo requires at least one evidenceRef")
 
         def operation() -> dict[str, Any]:
+            release_current = self.store.get_todo_instance(todo_instance_id_value)
+            resolved = (self._release_replaced_adapter_failure(release_current, request, repair_runtime)
+                        if request.release_technical_blocker else [])
             record = self.store.transition_todo_instance(
                 todo_instance_id_value,
                 status=request.status,
                 reason=request.reason,
-                evidence_refs=request.evidence_refs,
-                run_id=request.run_id,
+                evidence_refs=(list(release_current["evidence_refs"]) if request.release_technical_blocker else request.evidence_refs),
+                run_id=(release_current["run_id"] if request.release_technical_blocker else request.run_id),
                 increment_attempt=request.increment_attempt,
                 requested_by=request.requested_by,
             )
@@ -2279,6 +2477,7 @@ class ManagerService:
                 status_url=f"/api/v1/todo-instances/{todo_instance_id_value}",
                 message="Todo 状态转换已由 Manager 记账。",
                 result={
+                    "resolvedTechnicalBlockerIds": resolved,
                     "todoInstance": _dump(
                         self._todo_instance_record(record, runtime_cache={})
                     ),
@@ -2414,7 +2613,7 @@ class ManagerService:
             )
         try:
             readiness = self._execution_readiness_for_games(
-                [game.game_id for game in self.list_games() if game.enabled]
+                [str(game["game_id"]) for game in self.store.list_games() if game["enabled"]]
             )
         except Exception as error:
             return (
@@ -2470,6 +2669,15 @@ class ManagerService:
                 result.update({"currentGameId": run["game_id"], "currentAccountId": run.get("account_id", DEFAULT_ACCOUNT_ID),
                                "currentTargetId": run_target_id(run)})
         item = {**item, "result": result}
+        if result.get("sealVersion") is not None:
+            # Sealed batches cannot resume or reconcile. Building every old
+            # run's recovery graph on each snapshot is both unnecessary and
+            # misleading; retain the sealed result and membership diagnostics.
+            return project_batch_record(
+                item, execution_readiness=execution_readiness,
+                terminal_retry_run_ids=[], pending_with_attempt_ids=[],
+                run_resume_targets=[], run_reconcile_targets=[], human_takeover_targets=[],
+            )
         pending = [
             membership
             for membership in memberships
@@ -3518,8 +3726,10 @@ class ManagerService:
 
     def list_adapters(self) -> list[AdapterInfoRecord]:
         records: list[AdapterInfoRecord] = []
-        for game in self.list_games():
-            host = self.adapter_host.probe_game(game.game_id)
+        # Adapter inventory needs identity, not historical game/Todo projection.
+        for game in self.store.list_games():
+            game_id = game["game_id"]
+            host = self.adapter_host.probe_game(game_id)
             package = host["executionPackage"]
             package_status = str(package.get("status") or "unknown")
             package_version = package.get("packageVersion")
@@ -3544,9 +3754,9 @@ class ManagerService:
                 health = "healthy"
             records.append(
                 AdapterInfoRecord(
-                    adapter_id=self.adapter_host.adapter_id(game.game_id),
-                    display_name=f"{game.display_name} 兼容 Adapter",
-                    game_id=game.game_id,
+                    adapter_id=self.adapter_host.adapter_id(game_id),
+                    display_name=f"{game['display_name']} 兼容 Adapter",
+                    game_id=game_id,
                     active_version=package_version if promoted else None,
                     active_version_id=package_version if promoted else None,
                     candidate_version=package_version if candidate else None,
@@ -3689,7 +3899,7 @@ class ManagerService:
                 event.entity_id if event.entity_type == "todo-attempt" else None
             )
             adapter_event_type = field("eventType", "event_type")
-            phase = field("phase", "stage") or adapter_event_type
+            phase = field("phase", "stage", "stepPhase") or adapter_event_type
             observed_state = field(
                 "observedState",
                 "observed_state",
@@ -3733,6 +3943,17 @@ class ManagerService:
                 else "info"
             )
             summary = reason_code or decision or observed_state or phase or event.entity_id
+            if reason_code == "official_log_record":
+                for layer in payload_layers:
+                    metrics = layer.get("metrics")
+                    if isinstance(metrics, dict) and metrics.get("source") in {"March7th.FileHandler", "NTE.PythonLogger"}:
+                        level = {
+                            "DEBUG": "debug", "INFO": "info", "WARNING": "warning",
+                            "ERROR": "error", "CRITICAL": "error",
+                        }.get(str(metrics.get("level")), level)
+                        break
+            if event.event_type == "todo-step-capture.failed":
+                summary = f"{field('operation')}:{phase}"
             entries.append(
                 LogEntry(
                     sequence=event.sequence,
@@ -3850,12 +4071,12 @@ class ManagerService:
         cursor = max(0, after)
         heartbeat_deadline = asyncio.get_running_loop().time() + 15.0
         while not self._shutdown_requested.is_set():
-            records = [
-                EventRecord.model_validate(item)
-                for item in self.store.list_events(after=cursor, limit=100)
-            ]
+            # SQLite uses a synchronous lock shared with execution writes. Do
+            # not wait for it on the HTTP/SSE event loop.
+            page = await asyncio.to_thread(self.events, cursor, 100)
+            records = page.events
             if records:
-                state_version = self.store.latest_event_sequence()
+                state_version = await asyncio.to_thread(self.store.latest_event_sequence)
                 for record in records:
                     cursor = record.sequence
                     payload = record.as_stream_event(state_version)
@@ -4053,6 +4274,7 @@ class ManagerService:
                         "category": item.category,
                         "orderIndex": item.order_index,
                         "required": item.required,
+                        "keyStep": item.key_step,
                         "risk": item.risk,
                         "status": item.status,
                         "attempts": item.attempts,
@@ -4160,8 +4382,8 @@ class ManagerService:
         unsupported_reasons: list[str] = []
         if int(run.get("completion_scope_version", 0)) != 1:
             unsupported_reasons.append("legacy_or_missing_completion_scope")
-        if not required:
-            unsupported_reasons.append("no_required_frozen_todos")
+        if not frozen:
+            unsupported_reasons.append("no_frozen_todos")
         period_shapes = {
             (
                 item.period_key,
@@ -4375,7 +4597,7 @@ class ManagerService:
                     account_id=todo.account_id,
                     game_day_key=todo.period_key,
                     required=todo.required,
-                    status=todo_attempt["state"],
+                    status=("in_progress" if todo_attempt["state"] == "running" else todo_attempt["state"]),
                     run_id=completion_attempts[
                         str(todo_attempt["run_attempt_id"])
                     ]["run_id"],
@@ -4438,6 +4660,23 @@ class ManagerService:
                 ),
             )
 
+        # A failed/cancelled step can have diagnostic frames before it has any
+        # terminal evidence refs. Include those same-attempt screenshots for
+        # reporting without adding them to a Todo's completion evidence.
+        diagnostic_refs = []
+        if current_attempt is not None:
+            selected_ids = set(current_attempt.get("plan", {}).get("executableTodoInstanceIds", []))
+            for resource in self.store.list_run_artifacts(
+                run_id=run_id, run_attempt_id=current_attempt["run_attempt_id"]
+            ):
+                document = resource["document"]
+                if (document.get("contentType") in {"image/png", "image/jpeg"}
+                        and document.get("gameId") == run["game_id"]
+                        and document.get("accountId", DEFAULT_ACCOUNT_ID) == run.get("account_id", DEFAULT_ACCOUNT_ID)
+                        and (document.get("todoInstanceId") in attempts_by_todo or
+                             (document.get("diagnosticOnly") is True and
+                              document.get("todoInstanceId") in selected_ids))):
+                    diagnostic_refs.append(resource["resource_id"])
         artifact_ids = list(
             dict.fromkeys(
                 [
@@ -4445,7 +4684,7 @@ class ManagerService:
                     for todo in todo_facts
                     for artifact_id in todo.evidence_refs
                 ]
-                + review_artifact_refs
+                + review_artifact_refs + diagnostic_refs
             )
         )
         evidence_facts: list[EvidenceArtifactFact] = []
@@ -4634,10 +4873,10 @@ class ManagerService:
             )
         return self._completion_adjudication_record(resource)
 
-    # Screenshot kinds in the order the round mail prefers them.  Reward/claim
-    # frames prove completion; watermarked step frames show the last scene a
-    # failed or unreviewed run reached; raw pre-step frames give the "before"
-    # context.  Text logs are never mail attachments.
+    # Screenshot kinds in the order the round mail prefers them. Reward/claim
+    # frames illustrate official results; diagnostic frames show the last scene
+    # reached. Image selection never decides task completion. Text logs are
+    # available through the report's log links, not image attachments.
     MAIL_SCREENSHOT_KIND_PRIORITY: tuple[str, ...] = (
         "game-ui-claimed-reward",
         "game-ui-daily-reward-watermarked",
@@ -4648,6 +4887,8 @@ class ManagerService:
         "game-ui-step-after-watermarked",
         "game-ui-daily-reward-before",
         "game-ui-step-before-raw",
+        "integration-source-confirm-after",
+        "integration-source-confirm-before",
         "game-ui-main-window",
         "reward-screenshot",
         "window-screenshot",
@@ -4782,6 +5023,252 @@ class ManagerService:
             "accepted": artifact_id in decision.accepted_evidence_refs,
         }
 
+    # --- game-day report ------------------------------------------------
+    #
+    # A round report answers "what happened in the batch that just sealed".  On
+    # 2026-09-22 that produced one alarming mail per retry round, and because
+    # acceptance is adjudicated per round contract, games that had already been
+    # accepted earlier the same day fell back to "待验收/本轮未执行" while the
+    # operator had 4 games accepted.  The game-day report below replaces that:
+    # it is scoped to the whole enabled day, uses the authoritative per-game
+    # projections (which accumulate across batches), and is sent once.
+
+    def _game_day_report_snapshot(self) -> tuple[str, list[dict[str, Any]]]:
+        """The reported game day plus one authoritative row per enabled game.
+
+        Two sources are deliberately combined and neither may be replaced by a
+        shortcut:
+
+        * the day key is the enabled games' current daily ``period_key`` (the
+          04:00 Asia/Shanghai window date).  It must not be the Manager scope
+          fingerprint that ``Batch.result.gameDay`` carries: that fingerprint
+          changes whenever the frozen Todo set changes, so it cannot answer
+          "is this still the same day".  Disabled games are excluded because
+          FGO/BD2/CZN register a 00:00 window and would roll the reported day
+          four hours early.
+        * the per-game required counts come from ``todo_overview``, which is the
+          selection-aware projection the WebGUI shows.  Counting every current
+          Todo instance instead would inflate today's total with rows no batch
+          ever runs, and the mail would disagree with the screen.
+        """
+
+        games = self.store.list_games()
+        current: dict[str, list[TodoInstanceRecord]] = {}
+        for record in games:
+            if not record.get("enabled"):
+                continue
+            current[str(record["game_id"])] = self.list_todo_instances(
+                game_id=str(record["game_id"]), cadence="daily", current=True, limit=1000
+            )
+        overview = self.todo_overview(games=games, current_items_by_game=current)
+        summaries: dict[str, Any] = overview.get("games") or {}
+        day_key = ""
+        entries: list[dict[str, Any]] = []
+        for record in games:
+            if not record.get("enabled"):
+                continue
+            game_id = str(record["game_id"])
+            todos = current.get(game_id, [])
+            summary = summaries.get(game_id) or {}
+            for key in list(summary.get("periodKeys") or []) or [
+                getattr(item, "period_key", "") for item in todos
+            ]:
+                candidate = str(key or "")
+                if candidate:
+                    day_key = max(day_key, candidate)
+            projection = self._game_projection(record, current_todos=todos)
+            entries.append(
+                {
+                    "gameId": game_id,
+                    "displayName": str(record.get("display_name") or game_id),
+                    "orderIndex": int(record.get("order_index") or 0),
+                    "acceptanceState": str(projection.acceptance_state),
+                    "runtimeState": str(projection.runtime_state),
+                    "requiredCompleted": int(summary.get("requiredCompleted") or 0),
+                    "requiredTotal": int(summary.get("requiredTotal") or 0),
+                    "allRequiredCompleted": bool(summary.get("allRequiredCompleted")),
+                    "doneTitles": [
+                        str(getattr(item, "title", "") or "")
+                        for item in todos
+                        if item.required
+                        and str(getattr(item, "status", "")) == "completed"
+                        and str(getattr(item, "title", "") or "")
+                    ],
+                    "attention": str(projection.next_action or ""),
+                }
+            )
+        return day_key, entries
+
+    def _game_day_report_finality(
+        self, entries: list[dict[str, Any]]
+    ) -> tuple[bool, str]:
+        """Whether the reported day is settled enough to be mailed out.
+
+        ``human_required`` is deliberately *not* a finality trigger: a report
+        released as soon as one game hits a gate would then be followed by a
+        second, contradictory report once the gate is released and the day is
+        finished.  The day's single report carries the ``需人工处理`` badge, and
+        an operator who must act now sees it in the WebGUI immediately.
+        """
+
+        if not entries:
+            return False, ""
+        if all(entry["allRequiredCompleted"] for entry in entries) and not any(
+            self.store.active_execution_summary().values()
+        ):
+            return True, "all_required_completed"
+        return False, ""
+
+    def _game_day_report_draft(
+        self, *, game_day: str, policy: dict[str, Any], batch_id: str
+    ) -> dict[str, Any]:
+        day_key, entries = self._game_day_report_snapshot()
+        reported_day = day_key or str(game_day)
+        rendered = render_game_day_notification(game_day=reported_day, entries=entries)
+        binding_id = str(policy["recipient_binding_id"])
+        final, _reason = self._game_day_report_finality(entries)
+        return {
+            "outcome": rendered.outcome,
+            "subject": rendered.subject,
+            "text_body": rendered.text_body,
+            "html_body": rendered.html_body,
+            "report_html": rendered.report_html,
+            # Evidence bytes are resolved from the immutable seal of an anchor
+            # batch, so a day report that spans several batches cannot carry
+            # them faithfully.  The body points at the local evidence page.
+            "attachment_refs": [],
+            "secret_state": self.notification_secret_provider.state(binding_id),
+            # The batch's own staleness must not gate a day report: this row
+            # describes the current game day, and the sealing batch is only its
+            # provenance.  Inheriting `stale_batch` would strand the report.
+            "dispatch_disposition": "",
+            "report_day": reported_day,
+            "dispatch_hold": not final,
+        }
+
+    def _notification_draft_for_seal(
+        self, *, batch_id: str, seal_version: int, sealed: dict[str, Any],
+        policy: dict[str, Any],
+    ) -> dict[str, Any]:
+        scope = str(policy.get("report_scope") or "game_day")
+        if scope != "game_day":
+            return self.notification_dispatcher.build_draft(
+                game_day=str(sealed["gameDay"]),
+                batch_id=batch_id,
+                seal_version=seal_version,
+                sealed_result=sealed,
+                policy=policy,
+            )
+        return self._game_day_report_draft(
+            game_day=str(sealed["gameDay"]), policy=policy, batch_id=batch_id
+        )
+
+    def _game_day_report_already_released(
+        self, report_day: str, *, channel: str, recipient_binding_id: str
+    ) -> bool:
+        """Whether one report for this game day already left the held state.
+
+        A day is meant to be mailed once.  Because every executed Batch seal
+        seeds its own delivery row, a later seal of the same day can only end up
+        as a second mail if this is not checked.
+        """
+
+        return any(
+            str(item["state"]) != "superseded"
+            and str(item["dispatch_gate"]) != "game_day_pending"
+            for item in self.store.list_game_day_notifications(
+                report_day, channel=channel, recipient_binding_id=recipient_binding_id
+            )
+        )
+
+    def dispatch_game_day_reports(self) -> int:
+        """Release at most one game-day report per day.
+
+        Called from the Manager's periodic tick as well as right after a seal, so
+        a day that settles without another seal - or that simply rolls over at
+        04:00 Asia/Shanghai - still produces exactly one report instead of one
+        alarm per retry round.
+        """
+
+        policy = self.store.get_notification_policy()
+        if str(policy.get("report_scope") or "game_day") != "game_day":
+            return 0
+        if not policy.get("enabled") or not policy.get("automatic_dispatch"):
+            return 0
+        day_key, entries = self._game_day_report_snapshot()
+        if not day_key:
+            return 0
+        final, reason = self._game_day_report_finality(entries)
+        channel = str(policy["channel"])
+        binding_id = str(policy["recipient_binding_id"])
+        released = 0
+        seen_days: set[str] = set()
+        # Newest first: for one day only the newest held row may be sent, every
+        # older held row was superseded because a later seal re-observed more of
+        # the same day.
+        for row in self.store.list_game_day_pending_notifications():
+            day = str(row["report_day"])
+            notification_id = str(row["notification_id"])
+            if day in seen_days:
+                self.store.supersede_game_day_notification(
+                    notification_id,
+                    reason="a newer game-day report replaced this one",
+                )
+                continue
+            seen_days.add(day)
+            if day != day_key:
+                if day > day_key:
+                    # A report claiming a day the Todo scope has not reached is
+                    # never mailed; keep the row for diagnosis instead.
+                    continue
+                # The game day rolled over: whatever that day reached is final,
+                # unsent work included.
+                if self._game_day_report_already_released(
+                    day, channel=channel, recipient_binding_id=binding_id
+                ):
+                    self.store.supersede_game_day_notification(
+                        notification_id,
+                        reason="this game day was already reported",
+                    )
+                    continue
+                self._release_game_day_report(
+                    row, reason="the game day has rolled over"
+                )
+                released += 1
+                continue
+            if not final:
+                # The day is still running: keep its newest held report and let
+                # the next tick decide.
+                continue
+            if self._game_day_report_already_released(
+                day, channel=channel, recipient_binding_id=binding_id
+            ):
+                self.store.supersede_game_day_notification(
+                    notification_id,
+                    reason="this game day was already reported",
+                )
+                continue
+            self._release_game_day_report(row, reason=reason)
+            released += 1
+        return released
+
+    def _release_game_day_report(self, row: dict[str, Any], *, reason: str) -> None:
+        policy = self.store.get_notification_policy()
+        binding_id = str(policy["recipient_binding_id"])
+        try:
+            self.store.arm_notification_delivery(
+                str(row["notification_id"]),
+                requested_by="manager:game-day-report",
+                reason=reason,
+                secret_state=self.notification_secret_provider.state(binding_id),
+                confirm_ambiguous=False,
+            )
+        except ValueError:
+            # A row that already moved on (sent, sending, retry budget spent) is
+            # simply left as it is; the next tick re-reads persisted state.
+            return
+        self.notification_dispatcher.wake()
+
     def _seal_batch_from_todos(
         self,
         *,
@@ -4842,6 +5329,7 @@ class ManagerService:
             account_targets=account_targets,
         )
         completion_contracts: list[dict[str, Any]] = []
+        frozen_integration_results: list[dict[str, Any]] = []
         decisions: list[CompletionContractDecision] = []
         run_states_by_target: dict[str, str] = {}
         accepted_screenshot_candidates: list[tuple[str, str]] = []
@@ -4855,6 +5343,15 @@ class ManagerService:
             if run_target_id(run) not in target_by_id:
                 raise ManagerValidation("final GameRun account differs from the batch scope")
             run_states_by_target[run_target_id(run)] = str(run["state"])
+            for attempt in self.store.list_run_attempts(run_id=run_id, limit=1):
+                frozen_integration_results.extend(
+                    {**item, "runId": run_id, "gameId": run["game_id"], "accountId": run.get("account_id"),
+                     "targetId": run_target_id(run)}
+                    for item in integration_results(
+                        self.store.list_adapter_events(attempt["run_attempt_id"]),
+                        capture_failures=self.store.list_step_capture_failures(attempt["run_attempt_id"]),
+                    )
+                )
             contract_snapshot = self._completion_contract_snapshot(run_id)
             _, run_policies, policy_status, _ = self._completion_policy_context(
                 run=run,
@@ -5177,6 +5674,7 @@ class ManagerService:
                 "completed" if accepted_done else "blocked"
             ),
             "notificationBlockers": notification_blockers,
+            "integrationResults": frozen_integration_results,
             "acceptanceReason": (
                 "; ".join(decision.message for decision in decisions)
                 if decisions
@@ -5188,11 +5686,10 @@ class ManagerService:
             state=effective_state,
             result=frozen,
             notification_draft_factory=lambda seal_version, sealed, policy: (
-                self.notification_dispatcher.build_draft(
-                    game_day=str(sealed["gameDay"]),
+                self._notification_draft_for_seal(
                     batch_id=batch_id,
                     seal_version=seal_version,
-                    sealed_result=sealed,
+                    sealed=sealed,
                     policy=policy,
                 )
             ),
@@ -5526,6 +6023,8 @@ class ManagerService:
             work_item_ids: dict[str, str] = {}
             awaiting: list[str] = []
             for run_id in final_run_ids:
+                if has_upstream_task_results(self._completion_contract_snapshot(run_id)):
+                    continue
                 if self._current_completion_review_for_run(run_id) is not None:
                     continue
                 # The Agent work item is still created so a failed run can be
@@ -5595,6 +6094,8 @@ class ManagerService:
         barrier_expired = self._completion_review_barrier_expired(phase)
         with self.store.atomic():
             for run_id in final_run_ids:
+                if has_upstream_task_results(self._completion_contract_snapshot(run_id)):
+                    continue
                 review = self._current_completion_review_for_run(run_id)
                 if review is not None:
                     reviews[run_id] = review
@@ -5736,6 +6237,14 @@ class ManagerService:
                 # re-evaluates every pending phase from persisted state.
                 _log.exception("completion_review_watchdog.tick_failed")
                 continue
+            try:
+                # A held game-day report is released by a tick, not by the seal:
+                # the day can finish through an event that never seals a Batch,
+                # and a day that never finishes must still be reported once its
+                # 04:00 window closes.
+                self.dispatch_game_day_reports()
+            except Exception:
+                _log.exception("game_day_report.tick_failed")
 
     # Ledger retention runs shortly after start (so an oversized database is
     # repaired without waiting for the next window) and then a few times a day.
@@ -5866,6 +6375,7 @@ class ManagerService:
         ) != "running":
             raise ManagerConflict("Manager is stopping and cannot accept new execution")
         targets = self._freeze_account_targets(candidate_game_ids, str(cadence), requested_targets)
+        target_availability = self._account_availability_for_targets(targets)
         targets_by_id = {item["targetId"]: item for item in targets}
         target_ids = list(targets_by_id)
         candidate_game_ids = list(dict.fromkeys(item["gameId"] for item in targets))
@@ -5916,6 +6426,7 @@ class ManagerService:
                     "todoScope": batch_scope,
                     "candidateGameIds": list(dict.fromkeys(item["gameId"] for item in targets)),
                     "accountTargets": targets,
+                    "accountExecutionAvailability": target_availability,
                     "skippedCompletedTargetIds": skipped_games,
                     "executableTargetIds": executable_games,
                     "deferredTargetIds": deferred_games,
@@ -6217,6 +6728,18 @@ class ManagerService:
             account_snapshot=({key: run["account_snapshot"][key] for key in ("label", "saved_account_label")}
                               if run["game_id"] == "WW" and
                               run.get("account_snapshot", {}).get("saved_account_label") else {}),
+            # WW is one official DailyTask selected as a unit, but a retry only
+            # freezes the Todos that are still open.  Freeze the account's own
+            # operation selection alongside the scope so the Adapter can tell
+            # "the account selected the whole daily, only part of it is left"
+            # from "the account selected a partial daily".
+            selected_operations=(
+                tuple(
+                    str(definition_id).rsplit(".", 1)[-1]
+                    for definition_id in run.get("account_snapshot", {}).get("daily_todo_selection") or []
+                )
+                if run["game_id"] == "WW" else ()
+            ),
             cadence=run["cadence"],
             manager_state_version=self.store.latest_event_sequence(),
             catalog_version=execution_catalog_version,
@@ -6576,6 +7099,95 @@ class ManagerService:
                 )
                 raise
 
+    def _accept_nte_official_cycle_result(
+        self, plan: AdapterExecutionPlan, document: dict[str, Any]
+    ) -> None:
+        """Persist one official DailyTask cycle result without deriving a next value.
+
+        The adapter supplies both the frozen binding and the post-run official
+        config. This method is deliberately a no-op for malformed, late, or
+        user-superseded observations so observation never blocks a daily run.
+        """
+        if plan.game_id != "NTE":
+            return
+        metrics = document.get("metrics")
+        if not isinstance(metrics, dict) or metrics.get("officialCycleMode") != "自动循环序号/目标":
+            return
+        try:
+            todo_attempt = self.store.get_todo_attempt(str(document["todoAttemptId"]))
+            todo = self.store.get_todo_instance(str(document["todoInstanceId"]))
+            if (
+                todo_attempt.get("run_attempt_id") != plan.run_attempt_id
+                or todo_attempt.get("state") != "running"
+                or todo.get("operation") != "spend-city-vitality"
+            ):
+                return
+            run_attempt = self.store.get_run_attempt(plan.run_attempt_id)
+            run = self.store.get_game_run(plan.run_id)
+            if run_attempt.get("state") != "running" or run.get("state") in {
+                EntityState.HUMAN_REQUIRED, EntityState.CANCELLED
+            }:
+                return
+            prior_result = run_attempt.get("result")
+            if isinstance(prior_result, dict) and "nteOfficialCycle" in prior_result:
+                return
+            frozen = NTEProfileConfig.model_validate(metrics["frozenProfile"])
+            next_profile = NTEProfileConfig.model_validate(metrics["nextProfile"])
+            if not frozen.auto_cycle_sub_task or not next_profile.auto_cycle_sub_task:
+                return
+            cycle_fields = {"material_index", "exp_reward_target"}
+            if (frozen.stamina_task != "异象界域"
+                    or frozen.model_dump(exclude=cycle_fields) != next_profile.model_dump(exclude=cycle_fields)):
+                return
+            if frozen.anomaly_task_type == "经验与甲硬币":
+                if (
+                    frozen.material_index != next_profile.material_index
+                    or frozen.exp_reward_target == next_profile.exp_reward_target
+                ):
+                    return
+            elif (
+                frozen.exp_reward_target != next_profile.exp_reward_target
+                or frozen.material_index == next_profile.material_index
+                or next_profile.material_index > (
+                    6 if frozen.anomaly_task_type == "空幕" else 5
+                )
+            ):
+                return
+            config_values = self.store.get_config()["values"]
+            profiles = config_values.get("daily_tool_profiles", {})
+            current_raw = profiles.get("nte") if isinstance(profiles, dict) else None
+            current = NTEProfileConfig.model_validate(
+                current_raw if isinstance(current_raw, dict) else {}
+            )
+            if current.model_dump(mode="json") != frozen.model_dump(mode="json"):
+                return
+            # The outer adapter event transaction also contains its journal row.
+            # Keep this optional observation in a savepoint so a storage failure
+            # cannot partially change the next-run profile or reject the tool event.
+            savepoint = "nte_official_cycle_observation"
+            self.store.connection.execute("SAVEPOINT " + savepoint)
+            try:
+                self.store.update_config(
+                    {"daily_tool_profiles": {"nte": next_profile.model_dump(mode="json")}}
+                )
+                updated = dict(prior_result) if isinstance(prior_result, dict) else {}
+                updated["nteOfficialCycle"] = {
+                    "status": "applied",
+                    "route": frozen.anomaly_task_type,
+                    "nextProfile": next_profile.model_dump(mode="json"),
+                }
+                self.store.update_run_attempt(
+                    plan.run_attempt_id, state="running", result=updated, completed=False
+                )
+                self.store.connection.execute("RELEASE SAVEPOINT " + savepoint)
+            except Exception:
+                self.store.connection.execute("ROLLBACK TO SAVEPOINT " + savepoint)
+                self.store.connection.execute("RELEASE SAVEPOINT " + savepoint)
+                _log.warning("nte.official_cycle.observation_ignored attempt=%s", plan.run_attempt_id)
+        except Exception:
+            _log.warning("nte.official_cycle.observation_rejected attempt=%s", plan.run_attempt_id)
+            return
+
     def _handle_adapter_event_inner(
         self,
         plan: AdapterExecutionPlan,
@@ -6583,11 +7195,11 @@ class ManagerService:
         manifest: ExecutionPackageManifest | None = None,
         capture_pids: frozenset[int] | None = None,
     ) -> None:
-        if event.event_type == "artifact_staged" and manifest is None:
+        if event.event_type in {"artifact_staged", "run_artifact_staged"} and manifest is None:
             raise ManagerValidation(
                 "artifact persistence requires the verified execution manifest"
             )
-        if event.event_type == "artifact_staged" and manifest is not None:
+        if event.event_type in {"artifact_staged", "run_artifact_staged"} and manifest is not None:
             if (
                 tuple(sorted(event.allowed_artifact_mime_types))
                 != tuple(sorted(manifest.allowed_mime_types))
@@ -6604,6 +7216,51 @@ class ManagerService:
         token_hash = "sha256:" + hashlib.sha256(
             plan.fencing_token.encode("utf-8")
         ).hexdigest()
+        # Capture is synchronous Windows I/O and can wait for an unresponsive
+        # game. Keep it on the existing serialized Adapter worker, but outside
+        # the SQLite transaction so API and monitoring reads remain available.
+        capture_phase = None
+        manager_captures_steps = event.step_capture_source == "manager"
+        if event.event_type == "todo_attempt_started":
+            capture_phase = "before"
+        elif event.event_type == "todo_terminal" or (
+            event.event_type == "todo_progress"
+            and document.get("code") == "upstream_step_returned"
+        ):
+            if not any(kind == "game-ui-step-after-watermarked" for _, kind in
+                       self._adapter_step_artifact_ids(plan, str(document["todoAttemptId"]))):
+                capture_phase = "after"
+        if capture_phase:
+            # An accepted boundary remains observed even when its image failed.
+            # The serialized Adapter worker must not retake it at a later terminal.
+            for previous in self.store.list_adapter_events(plan.run_attempt_id):
+                payload = previous["payload"]
+                if payload.get("todoAttemptId") != document.get("todoAttemptId"):
+                    continue
+                before_seen = previous["event_type"] == "todo_attempt_started"
+                after_seen = previous["event_type"] == "todo_terminal" or (
+                    previous["event_type"] == "todo_progress"
+                    and payload.get("code") == "upstream_step_returned"
+                )
+                if (capture_phase == "before" and before_seen) or (capture_phase == "after" and after_seen):
+                    capture_phase = None
+                    break
+        capture_result = None
+        if capture_phase and manager_captures_steps and not self._ww_observation_replay_attempt(plan):
+            capture_operation = str(document.get("operation") or
+                self.store.get_todo_attempt(str(document["todoAttemptId"]))["operation"])
+            captured_at = utc_now()
+            stamp = captured_at.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                frame = self.window_capture.capture(
+                    plan.game_id,
+                    watermark_text=(f"YeYu Gamer | {stamp} Beijing (UTC+8) | {capture_operation}"
+                                    if capture_phase == "after" else None),
+                    allowed_pids=capture_pids,
+                )
+            except (WindowCaptureError, OSError, ManagerValidation) as error:
+                frame = error
+            capture_result = (captured_at, frame)
         with self.store.atomic():
             _, replayed = self.store.append_adapter_event(
                 run_attempt_id=plan.run_attempt_id,
@@ -6650,13 +7307,15 @@ class ManagerService:
                     message=f"正在执行：{title}",
                 )
                 try:
-                    self._capture_adapter_step_artifact(
-                        plan,
-                        document,
-                        phase="before",
-                        operation=str(document["operation"]),
-                        capture_pids=capture_pids,
-                    )
+                    if manager_captures_steps and not self._ww_observation_replay_attempt(plan):
+                        self._capture_adapter_step_artifact(
+                            plan,
+                            document,
+                            phase="before",
+                            operation=str(document["operation"]),
+                            capture_pids=capture_pids,
+                            capture_result=capture_result,
+                        )
                 except (WindowCaptureError, OSError, ManagerValidation) as error:
                     # Completion remains fail-closed below.  A transient frame
                     # failure must not abort the Adapter transport before it
@@ -6668,7 +7327,7 @@ class ManagerService:
                         operation=str(document["operation"]),
                         error=error,
                     )
-            elif event.event_type == "artifact_staged":
+            elif event.event_type in {"artifact_staged", "run_artifact_staged"}:
                 assert manifest is not None
                 self.adapter_artifacts.import_staged(
                     plan,
@@ -6677,28 +7336,57 @@ class ManagerService:
                     max_artifacts_per_todo=manifest.max_artifacts_per_todo,
                     max_artifact_bytes=manifest.max_artifact_bytes,
                 )
-            elif event.event_type == "todo_terminal":
-                adapter_status = str(document["status"])
-                existing_step_artifacts = self._adapter_step_artifact_ids(
-                    plan, str(document["todoAttemptId"])
-                )
-                if not any(
-                    kind == "game-ui-step-after-watermarked"
-                    for _artifact_id, kind in existing_step_artifacts
-                ):
+            elif (
+                event.event_type == "todo_progress"
+                and document.get("code") == "official_config_cycle_result"
+            ):
+                self._accept_nte_official_cycle_result(plan, document)
+            elif (
+                event.event_type == "todo_progress"
+                and document.get("code") == "upstream_step_returned"
+            ):
+                if capture_phase == "after":
                     after_operation = str(
                         self.store.get_todo_attempt(str(document["todoAttemptId"]))[
                             "operation"
                         ]
                     )
                     try:
-                        self._capture_adapter_step_artifact(
+                        if manager_captures_steps and not self._ww_observation_replay_attempt(plan):
+                            self._capture_adapter_step_artifact(
+                                plan,
+                                document,
+                                phase="after",
+                                operation=after_operation,
+                                capture_pids=capture_pids,
+                                capture_result=capture_result,
+                            )
+                    except (WindowCaptureError, OSError, ManagerValidation) as error:
+                        self._record_step_capture_failure(
                             plan,
                             document,
                             phase="after",
                             operation=after_operation,
-                            capture_pids=capture_pids,
+                            error=error,
                         )
+            elif event.event_type == "todo_terminal":
+                adapter_status = str(document["status"])
+                if capture_phase == "after":
+                    after_operation = str(
+                        self.store.get_todo_attempt(str(document["todoAttemptId"]))[
+                            "operation"
+                        ]
+                    )
+                    try:
+                        if manager_captures_steps and not self._ww_observation_replay_attempt(plan):
+                            self._capture_adapter_step_artifact(
+                                plan,
+                                document,
+                                phase="after",
+                                operation=after_operation,
+                                capture_pids=capture_pids,
+                                capture_result=capture_result,
+                            )
                     except (WindowCaptureError, OSError, ManagerValidation) as error:
                         self._record_step_capture_failure(
                             plan,
@@ -6786,6 +7474,14 @@ class ManagerService:
         except Exception:  # the ledger note is best effort
             pass
 
+    def _ww_observation_replay_attempt(self, plan: AdapterExecutionPlan) -> bool:
+        try:
+            attempt = self.store.get_run_attempt(plan.run_attempt_id)
+        except Exception:
+            return False
+        result = attempt.get("result") or {}
+        return bool(result.get("wwOfficialObservationReplay"))
+
     def _capture_adapter_step_artifact(
         self,
         plan: AdapterExecutionPlan,
@@ -6794,25 +7490,17 @@ class ManagerService:
         phase: str,
         operation: str,
         capture_pids: frozenset[int] | None = None,
+        capture_result: tuple[datetime, CapturedWindow | Exception] | None = None,
     ) -> str:
         """Capture one Manager-owned game frame for a Todo boundary."""
 
         if phase not in {"before", "after"}:
             raise ManagerValidation("unknown Todo screenshot phase")
-        captured_at = utc_now()
-        beijing_stamp = captured_at.astimezone(
-            timezone(timedelta(hours=8))
-        ).strftime("%Y-%m-%d %H:%M:%S")
-        watermark = (
-            f"YeYu Gamer | {beijing_stamp} Beijing (UTC+8) | {operation}"
-            if phase == "after"
-            else None
-        )
-        captured = self.window_capture.capture(
-            plan.game_id,
-            watermark_text=watermark,
-            allowed_pids=capture_pids,
-        )
+        if capture_result is None:
+            raise ManagerValidation("step frame was not captured before the transaction")
+        captured_at, captured = capture_result
+        if isinstance(captured, Exception):
+            raise captured
         artifact_id = str(uuid.uuid4())
         artifact_root = self.settings.data_dir / "artifacts"
         if str(artifact_root).startswith("\\\\"):
@@ -7032,60 +7720,8 @@ class ManagerService:
                     "code": result.code, "message": result.message, "managerControlOutcome": manager_control_outcome})
             prior_attempt = self.store.get_run_attempt(plan.run_attempt_id)
             prior_result = prior_attempt.get("result", {})
-            prior_advance = (
-                prior_result.get("nteProfileAdvance")
-                if isinstance(prior_result, dict)
-                else None
-            )
-            completed_operations = {
-                todo.operation
-                for todo in plan.todos
-                if todo.todo_instance_id in result.completed_todo_instance_ids
-            }
-            if prior_advance is not None:
-                result_document["nteProfileAdvance"] = prior_advance
-            elif (
-                result.protocol_valid
-                and plan.game_id == "NTE"
-                and "spend-city-vitality" in completed_operations
-            ):
-                config_values = self.store.get_config()["values"]
-                profiles = config_values.get("daily_tool_profiles", {})
-                raw_profile = (
-                    profiles.get("nte") if isinstance(profiles, dict) else None
-                )
-                profile = NTEProfileConfig.model_validate(
-                    raw_profile if isinstance(raw_profile, dict) else {}
-                )
-                advance: dict[str, Any] = {
-                    "advanced": False,
-                    "reason": "auto_cycle_disabled",
-                }
-                if profile.auto_cycle_sub_task:
-                    if profile.anomaly_task_type == "经验与甲硬币":
-                        options = ("角色经验", "弧盘经验", "甲硬币")
-                        current_index = options.index(profile.exp_reward_target)
-                        profile.exp_reward_target = options[
-                            (current_index + 1) % len(options)
-                        ]
-                        next_value: str | int = profile.exp_reward_target
-                    else:
-                        maximum = 6 if profile.anomaly_task_type == "空幕" else 5
-                        profile.material_index = profile.material_index % maximum + 1
-                        next_value = profile.material_index
-                    self.store.update_config(
-                        {
-                            "daily_tool_profiles": {
-                                "nte": profile.model_dump(mode="json")
-                            }
-                        }
-                    )
-                    advance = {
-                        "advanced": True,
-                        "route": profile.anomaly_task_type,
-                        "nextValue": next_value,
-                    }
-                result_document["nteProfileAdvance"] = advance
+            if isinstance(prior_result, dict) and "nteOfficialCycle" in prior_result:
+                result_document["nteOfficialCycle"] = prior_result["nteOfficialCycle"]
             blocker_persistence: dict[str, dict[str, Any]] = {}
             for todo_attempt in self.store.list_todo_attempts(
                 run_attempt_id=plan.run_attempt_id, limit=500
@@ -7137,7 +7773,7 @@ class ManagerService:
                     if run_state == EntityState.HUMAN_REQUIRED
                     else (
                         f"Adapter {result.code}: {result.message}; "
-                        "Todo evidence is recorded, but accepted_done remains a separate review contract"
+                        "Adapter task results are recorded; Manager is aggregating the run outcome"
                     )
                 ),
                 completed_todo_instance_ids=completed_ids,
@@ -7163,9 +7799,31 @@ class ManagerService:
                 run_attempt_id=plan.run_attempt_id,
                 outcome=(manager_control_outcome or (result.status if result.protocol_valid else "failed")),
             )
-        # A completed Adapter attempt still enters the per-Todo semantic review
-        # contract.  Automatic accepted reviews stay disabled until every
-        # required operation owns a machine-verifiable semantic predicate.
+        # Artifact integrity checks read files. Do not hold the store transaction
+        # while adjudicating; monitor requests must remain able to read state.
+        if attempt_state == "completed" and manager_control_outcome is None:
+            completion_snapshot = self._completion_contract_snapshot(plan.run_id)
+            if has_upstream_task_results(completion_snapshot):
+                official_completion = adjudicate_completion(completion_snapshot)
+                if official_completion.accepted_done:
+                    with self.store.atomic():
+                        latest_attempts = self.store.list_run_attempts(
+                            run_id=plan.run_id, limit=1
+                        )
+                        current_run = self.store.get_game_run(plan.run_id)
+                        if (
+                            latest_attempts
+                            and latest_attempts[0]["run_attempt_id"] == plan.run_attempt_id
+                            and current_run["state"] == EntityState.REVIEW_REQUIRED.value
+                        ):
+                            self.store.update_game_run(
+                                plan.run_id,
+                                state=EntityState.DONE,
+                                exit_code=current_run["exit_code"],
+                                message=official_completion.message,
+                            )
+        # The command receipt records transport execution. Batch completion is
+        # projected separately from scoped upstream task outcomes.
         self._complete_command(
             command_id or plan.run_id,
             (
@@ -7177,652 +7835,7 @@ class ManagerService:
         )
         return result
 
-    def _ensure_promoted_adapter_completion_review(
-        self, plan: AdapterExecutionPlan
-    ) -> CompletionReviewRecord | None:
-        """Accept a normal run without scheduling an Agent evidence-review job.
 
-        The promoted Adapter protocol is already fenced to one run and one exact
-        Todo list.  Manager may therefore create an immutable machine review when
-        every selected Todo ended as completed and supplied current-run evidence.
-        Game-specific visual predicates remain fail-closed: StarRail additionally
-        needs a raw current-run game screenshot and the indivisible training +
-        reward operation pair. WW additionally needs both the original and the
-        Beijing-time-watermarked screenshot from its reward-claim Todo, plus a
-        signed Adapter artifact proving the same run reached 100 activity.
-        """
-
-        # No current AdapterExecutionPlan declares a complete, per-operation
-        # machine semantic predicate set.  Generic before/after pairs therefore
-        # cannot authorize an automatic review, including for WW.
-        if not getattr(plan, "machine_semantic_predicates", None):
-            return None
-
-        lineage_review = self._ensure_promoted_adapter_lineage_completion_review(
-            plan.run_id, expected_run_attempt_id=plan.run_attempt_id
-        )
-        if lineage_review is not None:
-            return lineage_review
-
-        attempts = self.store.list_todo_attempts(
-            run_attempt_id=plan.run_attempt_id, limit=5000
-        )
-        attempts_by_todo = {
-            str(item["todo_instance_id"]): item for item in attempts
-        }
-        selected = [
-            attempts_by_todo.get(todo_id)
-            for todo_id in plan.executable_todo_instance_ids
-        ]
-        if (
-            not selected
-            or any(item is None for item in selected)
-            or any(item["state"] != "completed" for item in selected if item)
-        ):
-            return None
-        artifact_refs = list(
-            dict.fromkeys(
-                artifact_id
-                for item in selected
-                if item is not None
-                for artifact_id in item.get("evidence_refs", [])
-            )
-        )
-        if not artifact_refs or any(
-            not item.get("evidence_refs", []) for item in selected if item is not None
-        ):
-            return None
-
-        artifact_documents: dict[str, dict[str, Any]] = {}
-        artifact_integrity: dict[str, ArtifactIntegrityResult] = {}
-        for artifact_id in artifact_refs:
-            try:
-                resource = self.store.get_resource("artifact", artifact_id)
-            except RecordNotFound:
-                return None
-            document = dict(resource["document"])
-            artifact_kind = str(document.get("kind") or "")
-            is_watermark = artifact_kind.endswith("-watermarked")
-            if (
-                document.get("runId") != plan.run_id
-                or document.get("runAttemptId") != plan.run_attempt_id
-                or document.get("gameId") != plan.game_id
-                or (
-                    document.get("raw") is not False
-                    if is_watermark
-                    else document.get("raw") is not True
-                )
-            ):
-                return None
-            integrity = self._completion_artifact_integrity(
-                artifact_id, document
-            )
-            if not integrity.valid:
-                return None
-            artifact_documents[artifact_id] = document
-            artifact_integrity[artifact_id] = integrity
-
-        # Every selected step must carry its own same-attempt before/after
-        # transition evidence.  This is a product-wide daily contract, not a
-        # game-specific exception: a text log or a screenshot from another
-        # Todo can no longer make the run look complete.
-        operation_by_todo = {
-            target.todo_instance_id: target.operation for target in plan.todos
-        }
-        for item in selected:
-            if item is None:
-                return None
-            todo_attempt_id = item.get("todo_attempt_id")
-            kinds = {
-                str(artifact_documents[artifact_id].get("kind") or "")
-                for artifact_id in item.get("evidence_refs", [])
-                if artifact_id in artifact_documents
-                and (
-                    todo_attempt_id is None
-                    or artifact_documents[artifact_id].get("todoAttemptId")
-                    == todo_attempt_id
-                )
-                and (
-                    artifact_documents[artifact_id].get("todoInstanceId") is None
-                    or artifact_documents[artifact_id].get("todoInstanceId")
-                    == item["todo_instance_id"]
-                )
-            }
-            step_pair_present = {
-                "game-ui-step-before-raw",
-                "game-ui-step-after-watermarked",
-            }.issubset(kinds)
-            legacy_ww_claim_pair = (
-                plan.game_id == "WW"
-                and operation_by_todo.get(item["todo_instance_id"])
-                == "claim-daily-reward"
-                and {
-                    "game-ui-daily-reward-before",
-                    "game-ui-daily-reward-watermarked",
-                }.issubset(kinds)
-            )
-            if not step_pair_present and not legacy_ww_claim_pair:
-                return None
-
-        predicates: list[dict[str, Any]] = []
-        if plan.game_id == "WW":
-            claim_target = next(
-                (item for item in plan.todos if item.operation == "claim-daily-reward"),
-                None,
-            )
-            if claim_target is None:
-                return None
-            claim_attempt = attempts_by_todo.get(claim_target.todo_instance_id)
-            if claim_attempt is None:
-                return None
-            claim_artifacts = {
-                artifact_id: artifact_documents[artifact_id]
-                for artifact_id in claim_attempt.get("evidence_refs", [])
-                if artifact_id in artifact_documents
-            }
-            before_screenshot_ref = next(
-                (
-                    artifact_id
-                    for artifact_id, document in claim_artifacts.items()
-                    if document.get("kind") == "game-ui-daily-reward-before"
-                    and document.get("raw") is True
-                    and str(document.get("contentType", "")).lower()
-                    in {"image/png", "image/jpeg"}
-                ),
-                None,
-            )
-            raw_screenshot_ref = next(
-                (
-                    artifact_id
-                    for artifact_id, document in claim_artifacts.items()
-                    if document.get("kind") == "game-ui-daily-reward-raw"
-                    and document.get("raw") is True
-                    and str(document.get("contentType", "")).lower()
-                    in {"image/png", "image/jpeg"}
-                ),
-                None,
-            )
-            watermarked_screenshot_ref = next(
-                (
-                    artifact_id
-                    for artifact_id, document in claim_artifacts.items()
-                    if document.get("kind") == "game-ui-daily-reward-watermarked"
-                    and document.get("raw") is False
-                    and str(document.get("contentType", "")).lower()
-                    in {"image/png", "image/jpeg"}
-                ),
-                None,
-            )
-            activity_100_ref = next(
-                (
-                    artifact_id
-                    for artifact_id, document in claim_artifacts.items()
-                    if document.get("kind") == "game-ui-daily-activity-100"
-                    and document.get("raw") is True
-                    and str(document.get("contentType", "")).lower()
-                    == "text/plain"
-                ),
-                None,
-            )
-            if (
-                before_screenshot_ref is None
-                or raw_screenshot_ref is None
-                or watermarked_screenshot_ref is None
-                or activity_100_ref is None
-            ):
-                return None
-            if (
-                artifact_integrity[activity_100_ref]
-                .content.decode("utf-8", errors="strict")
-                .strip()
-                != "dailyActivityPoints=100"
-            ):
-                return None
-            predicates.append(
-                {
-                    "predicateId": "ww-daily-activity-100-and-reward-claim-screenshots",
-                    "metrics": {
-                        "dailyActivityPoints": 100,
-                        "beforeClaimScreenshotPresent": True,
-                        "rawScreenshotPresent": True,
-                        "watermarkedScreenshotPresent": True,
-                    },
-                    "artifactRefs": [
-                        before_screenshot_ref,
-                        raw_screenshot_ref,
-                        watermarked_screenshot_ref,
-                        activity_100_ref,
-                    ],
-                }
-            )
-        if plan.game_id == "StarRail":
-            # StarRail completion is visually semantic: a screenshot must show
-            # 500/500 activity and all five reward tiers claimed.  A promoted
-            # Adapter can prove that its fixed command ran, but it cannot turn
-            # an arbitrary non-uniform game frame into those visual facts.
-            # Leave the run pending for the scoped Agent completion review.
-            return None
-            operations = {item.operation for item in plan.todos}
-            if not {
-                "daily-training-objectives",
-                "claim-daily-training-rewards",
-            }.issubset(operations):
-                return None
-            claim_target = next(
-                (item for item in plan.todos if item.operation == "claim-daily-training-rewards"),
-                None,
-            )
-            if claim_target is None:
-                return None
-            claim_attempt = attempts_by_todo.get(claim_target.todo_instance_id)
-            if claim_attempt is None:
-                return None
-            claim_artifacts = {
-                artifact_id: artifact_documents[artifact_id]
-                for artifact_id in claim_attempt.get("evidence_refs", [])
-                if artifact_id in artifact_documents
-            }
-            screenshot_ref = next(
-                (
-                    artifact_id
-                    for artifact_id, document in claim_artifacts.items()
-                    if document.get("kind") == "game-ui-daily-reward-raw"
-                    and document.get("raw") is True
-                    and str(document.get("contentType", "")).lower()
-                    in {"image/png", "image/jpeg"}
-                ),
-                None,
-            )
-            watermarked_screenshot_ref = next(
-                (
-                    artifact_id
-                    for artifact_id, document in claim_artifacts.items()
-                    if document.get("kind") == "game-ui-daily-reward-watermarked"
-                    and document.get("raw") is False
-                    and str(document.get("contentType", "")).lower()
-                    in {"image/png", "image/jpeg"}
-                ),
-                None,
-            )
-            if screenshot_ref is None or watermarked_screenshot_ref is None:
-                return None
-            predicates.append(
-                {
-                    "predicateId": "starrail-reward-claim-screenshot-pair",
-                    "metrics": {
-                        "rawScreenshotPresent": True,
-                        "watermarkedScreenshotPresent": True,
-                    },
-                    "artifactRefs": [
-                        screenshot_ref,
-                        watermarked_screenshot_ref,
-                    ],
-                }
-            )
-            # Do not invent visual metrics from an Adapter exit. The promoted
-            # Adapter review below is a distinct tool-authoritative path; an
-            # actual human/Agent visual review still uses the stricter metrics.
-
-        run = self.store.get_game_run(plan.run_id)
-        frozen_todos = self._frozen_todos_for_run(run)
-        game_day_key = next(
-            (
-                item.period_key
-                for item in frozen_todos
-                if item.todo_instance_id in plan.executable_todo_instance_ids
-            ),
-            None,
-        )
-        if not game_day_key:
-            return None
-        review_id = "completion-review-" + str(
-            uuid.uuid5(
-                uuid.NAMESPACE_URL,
-                "/".join(
-                    (
-                        "yeyu-gamer",
-                        "promoted-adapter-review",
-                        plan.run_id,
-                        plan.run_attempt_id,
-                        game_day_key,
-                    )
-                ),
-            )
-        )
-        reviewed_at = utc_now().isoformat()
-        document = {
-            "schemaVersion": 1,
-            "workItemId": f"automatic:{plan.run_attempt_id}",
-            "claimId": f"automatic:{plan.run_attempt_id}",
-            "decisionId": f"automatic:{plan.run_attempt_id}",
-            "reviewerPrincipalId": "manager:promoted-adapter",
-            "decision": "accepted",
-            "gameId": plan.game_id,
-            "runId": plan.run_id,
-            "runAttemptId": plan.run_attempt_id,
-            "gameDayKey": game_day_key,
-            "predicates": predicates,
-            "artifactRefs": artifact_refs,
-            "reviewedAt": reviewed_at,
-            "reviewSource": "promoted-adapter-current-run-evidence",
-        }
-        try:
-            resource = self.store.get_resource("completion-review", review_id)
-        except RecordNotFound:
-            resource = self.store.create_resource(
-                "completion-review",
-                resource_id=review_id,
-                state="accepted",
-                document=document,
-            )
-        return self._completion_review_record(resource)
-
-    def _ensure_promoted_adapter_lineage_completion_review(
-        self,
-        run_id: str,
-        *,
-        expected_run_attempt_id: str | None = None,
-    ) -> CompletionReviewRecord | None:
-        """Create the promoted review from one frozen same-GameDay lineage.
-
-        A new top-level daily batch may execute only the Todo that became eligible
-        after an explicit human release.  Completed one-time actions remain owned
-        by their earlier RunAttempts.  The completion snapshot already freezes
-        those exact owners into one fail-closed lineage; this path applies the
-        same per-step screenshot contract to that lineage instead of requiring
-        every Todo to be replayed in the newest Adapter process.
-        """
-
-        try:
-            run = self.store.get_game_run(run_id)
-            snapshot = self._completion_contract_snapshot(run_id)
-            frozen_todos = self._frozen_todos_for_run(run)
-        except (
-            AttributeError,
-            ManagerConflict,
-            RecordNotFound,
-            TypeError,
-            ValueError,
-        ):
-            return None
-
-        if snapshot.game_id != "WW":
-            return None
-
-        current_attempt = snapshot.current_attempt
-        if (
-            current_attempt is None
-            or current_attempt.state != "completed"
-            or (
-                expected_run_attempt_id is not None
-                and current_attempt.run_attempt_id != expected_run_attempt_id
-            )
-        ):
-            return None
-
-        required_todos = [item for item in frozen_todos if item.required]
-        facts_by_todo = {
-            item.todo_instance_id: item for item in snapshot.todos if item.required
-        }
-        selected = [facts_by_todo.get(item.todo_instance_id) for item in required_todos]
-        if (
-            not selected
-            or any(item is None for item in selected)
-            or any(item.status != "completed" for item in selected if item is not None)
-        ):
-            return None
-
-        attempt_runs = {
-            item.run_attempt_id: item.run_id for item in snapshot.attempt_lineage
-        }
-        evidence_by_id = {item.artifact_id: item for item in snapshot.evidence}
-        artifact_refs = list(
-            dict.fromkeys(
-                artifact_id
-                for item in selected
-                if item is not None
-                for artifact_id in item.evidence_refs
-            )
-        )
-        if not artifact_refs:
-            return None
-
-        scoped_evidence_by_todo: dict[str, dict[str, Any]] = {}
-        for item in selected:
-            if item is None or item.run_attempt_id is None or not item.evidence_refs:
-                return None
-            scoped: dict[str, Any] = {}
-            for artifact_id in item.evidence_refs:
-                artifact = evidence_by_id.get(artifact_id)
-                if (
-                    artifact is None
-                    or artifact.game_id != snapshot.game_id
-                    or artifact.todo_instance_id != item.todo_instance_id
-                    or artifact.run_attempt_id != item.run_attempt_id
-                    or attempt_runs.get(artifact.run_attempt_id) != artifact.run_id
-                    or artifact.game_day_key != snapshot.game_day.period_key
-                    or not (
-                        snapshot.game_day.starts_at
-                        <= artifact.captured_at
-                        < snapshot.game_day.ends_at
-                    )
-                ):
-                    return None
-                scoped[artifact_id] = artifact
-            kinds = {artifact.kind for artifact in scoped.values()}
-            step_pair_present = {
-                "game-ui-step-before-raw",
-                "game-ui-step-after-watermarked",
-            }.issubset(kinds)
-            operation = next(
-                (
-                    todo.operation
-                    for todo in required_todos
-                    if todo.todo_instance_id == item.todo_instance_id
-                ),
-                "",
-            )
-            legacy_ww_claim_pair = (
-                snapshot.game_id == "WW"
-                and operation == "claim-daily-reward"
-                and {
-                    "game-ui-daily-reward-before",
-                    "game-ui-daily-reward-watermarked",
-                }.issubset(kinds)
-            )
-            if not step_pair_present and not legacy_ww_claim_pair:
-                return None
-            scoped_evidence_by_todo[item.todo_instance_id] = scoped
-
-        predicates: list[dict[str, Any]] = []
-        operations = {item.operation for item in required_todos}
-        todo_by_operation = {item.operation: item for item in required_todos}
-        if snapshot.game_id == "WW":
-            claim_todo = todo_by_operation.get("claim-daily-reward")
-            if claim_todo is None:
-                return None
-            claim_artifacts = scoped_evidence_by_todo.get(
-                claim_todo.todo_instance_id, {}
-            )
-
-            def ww_ref(kind: str, *, raw: bool, content_type: str) -> str | None:
-                return next(
-                    (
-                        artifact_id
-                        for artifact_id, artifact in claim_artifacts.items()
-                        if artifact.kind == kind
-                        and artifact.raw is raw
-                        and artifact.content_type.lower() == content_type
-                    ),
-                    None,
-                )
-
-            before_ref = ww_ref(
-                "game-ui-daily-reward-before", raw=True, content_type="image/png"
-            ) or next(
-                (
-                    artifact_id
-                    for artifact_id, artifact in claim_artifacts.items()
-                    if artifact.kind == "game-ui-daily-reward-before"
-                    and artifact.raw
-                    and artifact.is_screenshot
-                ),
-                None,
-            )
-            raw_ref = next(
-                (
-                    artifact_id
-                    for artifact_id, artifact in claim_artifacts.items()
-                    if artifact.kind == "game-ui-daily-reward-raw"
-                    and artifact.raw
-                    and artifact.is_screenshot
-                ),
-                None,
-            )
-            watermarked_ref = next(
-                (
-                    artifact_id
-                    for artifact_id, artifact in claim_artifacts.items()
-                    if artifact.kind == "game-ui-daily-reward-watermarked"
-                    and not artifact.raw
-                    and artifact.is_screenshot
-                ),
-                None,
-            )
-            activity_ref = next(
-                (
-                    artifact_id
-                    for artifact_id, artifact in claim_artifacts.items()
-                    if artifact.kind == "game-ui-daily-activity-100"
-                    and artifact.raw
-                    and artifact.content_type.lower() == "text/plain"
-                ),
-                None,
-            )
-            if None in {before_ref, raw_ref, watermarked_ref, activity_ref}:
-                return None
-            assert activity_ref is not None
-            try:
-                activity_document = dict(
-                    self.store.get_resource("artifact", activity_ref)["document"]
-                )
-            except (KeyError, RecordNotFound, TypeError):
-                return None
-            activity_integrity = self._completion_artifact_integrity(
-                activity_ref, activity_document
-            )
-            if (
-                not activity_integrity.valid
-                or activity_integrity.content.decode(
-                    "utf-8", errors="strict"
-                ).strip()
-                != "dailyActivityPoints=100"
-            ):
-                return None
-            predicates.append(
-                {
-                    "predicateId": "ww-daily-activity-100-and-reward-claim-screenshots",
-                    "metrics": {
-                        "dailyActivityPoints": 100,
-                        "beforeClaimScreenshotPresent": True,
-                        "rawScreenshotPresent": True,
-                        "watermarkedScreenshotPresent": True,
-                    },
-                    "artifactRefs": [
-                        before_ref,
-                        raw_ref,
-                        watermarked_ref,
-                        activity_ref,
-                    ],
-                }
-            )
-        elif snapshot.game_id == "StarRail":
-            # Same rule as the single-attempt path above.  Same-day lineage does
-            # not weaken the required visual review.
-            return None
-            if not {
-                "daily-training-objectives",
-                "claim-daily-training-rewards",
-            }.issubset(operations):
-                return None
-            claim_todo = todo_by_operation["claim-daily-training-rewards"]
-            claim_artifacts = scoped_evidence_by_todo.get(
-                claim_todo.todo_instance_id, {}
-            )
-            raw_ref = next(
-                (
-                    artifact_id
-                    for artifact_id, artifact in claim_artifacts.items()
-                    if artifact.kind == "game-ui-daily-reward-raw"
-                    and artifact.raw
-                    and artifact.is_screenshot
-                ),
-                None,
-            )
-            watermarked_ref = next(
-                (
-                    artifact_id
-                    for artifact_id, artifact in claim_artifacts.items()
-                    if artifact.kind == "game-ui-daily-reward-watermarked"
-                    and not artifact.raw
-                    and artifact.is_screenshot
-                ),
-                None,
-            )
-            if raw_ref is None or watermarked_ref is None:
-                return None
-            predicates.append(
-                {
-                    "predicateId": "starrail-reward-claim-screenshot-pair",
-                    "metrics": {
-                        "rawScreenshotPresent": True,
-                        "watermarkedScreenshotPresent": True,
-                    },
-                    "artifactRefs": [raw_ref, watermarked_ref],
-                }
-            )
-
-        game_day_key = snapshot.game_day.period_key
-        review_id = "completion-review-" + str(
-            uuid.uuid5(
-                uuid.NAMESPACE_URL,
-                "/".join(
-                    (
-                        "yeyu-gamer",
-                        "promoted-adapter-lineage-review",
-                        snapshot.run_id,
-                        current_attempt.run_attempt_id,
-                        game_day_key,
-                    )
-                ),
-            )
-        )
-        document = {
-            "schemaVersion": 1,
-            "workItemId": f"automatic:{current_attempt.run_attempt_id}",
-            "claimId": f"automatic:{current_attempt.run_attempt_id}",
-            "decisionId": f"automatic:{current_attempt.run_attempt_id}",
-            "reviewerPrincipalId": "manager:promoted-adapter",
-            "decision": "accepted",
-            "gameId": snapshot.game_id,
-            "runId": snapshot.run_id,
-            "runAttemptId": current_attempt.run_attempt_id,
-            "gameDayKey": game_day_key,
-            "predicates": predicates,
-            "artifactRefs": artifact_refs,
-            "reviewedAt": utc_now().isoformat(),
-            "reviewSource": "promoted-adapter-same-game-day-lineage-evidence",
-        }
-        try:
-            resource = self.store.get_resource("completion-review", review_id)
-        except RecordNotFound:
-            resource = self.store.create_resource(
-                "completion-review",
-                resource_id=review_id,
-                state="accepted",
-                document=document,
-            )
-        return self._completion_review_record(resource)
 
     def _start_game_run(
         self,
@@ -7873,7 +7886,34 @@ class ManagerService:
                 "instanceName": emulator_binding.instance_name,
                 "adbSerial": emulator_binding.adb_serial,
             }
-        if run["game_id"] == "WW":
+        if run["game_id"] == "StarRail":
+            raw_profiles = manager_config.get("daily_tool_profiles", {})
+            raw_profile = raw_profiles.get("star_rail") if isinstance(raw_profiles, dict) else None
+            if raw_profile is not None:
+                try:
+                    profile = StarRailProfileConfig.model_validate(raw_profile)
+                except ValueError as error:
+                    raise ManagerValidation("Stored March7th daily profile is invalid") from error
+                installation_binding["dailyTaskProfile"] = profile.model_dump(by_alias=True)
+        elif run["game_id"] == "Endfield":
+            raw_profiles = manager_config.get("daily_tool_profiles", {})
+            raw_profile = raw_profiles.get("endfield") if isinstance(raw_profiles, dict) else None
+            if raw_profile is not None:
+                try:
+                    profile = EndfieldProfileConfig.model_validate(raw_profile)
+                except ValueError as error:
+                    raise ManagerValidation("Stored Endfield daily profile is invalid") from error
+                installation_binding["dailyTaskProfile"] = profile.model_dump(by_alias=True)
+        elif run["game_id"] == "GF2":
+            raw_profiles = manager_config.get("daily_tool_profiles", {})
+            raw_profile = raw_profiles.get("gf2") if isinstance(raw_profiles, dict) else None
+            if raw_profile is not None:
+                try:
+                    profile = Gf2ProfileConfig.model_validate(raw_profile)
+                except ValueError as error:
+                    raise ManagerValidation("Stored GF2 daily profile is invalid") from error
+                installation_binding["dailyTaskProfile"] = profile.model_dump(by_alias=True)
+        elif run["game_id"] == "WW":
             raw_profiles = manager_config.get("daily_tool_profiles", {})
             raw_ok_ww_profile = (
                 raw_profiles.get("ok_ww")
@@ -7920,6 +7960,33 @@ class ManagerService:
             installation_binding["dailyTaskProfile"] = nte_profile.model_dump(
                 by_alias=True
             )
+        elif run["game_id"] == "FGO":
+            raw_profiles = manager_config.get("daily_tool_profiles", {})
+            raw_profile = raw_profiles.get("fgo") if isinstance(raw_profiles, dict) else None
+            if raw_profile is not None and emulator_binding is not None:
+                try:
+                    profile = FGOProfileConfig.model_validate(raw_profile)
+                except ValueError as error:
+                    raise ManagerValidation("Stored MaaFgo daily profile is invalid") from error
+                installation_binding["dailyTaskProfile"] = {
+                    "schemaVersion": 1,
+                    "resourceName": profile.resource_name,
+                    "taskOptions": profile.task_options,
+                    "device": {
+                        "type": "Adb",
+                        "controller_name": "安卓设备",
+                        "name": emulator_binding.instance_name or "LDPlayer",
+                        "adb_path": emulator_binding.adb_path,
+                        "address": emulator_binding.adb_serial,
+                        "screencap_methods": "64",
+                        "input_methods": "18446744073709551607",
+                        "config": {"extras": {"ld": {
+                            "enable": True,
+                            "index": emulator_binding.instance_index,
+                            "path": str(Path(emulator_binding.console_path).parent),
+                        }}},
+                    },
+                }
         elif run["game_id"] == "CZN":
             raw_profiles = manager_config.get("daily_tool_profiles", {})
             raw_czn_profile = (
@@ -7987,7 +8054,7 @@ class ManagerService:
                 if game_launch is None:
                     return GameCloseReceipt("not-started", (), ()), None
                 if emulator_binding is not None:
-                    return self.emulator_launcher.close_started(emulator_binding, game_launch), None
+                    return self._close_finished_batch_emulator(plan, emulator_binding, game_launch), None
                 return self._close_finished_batch_game(
                     plan, game_launch, installation_binding.get("gamePath"),
                 ), None
@@ -8036,8 +8103,8 @@ class ManagerService:
                 _log.info(
                     "attempt.game_cleanup state=%s requested=%s remaining=%s",
                     cleanup.state,
-                    list(cleanup.requested_process_ids),
-                    list(cleanup.remaining_process_ids),
+                    list(getattr(cleanup, "requested_process_ids", ())),
+                    list(getattr(cleanup, "remaining_process_ids", ())),
                 )
                 with self.store.atomic():
                     attempt = self.store.get_run_attempt(plan.run_attempt_id)
@@ -8100,13 +8167,30 @@ class ManagerService:
                 if completed_callback is not None and effective_result is not None:
                     completed_callback(effective_result)
 
+        observation_path, observation_mode = self._ww_official_multi_observation(
+            run, owning_batch
+        )
+        extra_environment = None
+        observation_replay = observation_mode == "read"
+        if observation_path is not None and observation_mode:
+            extra_environment = {
+                "YEYU_GAMER_WW_MULTI_OBSERVATION_FILE": str(observation_path),
+                "YEYU_GAMER_WW_MULTI_OBSERVATION_MODE": observation_mode,
+            }
         launch_log_scope = contextlib.ExitStack()
         launch_log_scope.enter_context(bind_log_context(**log_fields, phase="launch"))
         try:
             self.store.update_run_attempt(
                 plan.run_attempt_id,
                 state="running",
-                result={"launchState": "starting-game-client"},
+                result={
+                    "launchState": (
+                        "ww-official-observation-replay"
+                        if observation_replay
+                        else "starting-game-client"
+                    ),
+                    "wwOfficialObservationReplay": observation_replay,
+                },
                 completed=False,
             )
             _log.info(
@@ -8117,16 +8201,23 @@ class ManagerService:
             self.store.update_game_run(
                 run_id,
                 state=EntityState.RUNNING,
-                message="Manager starting configured game client before Adapter launch",
+                message=(
+                    "Replaying official MultiAccount observations for this WW account"
+                    if observation_replay
+                    else "Manager starting configured game client before Adapter launch"
+                ),
             )
-            self._close_other_batch_games(plan, configured_paths)
+            if not observation_replay:
+                self._close_other_batch_games(plan, configured_paths)
             if self._launch_cancel_requested(plan.run_attempt_id):
                 raise GameLaunchCancelled("Manager cancellation won the queue-cleanup to game-launch handoff")
             if self.store.get_game_run(run_id)["state"] == EntityState.HUMAN_REQUIRED:
                 raise GameLaunchHumanRequired(
                     "queue_cleanup_human_takeover", "Human takeover won the queue-cleanup to game-launch handoff.",
                 )
-            if emulator_binding is not None:
+            if observation_replay:
+                game_launch = None
+            elif emulator_binding is not None:
                 game_launch = self.emulator_launcher.ensure_started(emulator_binding)
                 emulator_state = self.emulator_launcher.inspect(emulator_binding)
                 capture_pids = frozenset(
@@ -8159,7 +8250,7 @@ class ManagerService:
                     ),
                 )
             _log.info(
-                "attempt.launch.game_ready %s",
+                "attempt.launch.receipt %s",
                 game_launch.as_result() if game_launch is not None else None,
             )
             with self._execution_handoff_lock:
@@ -8177,6 +8268,7 @@ class ManagerService:
                     ),
                     installation_binding=installation_binding,
                     transcript=attempt_log,
+                    extra_environment=extra_environment,
                 )
                 _log.info("attempt.launch.adapter_host_started pid=%s", pid)
                 attempt = self.store.get_run_attempt(plan.run_attempt_id)
@@ -8191,7 +8283,12 @@ class ManagerService:
                         process_id=pid,
                         result={
                             "launchState": "fixed-host-started",
-                            "gameLaunch": game_launch.as_result(),
+                            "gameLaunch": (
+                                {"skipped": "ww_official_multi_account_replay"}
+                                if game_launch is None
+                                else game_launch.as_result()
+                            ),
+                            "wwOfficialObservationReplay": observation_replay,
                         },
                         completed=False,
                     )
@@ -8401,6 +8498,27 @@ class ManagerService:
                 raise GameLaunchCancelled("The frozen queue no longer authorizes terminal game cleanup.")
         return False
 
+    def _queue_process_close_observer(
+        self, plan: AdapterExecutionPlan, batch_id: str, target_game_id: str, trigger: str,
+    ) -> Callable[[dict[str, object]], None]:
+        steps = self.store.list_todo_attempts(run_attempt_id=plan.run_attempt_id, limit=1)
+        step = steps[0] if steps else {}
+
+        def record(observation: dict[str, object]) -> None:
+            self.store.append_event(
+                "game-process.close-" + str(observation["auditPhase"]),
+                "run-attempt", plan.run_attempt_id,
+                {"runId": plan.run_id, "gameId": target_game_id, "batchId": batch_id,
+                 "initiator": "Manager", "reasonCode": trigger,
+                 "message": (f"Manager {observation['phase']} PID {observation['processId']}: "
+                             f"{observation['outcome']}; trigger={trigger}; "
+                             f"lastOperation={step.get('operation') or 'no official step started'}"),
+                 "todoAttemptId": step.get("todo_attempt_id"),
+                 "operation": step.get("operation"), **observation},
+            )
+
+        return record
+
     def _close_finished_batch_game(
         self, plan: AdapterExecutionPlan, launch: GameLaunchReceipt, game_path: object,
     ) -> GameCloseReceipt:
@@ -8424,6 +8542,7 @@ class ManagerService:
         cleanup = self.game_launcher.close_for_queue(
             plan.game_id, game_path,
             cancel_requested=lambda: self._terminal_game_cleanup_gate(plan, batch_id),
+            on_close=self._queue_process_close_observer(plan, batch_id, plan.game_id, "frozen_queue_terminal_cleanup"),
         )
         if not isinstance(cleanup, GameCloseReceipt):
             raise GameLaunchError("Terminal queue cleanup returned an invalid receipt")
@@ -8431,6 +8550,32 @@ class ManagerService:
             raise GameLaunchError("Terminal queue cleanup returned an unsupported closure state")
         self.store.append_event("game-run.queue-cleanup", "run-attempt", plan.run_attempt_id,
             {"runId": plan.run_id, "gameId": plan.game_id, "batchId": batch_id, **cleanup.as_result()})
+        self._terminal_game_cleanup_gate(plan, batch_id)
+        return cleanup
+
+    def _close_finished_batch_emulator(
+        self, plan: AdapterExecutionPlan, binding: LDPlayerBinding, launch: EmulatorLaunchReceipt,
+    ) -> EmulatorCloseReceipt:
+        """Close the current frozen queue's LDPlayer instance, even if pre-existing."""
+        memberships = self.store.list_batch_run_memberships(run_id=plan.run_id, limit=5000)
+        if not memberships:
+            return self.emulator_launcher.close_started(binding, launch)
+        batches = [self.store.get_batch(str(member["batch_id"])) for member in memberships
+            if member["state"] == "active" and member.get("latest_run_attempt_id") == plan.run_attempt_id]
+        if len(batches) != 1:
+            raise GameLaunchCancelled("No unique active queue owns this terminal emulator attempt; preserve the instance.")
+        batch = batches[0]
+        batch_id = str(batch["batch_id"])
+        self._terminal_game_cleanup_gate(plan, batch_id)
+        candidates = batch["result"].get("candidateGameIds")
+        if (batch["mode"] != RequestMode.EXECUTE or not isinstance(candidates, list)
+            or plan.game_id not in candidates):
+            raise GameLaunchHumanRequired("terminal_cleanup_scope_unavailable", "The frozen queue cannot authorize closing this emulator instance.")
+        cleanup = self.emulator_launcher.close_for_queue(binding)
+        if cleanup.state not in {"closed", "already-closed", "close-failed"}:
+            raise GameLaunchError("Terminal emulator cleanup returned an unsupported closure state")
+        self.store.append_event("game-run.queue-cleanup", "run-attempt", plan.run_attempt_id,
+            {"runId": plan.run_id, "gameId": plan.game_id, "batchId": batch_id, "provider": "ldplayer", **cleanup.as_result()})
         self._terminal_game_cleanup_gate(plan, batch_id)
         return cleanup
 
@@ -8541,25 +8686,37 @@ class ManagerService:
             for game_id in other_game_ids:
                 check_gate()
                 binding = configured_paths.get(game_id)
-                if not isinstance(binding, dict) or binding.get("emulator") is not None or not isinstance(binding.get("game_path"), str) or not binding["game_path"]:
+                if not isinstance(binding, dict):
                     report["games"].append({"gameId": game_id, "state": "binding-unavailable", "code": "queue_cleanup_binding_unavailable"})
                     failures.append(game_id)
                     persist()
                     continue
                 try:
-                    cleanup = self.game_launcher.close_for_queue(
-                        game_id, binding["game_path"], cancel_requested=check_gate,
-                    )
-                    if not isinstance(cleanup, GameCloseReceipt):
-                        raise GameLaunchError("Queue cleanup returned an invalid receipt")
-                    report["games"].append({"gameId": game_id, **cleanup.as_result()})
-                    if (
-                        cleanup.state not in {"closed", "already-closed"}
-                        or cleanup.remaining_process_ids
-                        or cleanup.zombie_process_ids
-                        or getattr(cleanup, "unverified_process_ids", ())
-                    ):
-                        failures.append(game_id)
+                    emulator = binding.get("emulator")
+                    if isinstance(emulator, dict):
+                        cleanup = self.emulator_launcher.close_for_queue(LDPlayerBinding(
+                            game_id=game_id,
+                            console_path=str(emulator.get("console_path", "")),
+                            adb_path=str(emulator.get("adb_path", "")),
+                            instance_index=int(emulator.get("instance_index", 0)),
+                            adb_serial=str(emulator.get("adb_serial", "")),
+                            instance_name=str(emulator["instance_name"]) if emulator.get("instance_name") is not None else None,
+                        ))
+                        report["games"].append({"gameId": game_id, "provider": "ldplayer", **cleanup.as_result()})
+                        if cleanup.state not in {"closed", "already-closed"} or cleanup.instance_remaining:
+                            failures.append(game_id)
+                    elif isinstance(binding.get("game_path"), str) and binding["game_path"]:
+                        cleanup = self.game_launcher.close_for_queue(
+                            game_id, binding["game_path"], cancel_requested=check_gate,
+                            on_close=self._queue_process_close_observer(plan, batch_id, game_id, "frozen_queue_before_game_launch"),
+                        )
+                        if not isinstance(cleanup, GameCloseReceipt):
+                            raise GameLaunchError("Queue cleanup returned an invalid receipt")
+                        report["games"].append({"gameId": game_id, **cleanup.as_result()})
+                        if cleanup.state not in {"closed", "already-closed"} or cleanup.remaining_process_ids or cleanup.zombie_process_ids or getattr(cleanup, "unverified_process_ids", ()):
+                            failures.append(game_id)
+                    else:
+                        raise GameLaunchError("queue cleanup binding has neither an emulator nor a game executable")
                 except (GameLaunchCancelled, GameLaunchHumanRequired):
                     raise
                 except Exception as error:
@@ -8641,6 +8798,23 @@ class ManagerService:
             )
             artifact_id: str | None = None
             capture_error: str | None = None
+            checkpoint = {
+                "phase": observation.phase,
+                "observedAt": utc_now().isoformat(),
+                "elapsedSeconds": observation.elapsed_seconds,
+                "processIds": sorted(observation.process_ids),
+                "detail": observation.detail,
+            }
+            # Publish the observation before potentially slow window capture.
+            # This is launch status, never an official task-progress timestamp.
+            with self.store.atomic():
+                attempt = self.store.get_run_attempt(plan.run_attempt_id)
+                if attempt["state"] in {"starting", "running", "cancelling"}:
+                    self.store.update_run_attempt(
+                        plan.run_attempt_id, state=attempt["state"],
+                        exit_code=attempt["exit_code"],
+                        result={"launchObservation": checkpoint}, completed=False,
+                    )
             try:
                 if (
                     not observation.process_ids
@@ -9646,6 +9820,8 @@ class ManagerService:
                             state="cancelling",
                             result={
                                 "cancelReason": "batch_cancel_requested",
+                                "cancelRequestReason": cancel_request["reason"],
+                                "cancelRequestedBy": cancel_request["requested_by"],
                                 "cancelPhase": (
                                     "game-launch"
                                     if launch_phase
@@ -11383,6 +11559,24 @@ class ManagerService:
         def operation() -> dict[str, Any]:
             validated_patch = dict(patch)
             if "game_accounts" in validated_patch:
+                current_accounts = self.store.get_config()["values"]
+                removed = {
+                    (game_id, account["account_id"])
+                    for game_id, accounts in validated_patch["game_accounts"].items()
+                    for account in game_accounts(current_accounts, game_id)
+                    if account["account_id"] not in {item.get("account_id") for item in accounts}
+                }
+                if removed:
+                    active = self.store.active_execution_summary()
+                    for item in active["batches"]:
+                        batch = self.store.get_batch(item["batchId"])
+                        if any((target["gameId"], target.get("accountId", "default")) in removed
+                               for target in batch.get("result", {}).get("accountTargets", [])):
+                            raise ManagerConflict("账号仍在当前每日执行范围内，请等待本轮结束后删除。")
+                    for item in active["gameRuns"]:
+                        run = self.store.get_game_run(item["runId"])
+                        if (run["game_id"], run.get("account_id", "default")) in removed:
+                            raise ManagerConflict("账号任务尚未退出，请等待执行结束后删除。")
                 definitions = {item.todo_definition_id: item for item in self.list_todo_definitions()}
                 for account in validated_patch["game_accounts"].get("WW", []):
                     selection = account.get("daily_todo_selection")
@@ -11749,6 +11943,7 @@ class ManagerService:
                         "raw": True,
                         "contentType": "image/png",
                         "gameId": str(game_id),
+                        "accountId": capture_run.get("account_id", DEFAULT_ACCOUNT_ID),
                         "runId": capture_run_id,
                         "runAttemptId": run_attempt["run_attempt_id"],
                         "gameDayKey": self._run_game_day_key(
@@ -11785,6 +11980,7 @@ class ManagerService:
                         "artifactId": artifact_id,
                         "capturedAt": captured_at.isoformat(),
                         "sceneCode": "unreviewed-game-window",
+                        "accountId": capture_run.get("account_id", DEFAULT_ACCOUNT_ID),
                     },
                 )
                 result = {
@@ -11932,6 +12128,8 @@ class ManagerService:
                             state="cancelling",
                             result={
                                 "cancelReason": "user_cancelled",
+                                "cancelRequestReason": str(request.get("reason", "operator-request")),
+                                "cancelRequestedBy": str(request.get("requestedBy", "operator")),
                                 "cancelPhase": (
                                     "game-launch"
                                     if self._is_pre_adapter_launch_attempt(

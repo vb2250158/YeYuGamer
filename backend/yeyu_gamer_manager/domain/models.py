@@ -3,7 +3,7 @@ from __future__ import annotations
 import ntpath
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_core import PydanticCustomError
@@ -13,6 +13,7 @@ from .completion_contract import (
     CompletionContractDecision,
     StrictMetricValue,
 )
+from .fgo_maafgo_task_options import validate_task_options
 
 
 def utc_now() -> datetime:
@@ -426,9 +427,18 @@ class NotificationDeliveryRecord(ApiModel):
     channel: Literal["email"] = "email"
     recipient_binding_id: str
     message_id: str
-    state: Literal["draft", "sending", "sent", "failed"]
+    # ``superseded`` retires a held game-day report that a later seal of the
+    # same day replaced; it is outside every dispatchable state.
+    state: Literal["draft", "sending", "sent", "failed", "superseded"]
     dispatch_gate: Literal[
-        "automatic", "disabled", "secret_missing", "manual_review", "stale_batch"
+        "automatic",
+        "disabled",
+        "secret_missing",
+        "manual_review",
+        "stale_batch",
+        # A day report is held until its game day is final, so that one retry
+        # round cannot mail an alarm that the next round contradicts.
+        "game_day_pending",
     ]
     outcome: Literal["completed", "blocked"]
     subject: str
@@ -541,9 +551,11 @@ class AdapterEventRecord(ApiModel):
     sequence: int = Field(ge=0)
     event_type: Literal[
         "hello",
+        "run_progress",
         "todo_attempt_started",
         "todo_progress",
         "artifact_staged",
+        "run_artifact_staged",
         "todo_terminal",
         "run_terminal",
     ]
@@ -569,6 +581,7 @@ class NotificationPolicyRecord(ApiModel):
     automatic_dispatch: bool
     channel: Literal["email"] = "email"
     recipient_binding_id: str
+    report_scope: Literal["batch", "game_day"] = "game_day"
     secret_state: Literal["configured", "missing", "invalid"]
     updated_by: str
     created_at: datetime
@@ -597,6 +610,7 @@ class TodoDefinitionRecord(ApiModel):
     category: str
     order_index: int
     required: bool
+    key_step: bool = False
     risk: Literal[
         "observe_only", "routine_action", "approval_required", "forbidden"
     ]
@@ -649,6 +663,7 @@ class TodoInstanceRecord(ApiModel):
     category: str
     order_index: int
     required: bool
+    key_step: bool = False
     risk: Literal[
         "observe_only", "routine_action", "approval_required", "forbidden"
     ]
@@ -726,7 +741,7 @@ class GameIntegrationParameterRecord(ApiModel):
     label: str = Field(min_length=1, max_length=120)
     value_type: Literal["enum", "integer", "boolean", "notice"]
     dispatch_status: Literal["active", "requires_adapter"]
-    options: list[str] = Field(default_factory=list, max_length=24)
+    options: list[str] = Field(default_factory=list, max_length=64)
     minimum: int | None = None
     maximum: int | None = None
     note: str = Field(default="", max_length=500)
@@ -875,6 +890,7 @@ class SnapshotResponse(ApiModel):
     counters: dict[str, int]
     todo: dict[str, Any] = Field(default_factory=dict)
     execution_control: dict[str, Any] = Field(default_factory=dict)
+    account_execution_availability: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ConfigResponse(ApiModel):
@@ -1193,12 +1209,20 @@ class PGRMfwProfileConfig(ApiModel):
     )
 
 
-class OKWWProfileConfig(ApiModel):
-    """Safe, Manager-owned subset of OK-WW DailyTask intent.
+OKWWAdditionalTask = Literal[
+    "Check Weekly Garden",
+    "Auto Farm all Nightmare Nest",
+    "Merge Echo If discarded > 1000",
+    "Teleport and Farm 4C Echo",
+]
 
-    Weekly garden, inventory mutation, echo farming after the daily, and
-    tool-exit policy are deliberately absent. The runner always projects
-    those upstream switches to their safe values.
+
+class OKWWProfileConfig(ApiModel):
+    """Official OK-WW DailyTask configuration keys owned by Manager.
+
+    These are the DailyTask.json fields the official GUI already exposes.
+    Unmapped upstream keys keep their saved file bytes for the run restore.
+    Tool-exit policy belongs to the queue lifecycle rather than this profile.
     """
 
     which_to_farm: Literal[
@@ -1212,6 +1236,17 @@ class OKWWProfileConfig(ApiModel):
         "Resonator EXP", "Weapon EXP", "Shell Credit"
     ] = "Shell Credit"
     farm_nightmare_nest_for_daily_echo: bool = True
+    additional_tasks: list[OKWWAdditionalTask] = Field(default_factory=list)
+
+    @field_validator("additional_tasks")
+    @classmethod
+    def additional_tasks_are_unique(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise PydanticCustomError(
+                "ok_ww_additional_tasks_duplicate",
+                "Official additional tasks cannot be repeated",
+            )
+        return value
 
 
 EndfieldStaminaStage = Literal[
@@ -1244,35 +1279,75 @@ EndfieldStaminaStage = Literal[
 
 
 class EndfieldProfileConfig(ApiModel):
-    """Manager-owned Endfield daily-intent draft, not an upstream file patch.
-
-    The current tool has not been promoted to a selected-stage Adapter.  This
-    model intentionally preserves the user's exact target for that promotion
-    while refusing medicine, continued runs, trade, stores, and crafting.
-    """
+    """Official Endfield daily settings; the tool owns rotation semantics."""
 
     stamina_stage: EndfieldStaminaStage = "超距辉映管"
     reward_tier: Literal["保持当前", "低阶", "高阶"] = "保持当前"
     stamina_rotation_start_date: str = Field(
         default="2026-04-06", pattern=r"^\d{4}-\d{2}-\d{2}$"
     )
-    stamina_rotation: list[EndfieldStaminaStage] = Field(
-        default_factory=lambda: ["超距辉映管"], min_length=1, max_length=31
-    )
+    stamina_rotation: list[str] = Field(default_factory=list, max_length=31)
     team_slot: Literal["不换队伍", "1", "2", "3", "4", "5"] = "不换队伍"
+
+    @field_validator("stamina_rotation")
+    @classmethod
+    def validate_rotation(cls, value: list[str]) -> list[str]:
+        allowed = set(get_args(EndfieldStaminaStage)) | {
+            stage + tier for stage in ("干员经验", "干员进阶", "技能提升", "武器进阶")
+            for tier in ("低阶", "高阶")
+        }
+        if any(entry not in allowed for entry in value):
+            raise ValueError("staminaRotation contains an unsupported official stage")
+        return value
+
+    @field_validator("stamina_rotation_start_date")
+    @classmethod
+    def validate_rotation_date(cls, value: str) -> str:
+        datetime.strptime(value, "%Y-%m-%d")
+        return value
+
+
+Gf2StaminaStage = Literal["军备解析", "深度搜索", "决策构象", "定向"]
+
+
+class Gf2ProfileConfig(ApiModel):
+    """Official GF2 parameters; null leaves the tool's saved value intact."""
+
+    auto_battle_confirmed: bool | None = Field(default=None, strict=True)
+    stamina_stage: Gf2StaminaStage | None = None
+    extra_credit_battle: bool | None = Field(default=None, strict=True)
+    autonomous_loop: bool | None = Field(default=None, strict=True)
+    squad_dust: bool | None = Field(default=None, strict=True)
+    event_stage_name: str | None = Field(default=None, max_length=128)
+    drink_durations: str | None = Field(default=None, max_length=64)
+    meal_duration: str | None = Field(default=None, max_length=64)
 
 
 class NTEProfileConfig(ApiModel):
     """Manager-owned NTE daily-intent draft; no upstream config file is edited."""
 
+    stamina_task: Literal["异象界域", "异象追猎"] = "异象界域"
+    anomaly_hunter_target: Literal[
+        "音霸魔王", "无首铁驭", "塞润尼缇", "黑之书", "海囚", "围巢鸟", "斑蝶"
+    ] = "音霸魔王"
     anomaly_task_type: Literal[
         "经验与甲硬币", "异能升级材料", "弧盘突破材料", "空幕"
     ] = "经验与甲硬币"
     exp_reward_target: Literal["角色经验", "弧盘经验", "甲硬币"] = "甲硬币"
     material_index: int = Field(default=1, ge=1, le=6)
-    stamina_target: int = Field(default=200, ge=40, le=360, multiple_of=40)
+    stamina_target: int = Field(default=200, ge=1, le=360)
     auto_cycle_sub_task: bool = False
-    coffee_mode: Literal["不执行", "领取/补货", "完整自动化"] = "不执行"
+    coffee_mode: Literal["不执行", "仅领取收益", "领取/补货", "完整自动化"] = "不执行"
+    coffee_collect_income: bool = True
+    coffee_restock_goods: bool = False
+    coffee_buy_goods: bool = False
+    coffee_optimize_products: bool = False
+    coffee_restock_duration: Literal["auto", "2小时", "4小时", "8小时", "24小时"] = "auto"
+    coffee_product_slots: Literal["auto", "1", "2", "3", "4", "5"] = "auto"
+    coffee_price_table: Literal["auto", "disabled"] = "auto"
+    cinema_date_target: str = Field(default="", max_length=120)
+    fountain_mode: Literal["签到", "捞币"] = "签到"
+    furniture_challenge_mammon: bool = False
 
 
 class CZNProfileConfig(ApiModel):
@@ -1314,6 +1389,38 @@ class CZNProfileConfig(ApiModel):
         return self
 
 
+class FGOProfileConfig(ApiModel):
+    """Official MaaFgo task options; device ownership stays with Manager."""
+
+    resource_name: str = Field(min_length=1, max_length=160)
+    task_options: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+    @field_validator("task_options")
+    @classmethod
+    def official_daily_tasks_only(cls, value: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        return validate_task_options(value)
+
+
+class StarRailPowerPlanEntry(ApiModel):
+    instance_type: Literal["拟造花萼（金）", "拟造花萼（赤）", "凝滞虚影", "侵蚀隧洞", "历战余响", "饰品提取"]
+    instance_name: str = Field(min_length=1, max_length=160)
+    planned_attempts: int = Field(ge=1)
+
+    @field_validator("instance_name")
+    @classmethod
+    def validate_instance_name(cls, value: str) -> str:
+        if not value.strip() or value == "无" or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value):
+            raise ValueError("instanceName must name an existing official instance")
+        return value
+
+
+class StarRailProfileConfig(ApiModel):
+    """Official March7th power plan; null retains the tool's saved value."""
+
+    power_plan: list[StarRailPowerPlanEntry] | None = Field(default=None, max_length=64)
+    existing_team_preset: int | None = Field(default=None, ge=0, le=4)
+
+
 class DailyToolProfilesConfig(ApiModel):
     """Per-tool daily intent owned by Manager and shared by WebGUI/API callers."""
 
@@ -1321,8 +1428,11 @@ class DailyToolProfilesConfig(ApiModel):
     pgr_mfw: PGRMfwProfileConfig | None = None
     ok_ww: OKWWProfileConfig | None = None
     endfield: EndfieldProfileConfig | None = None
+    gf2: Gf2ProfileConfig | None = None
     nte: NTEProfileConfig | None = None
     czn: CZNProfileConfig | None = None
+    fgo: FGOProfileConfig | None = None
+    star_rail: StarRailProfileConfig | None = None
 
 
 class GameAccountConfig(ApiModel):
@@ -1366,6 +1476,7 @@ class ConfigPatchRequest(ApiModel):
 
 class TodoTransitionRequest(ApiModel):
     status: TodoStatus
+    release_technical_blocker: bool = False
     reason: str = Field(default="", max_length=2000)
     evidence_refs: list[str] = Field(default_factory=list, max_length=100)
     run_id: str | None = Field(default=None, max_length=160)
@@ -1399,6 +1510,11 @@ class TodoReconcileRequest(ApiModel):
 class NotificationPolicyPatchRequest(ApiModel):
     enabled: bool | None = None
     automatic_dispatch: bool | None = None
+    # `batch` keeps the legacy per-round report; `game_day` reports the whole
+    # game day once and is the default because per-round mails described each
+    # retry round as a fresh failure while games accepted earlier that day fell
+    # back to "待验收".
+    report_scope: Literal["batch", "game_day"] | None = None
     recipient_binding_id: str | None = Field(
         default=None,
         min_length=1,

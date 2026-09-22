@@ -1,6 +1,6 @@
 export type JsonObject = Record<string, unknown>
 export type CommandState = 'accepted' | 'running' | 'succeeded' | 'rejected' | 'failed' | 'unknown'
-export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'offline' | 'mock'
+export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'offline' | 'unauthorized' | 'mock'
 export type TodoCadence = 'daily' | 'weekly'
 export type TodoStatus = 'pending' | 'in_progress' | 'completed' | 'skipped' | 'blocked' | 'review_required' | 'human_required'
 export type TodoRisk = 'observe_only' | 'routine_action' | 'approval_required' | 'forbidden'
@@ -62,12 +62,19 @@ export interface GamePathConfig {
 }
 
 /** Config uses snake_case; newly added rows receive their identity from Manager. */
+export type OKWWAdditionalTask =
+  | 'Check Weekly Garden'
+  | 'Auto Farm all Nightmare Nest'
+  | 'Merge Echo If discarded > 1000'
+  | 'Teleport and Farm 4C Echo'
+
 export interface OKWWProfile {
   whichToFarm: 'Tacet Suppression' | 'Forgery Challenge' | 'Simulation Challenge'
   tacetSuppressionNumber: number
   forgeryChallengeNumber: number
   materialSelection: 'Resonator EXP' | 'Weapon EXP' | 'Shell Credit'
   farmNightmareNestForDailyEcho: boolean
+  additionalTasks: OKWWAdditionalTask[]
 }
 
 export interface GameAccount {
@@ -205,6 +212,7 @@ export interface TodoDefinition {
   category: string
   orderIndex: number
   required: boolean
+  keyStep?: boolean
   risk: TodoRisk
   automationDifficulty: TodoDifficulty
   adapterCapabilityRef?: string | null
@@ -234,6 +242,7 @@ export interface TodoInstance {
   category: string
   orderIndex: number
   required: boolean
+  keyStep?: boolean
   risk: TodoRisk
   automationDifficulty: TodoDifficulty
   adapterCapabilityRef?: string | null
@@ -769,8 +778,19 @@ export interface ManagerSnapshot {
   counters?: Record<string, number>
   todo?: TodoOverview
   executionControl?: ExecutionControlSummary
+  accountExecutionAvailability?: AccountExecutionAvailability[]
   notifications?: NotificationDelivery[]
   [key: string]: unknown
+}
+
+export interface AccountExecutionAvailability {
+  targetId: string
+  gameId: string
+  accountId: string
+  executable: boolean
+  mode: string
+  reasonCode?: string
+  reason?: string
 }
 
 export interface ManagerEvent<T = JsonObject> {
@@ -1057,8 +1077,16 @@ export interface RepairSessionDocument extends JsonObject {
 export type RepairSession = ManagerResource<RepairSessionDocument>
 export type RepairVerificationVerdict = 'passed' | 'failed' | 'needs_more_evidence'
 
-export type NotificationDeliveryState = 'draft' | 'sending' | 'sent' | 'failed'
-export type NotificationDispatchGate = 'automatic' | 'disabled' | 'secret_missing' | 'manual_review'
+export type NotificationDeliveryState = 'draft' | 'sending' | 'sent' | 'failed' | 'superseded'
+export type NotificationDispatchGate =
+  | 'automatic'
+  | 'disabled'
+  | 'secret_missing'
+  | 'manual_review'
+  | 'stale_batch'
+  // A game-day report is held until its game day is final, so one retry round
+  // cannot mail an alarm that the next round contradicts.
+  | 'game_day_pending'
 export type NotificationOutcome = 'completed' | 'blocked'
 export type NotificationAttemptState = 'sending' | 'sent' | 'failed'
 export type NotificationAttemptOutcome = 'sent' | 'transient_failure' | 'permanent_failure' | 'ambiguous'
@@ -1117,6 +1145,9 @@ export interface NotificationPolicy {
   automaticDispatch: boolean
   channel: 'email'
   recipientBindingId: string
+  // `game_day` = one report per game day (default); `batch` = the legacy
+  // per-round report.
+  reportScope: 'batch' | 'game_day'
   secretState: NotificationSecretState
   updatedBy: string
   createdAt: string

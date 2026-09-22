@@ -8,7 +8,11 @@ from .secrets import (
     NotificationSecretMissing,
     SmtpProfile,
 )
-from .template import RenderedBatchNotification, render_batch_notification
+from .template import (
+    RenderedBatchNotification,
+    render_batch_notification,
+    render_game_day_notification,
+)
 from .transport import (
     FakeNotificationTransport,
     NotificationAttachment,
@@ -31,4 +35,5 @@ __all__ = [
     "SmtpNotificationTransport",
     "SmtpProfile",
     "render_batch_notification",
+    "render_game_day_notification",
 ]

@@ -9,10 +9,11 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html import escape
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from ..account_scopes import DEFAULT_ACCOUNT_ID, account_target_id
-from .screenshots import REWARD_KINDS, is_reward_capture
+from ..completion_contract import UPSTREAM_RESULT_POLICY_ID
+from .screenshots import REWARD_KINDS, has_declared_daily_reward, is_reward_capture
 
 _STATUS_LABELS = {
     "completed": "已完成", "skipped": "已跳过", "blocked": "受阻",
@@ -226,6 +227,122 @@ def _document(title: str, summary: str, day: str, sections: list[str], footer: s
     )
 
 
+# Day-scoped labels.  A game-day report answers "what is the state of today",
+# so a game that finished in an earlier round must keep reading "已完成" instead
+# of the per-round wording ("本轮未执行").
+_DAY_BADGES = {
+    "accepted": ("已完成", "#18704a"),
+    "human": ("需人工处理", "#97551c"),
+    "failed": ("执行失败", "#ac3939"),
+    "review": ("待验收", "#97551c"),
+    "running": ("进行中", "#516477"),
+    "notstarted": ("未执行", "#697585"),
+}
+
+
+def _day_badge(entry: Mapping[str, Any]) -> str:
+    acceptance = _text(entry.get("acceptanceState"))
+    runtime = _text(entry.get("runtimeState"))
+    if acceptance == "accepted_done":
+        return "accepted"
+    if runtime == "human_required":
+        return "human"
+    if runtime == "failed":
+        return "failed"
+    if runtime in {"running", "executing", "verifying"} or acceptance == "in_progress":
+        return "running"
+    if runtime in {"unknown", "planned", "not_started", ""} and acceptance == "not_started":
+        return "notstarted"
+    return "review"
+
+
+def render_game_day_notification(*, game_day: str, entries: Sequence[Mapping[str, Any]],
+                                 account_scope: str = "") -> RenderedBatchNotification:
+    """One report for a whole game day, built from the day's final state.
+
+    The batch renderer answers "what happened in this round", which is why a
+    retry round could report ``已验收 0/7`` while most games were already
+    accepted earlier the same day.  This renderer answers "where did today end
+    up" and is therefore safe to send once per game day.
+    """
+
+    if not game_day.strip():
+        raise ValueError("gameDay is required")
+    ordered = sorted(
+        (entry for entry in entries if isinstance(entry, Mapping)),
+        key=lambda entry: _integer(entry.get("orderIndex"), 10_000),
+    )
+    if not ordered:
+        raise ValueError("a game-day report requires at least one game")
+    match = _DATE_PATTERN.search(game_day)
+    day = match.group(1) if match else game_day
+    badges = {id(entry): _day_badge(entry) for entry in ordered}
+    accepted = sum(badge == "accepted" for badge in badges.values())
+    total = len(ordered)
+    outcome = "completed" if accepted == total else "blocked"
+    scope = f"{total} 款游戏" + (f" · {account_scope}" if account_scope else "")
+    summary_line = f"{scope} · 已完成 {accepted}/{total}"
+    if accepted != total:
+        summary_line += f" · 待处理 {total - accepted}"
+    title = "每日全部完成" if outcome == "completed" else "每日结果 · 有未完成项"
+    subject = (
+        f"夜雨 Gamer 每日 {day} · "
+        + (f"全部完成 · {accepted}/{total}" if outcome == "completed"
+           else f"已完成 {accepted}/{total} · 待处理 {total - accepted}")
+    )
+    text_lines = [subject, summary_line, ""]
+    sections, report_sections = [], []
+    for entry in ordered:
+        name = _text(entry.get("displayName"), _text(entry.get("gameId"), "未命名游戏"))
+        label = _text(entry.get("accountLabel"))
+        if label and label != "当前账号":
+            name += f" · {label}"
+        badge = badges[id(entry)]
+        label_text, color = _DAY_BADGES[badge]
+        completed = _integer(entry.get("requiredCompleted"))
+        required = _integer(entry.get("requiredTotal"))
+        done_titles = [
+            value
+            for value in (entry.get("doneTitles") or [])
+            if isinstance(value, str) and value
+        ]
+        done_line = "已完成：" + ("、".join(done_titles) if done_titles else "暂无")
+        attention = _text(entry.get("attention"))
+        content = (
+            '<table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr><td>'
+            f'<h2 style="margin:0;font-size:17px;line-height:1.5">{escape(name)}</h2></td>'
+            f'<td align="right" style="color:{color};font-size:13px;white-space:nowrap;padding-left:10px">{label_text}</td></tr></table>'
+            f'<p {_P}>{escape(done_line)}</p>'
+            f'<p style="margin:4px 0;color:#697585;font-size:12px">必做事项 {completed}/{required}</p>'
+            + (f'<p style="margin:6px 0;color:{color};font-size:13px;line-height:1.6">{escape(attention)}</p>' if attention else "")
+        )
+        start, end = '<tr><td class="pad" style="padding:16px 24px;border-bottom:1px solid #e6eaf0">', '</td></tr>'
+        sections.append(start + content + end)
+        detail = (f'<p {_P}>验收状态：{escape(_text(entry.get("acceptanceState"), "未知"))}'
+                  f'　运行状态：{escape(_text(entry.get("runtimeState"), "未知"))}</p>')
+        report_sections.append(start + content + detail + end)
+        text_lines.extend([f"{name} · {label_text}", done_line, f"必做事项 {completed}/{required}"])
+        if attention:
+            text_lines.append(attention)
+        text_lines.append("")
+    footer = (
+        "本报告按游戏日汇总，一天一封，使用当天的最终结果；不再按重试轮次单独发送。"
+    )
+    text_lines.append("本报告按游戏日汇总，一天一封，不再按重试轮次单独发送。")
+    text_lines.append("完整证据截图与逐项记录保留在本机，请在运行 YeYu Gamer 的电脑上打开“证据”页。")
+    report_footer = (
+        '<details><summary style="cursor:pointer">报告说明</summary>'
+        f'<p>范围：{escape(game_day)}</p>'
+        '<p>本报告汇总当天全部启用游戏的最终状态，跨批次累计；每项数值来自 Manager 的完成度与验收投影。'
+        '证据截图完整保留在本机，请打开 <a href="http://127.0.0.1:8877/evidence">证据页</a> 查看。</p></details>'
+    )
+    return RenderedBatchNotification(
+        outcome=outcome, subject=subject, text_body="\n".join(text_lines),
+        html_body=_document(title, summary_line, day, sections, footer),
+        report_html=_document(title, summary_line, day, report_sections, report_footer),
+    )
+
+
 def render_batch_notification(*, game_day: str, batch_id: str, seal_version: int,
                               sealed_result: Mapping[str, Any]) -> RenderedBatchNotification:
     if not game_day.strip():
@@ -260,6 +377,10 @@ def render_batch_notification(*, game_day: str, batch_id: str, seal_version: int
         summary_line += f" · 需关注 {len(entries) - accepted_count}"
     title = "每日全部完成" if outcome == "completed" else "每日验收 · 有待处理"
     subject = f"夜雨 Gamer 每日 {day} · {'全部完成' if outcome == 'completed' else '完成受阻 / 待验收'} · 已验收 {accepted_count}/{len(entries)}"
+    integrations = _items(sealed_result.get("integrationResults"))
+    if any(item.get("status") in {"pending", "failed"} for item in integrations):
+        subject += " · 接入事项需处理"
+        title += " · 接入事项需处理"
     text_lines = [subject, summary_line, ""]
     sections, report_sections = [], []
     for target_id, document in entries:
@@ -285,13 +406,17 @@ def render_batch_notification(*, game_day: str, batch_id: str, seal_version: int
         main_frame = _reward_frame(frames, contract, game_id, instances)
         if main_frame:
             reviewed = badge == "accepted" and main_frame.get("artifactId") in contract.get("acceptedEvidenceRefs", [])
-            caption = "领取截图" + (" · 已验收" if reviewed else " · 待复核")
+            caption = ("领奖步骤截图" if contract.get("policyId") == UPSTREAM_RESULT_POLICY_ID
+                       else "领取截图" + (" · 已验收" if reviewed else " · 待复核"))
             captured = _beijing_time(main_frame.get("capturedAt"))
             if captured:
                 caption += f" · {captured} 北京时间"
             figure, screenshot_note = _figure(main_frame, caption), caption + "（见邮件图片）"
         else:
-            screenshot_note = "尚无领取截图" + ("；现场画面见附件。" if frames else "。")
+            if has_declared_daily_reward(game_id, instances):
+                screenshot_note = "尚无领取截图" + ("；现场画面见附件。" if frames else "。")
+            else:
+                screenshot_note = "本轮未登记独立领奖步骤；附图仅为运行过程场景，非领奖截图。" if frames else "本轮未登记独立领奖步骤，也未采集运行过程截图。"
             figure = f'<p style="margin:8px 0 0;color:#697585;font-size:12px">{escape(screenshot_note)}</p>'
         content = (
             '<table role="presentation" width="100%" cellspacing="0" cellpadding="0"><tr><td>'
@@ -308,6 +433,23 @@ def render_batch_notification(*, game_day: str, batch_id: str, seal_version: int
         if attention:
             text_lines.append(attention)
         text_lines.extend([screenshot_note, ""])
+        integration_lines = [
+            f"接入结果：{_text(item.get('operation'))} · "
+            f"{ {'completed': '已完成', 'pending': '待处理', 'failed': '失败'}.get(item.get('status'), '未知') } · "
+            f"{_text(item.get('message'))}；依据：{_text(item.get('trigger'))}；"
+            f"后续条件：{_text(item.get('waitingFor'))}；"
+            f"确认时间：{_text(item.get('confirmedAt'), '未记录')}；"
+            f"RunAttempt：{_text(item.get('runAttemptId'))} / {item.get('sequence')}"
+            f"；事件来源：{_text(item.get('source'), 'adapter-event')}"
+            for item in integrations if _target_id(item) == target_id
+        ]
+        if integration_lines:
+            row = '<tr><td class="pad" style="padding:12px 24px">' + ''.join(
+                f'<p {_P}>{escape(line)}</p>' for line in integration_lines
+            ) + '</td></tr>'
+            sections.append(row)
+            report_sections.append(row)
+            text_lines.extend(integration_lines + [""])
     if not entries:
         empty = '<tr><td class="pad" style="padding:16px 24px">本轮没有选中游戏。</td></tr>'
         sections.append(empty)
@@ -315,11 +457,14 @@ def render_batch_notification(*, game_day: str, batch_id: str, seal_version: int
         text_lines.append("本轮没有选中游戏。")
     footer = '详细事项、其他截图和诊断记录见附件 <strong>daily-report.html</strong>，下载后用浏览器打开可逐项展开。'
     text_lines.append("详细事项、其他截图和诊断记录见附件 daily-report.html（下载后用浏览器打开）。")
+    text_lines.append("完整原始日志由本机 Manager 保留；请在运行 YeYu Gamer 的电脑上打开“证据”页，按游戏与运行记录查看。")
     report_footer = (
         '<details><summary style="cursor:pointer">批次与证据说明</summary>'
         f'<p>Batch：{escape(batch_id)} · Seal：{seal_version} · 范围：{escape(game_day)}</p>'
-        '<p>Todo 打勾是逐项事实，不替代每日完成证据合同。本报告使用封口时冻结的事项与证据；'
-        '图片为邮件缩放副本，原图由本机 Manager 保留。发送重试不会重新运行游戏。</p></details>'
+        '<p>本报告使用封口时冻结的上游任务结果、步骤和证据；截图记录运行过程。'
+        '图片为邮件缩放副本，原图由本机 Manager 保留。发送重试不会重新运行游戏。</p>'
+        '<p>完整原始日志保留在本机，不在此附件中展开。请在运行 YeYu Gamer 的电脑上打开'
+        '<a href="http://127.0.0.1:8877/evidence">证据页</a>，按游戏与运行记录查看。</p></details>'
     )
     return RenderedBatchNotification(
         outcome=outcome, subject=subject, text_body="\n".join(text_lines),

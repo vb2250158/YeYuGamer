@@ -6,7 +6,7 @@ import re
 import sqlite3
 import threading
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, TypeVar
@@ -56,10 +56,10 @@ _TODO_TRANSITIONS: dict[str, frozenset[str]] = {
         {"skipped", "in_progress", "blocked", "review_required", "human_required"}
     ),
     "blocked": frozenset(
-        {"blocked", "in_progress", "skipped", "review_required", "human_required"}
+        {"pending", "blocked", "in_progress", "skipped", "review_required", "human_required"}
     ),
     "review_required": frozenset(
-        {"review_required", "in_progress", "skipped", "blocked", "human_required"}
+        {"pending", "review_required", "in_progress", "skipped", "blocked", "human_required"}
     ),
     # An operator gate is deliberately not executable. A separate, explicit
     # release/resume contract must move it to a safe state before a new attempt.
@@ -387,6 +387,7 @@ class SqliteStore:
                     category TEXT NOT NULL,
                     order_index INTEGER NOT NULL,
                     required INTEGER NOT NULL,
+                    key_step INTEGER NOT NULL DEFAULT 0,
                     risk TEXT NOT NULL,
                     automation_difficulty TEXT NOT NULL,
                     adapter_capability_ref TEXT,
@@ -696,6 +697,23 @@ class SqliteStore:
                 """
             )
             self._ensure_column("notification_deliveries", "report_html", "TEXT NOT NULL DEFAULT ''")
+            # ``report_scope`` decides what a mail reports: the round that just
+            # sealed (``batch``) or the whole game day (``game_day``).  Defaults
+            # to ``game_day`` so an operator never receives one alarming report
+            # per retry round; a round report is opt-in.
+            self._ensure_column(
+                "notification_policy",
+                "report_scope",
+                "TEXT NOT NULL DEFAULT 'game_day'",
+            )
+            # A game-day report is held until the day is final, so the row has
+            # to carry the day it reports on: that is the only way to find the
+            # held row again, and to keep at most one alert per day.
+            self._ensure_column(
+                "notification_deliveries",
+                "report_day",
+                "TEXT NOT NULL DEFAULT ''",
+            )
             self._ensure_column("batches", "mode", "TEXT NOT NULL DEFAULT 'plan'")
             self._ensure_column(
                 "work_items", "artifact_refs_json", "TEXT NOT NULL DEFAULT '[]'"
@@ -750,6 +768,9 @@ class SqliteStore:
                 "todo_definitions",
                 "source_hash",
                 "TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'",
+            )
+            self._ensure_column(
+                "todo_definitions", "key_step", "INTEGER NOT NULL DEFAULT 0"
             )
             self._ensure_column(
                 "run_attempts", "attempt_ordinal", "INTEGER NOT NULL DEFAULT 1"
@@ -942,8 +963,8 @@ class SqliteStore:
                 """
                 INSERT OR IGNORE INTO notification_policy(
                     policy_id, enabled, automatic_dispatch, channel,
-                    recipient_binding_id, updated_by, created_at, updated_at
-                ) VALUES ('default', 1, 1, 'email', 'self-email', 'manager-default', ?, ?)
+                    recipient_binding_id, report_scope, updated_by, created_at, updated_at
+                ) VALUES ('default', 1, 1, 'email', 'self-email', 'game_day', 'manager-default', ?, ?)
                 """,
                 (timestamp, timestamp),
             )
@@ -1811,6 +1832,8 @@ class SqliteStore:
     def _ensure_column(self, table: str, column: str, declaration: str) -> None:
         allowed = {
             ("notification_deliveries", "report_html"),
+            ("notification_deliveries", "report_day"),
+            ("notification_policy", "report_scope"),
             ("batches", "mode"),
             ("work_items", "artifact_refs_json"),
             ("work_items", "allowed_capability_refs_json"),
@@ -1828,6 +1851,7 @@ class SqliteStore:
             ("todo_definitions", "definition_version"),
             ("todo_definitions", "catalog_version"),
             ("todo_definitions", "source_hash"),
+            ("todo_definitions", "key_step"),
             ("run_attempts", "attempt_ordinal"),
             ("run_attempts", "cancel_authority_hash"),
             ("todo_blockers", "manager_id"),
@@ -2132,11 +2156,11 @@ class SqliteStore:
                     INSERT INTO todo_definitions(
                         todo_definition_id, definition_version, catalog_version,
                         source_hash, game_id, cadence, operation, title, category,
-                        order_index, required, risk,
+                        order_index, required, key_step, risk,
                         automation_difficulty, adapter_capability_ref,
                         automation_state, initial_status, initial_reason,
                         reset_rule_json, source_refs_json, active, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(todo_definition_id) DO UPDATE SET
                         definition_version = excluded.definition_version,
                         catalog_version = excluded.catalog_version,
@@ -2148,6 +2172,7 @@ class SqliteStore:
                         category = excluded.category,
                         order_index = excluded.order_index,
                         required = excluded.required,
+                        key_step = excluded.key_step,
                         risk = excluded.risk,
                         automation_difficulty = excluded.automation_difficulty,
                         adapter_capability_ref = excluded.adapter_capability_ref,
@@ -2171,6 +2196,7 @@ class SqliteStore:
                         record["category"],
                         int(record["order_index"]),
                         int(bool(record["required"])),
+                        int(bool(record.get("key_step", False))),
                         record["risk"],
                         record["automation_difficulty"],
                         record.get("adapter_capability_ref"),
@@ -2262,6 +2288,7 @@ class SqliteStore:
             "category": row["category"],
             "order_index": int(row["order_index"]),
             "required": bool(row["required"]),
+            "key_step": bool(row["key_step"]) if "key_step" in row.keys() else False,
             "risk": row["risk"],
             "automation_difficulty": row["automation_difficulty"],
             "adapter_capability_ref": row["adapter_capability_ref"],
@@ -2546,6 +2573,7 @@ class SqliteStore:
         cadence: str | None = None,
         period_key: str | None = None,
         status: str | None = None,
+        todo_instance_ids: set[str] | None = None,
         limit: int = 1000,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
@@ -2560,6 +2588,13 @@ class SqliteStore:
             if value is not None:
                 clauses.append(f"{column} = ?")
                 parameters.append(value)
+        if todo_instance_ids is not None:
+            if not todo_instance_ids:
+                return []
+            identifiers = sorted(todo_instance_ids)
+            placeholders = ",".join("?" for _ in identifiers)
+            clauses.append(f"ti.todo_instance_id IN ({placeholders})")
+            parameters.extend(identifiers)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         parameters.append(limit)
         with self._lock:
@@ -2613,6 +2648,7 @@ class SqliteStore:
             "category": definition.get("category", ""),
             "order_index": int(definition.get("order_index", 0)),
             "required": bool(definition.get("required", False)),
+            "key_step": bool(definition.get("key_step", False)),
             "risk": definition.get("risk", "approval_required"),
             "automation_difficulty": definition.get("automation_difficulty", "unknown"),
             "adapter_capability_ref": definition.get("adapter_capability_ref"),
@@ -3565,6 +3601,7 @@ class SqliteStore:
             "automatic_dispatch": bool(row["automatic_dispatch"]),
             "channel": row["channel"],
             "recipient_binding_id": row["recipient_binding_id"],
+            "report_scope": row["report_scope"],
             "updated_by": row["updated_by"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -3575,9 +3612,14 @@ class SqliteStore:
     ) -> dict[str, Any]:
         if not patch:
             raise ValueError("notification policy patch is empty")
-        allowed = {"enabled", "automatic_dispatch", "recipient_binding_id"}
+        allowed = {"enabled", "automatic_dispatch", "recipient_binding_id", "report_scope"}
         if not set(patch).issubset(allowed):
             raise ValueError("notification policy patch contains unsupported fields")
+        if "report_scope" in patch and str(patch["report_scope"]) not in {
+            "batch",
+            "game_day",
+        }:
+            raise ValueError("notification report scope is invalid")
         timestamp = _now()
         with self._write_scope():
             current = self.get_notification_policy()
@@ -3586,13 +3628,14 @@ class SqliteStore:
                 """
                 UPDATE notification_policy SET
                     enabled = ?, automatic_dispatch = ?, recipient_binding_id = ?,
-                    updated_by = ?, updated_at = ?
+                    report_scope = ?, updated_by = ?, updated_at = ?
                 WHERE policy_id = 'default'
                 """,
                 (
                     1 if updated["enabled"] else 0,
                     1 if updated["automatic_dispatch"] else 0,
                     updated["recipient_binding_id"],
+                    str(updated.get("report_scope") or "game_day"),
                     requested_by,
                     timestamp,
                 ),
@@ -3606,6 +3649,7 @@ class SqliteStore:
                     "enabled": record["enabled"],
                     "automaticDispatch": record["automatic_dispatch"],
                     "recipientBindingId": record["recipient_binding_id"],
+                    "reportScope": record.get("report_scope", "game_day"),
                     "requestedBy": requested_by,
                 },
             )
@@ -3660,6 +3704,7 @@ class SqliteStore:
         secret_state: str,
         timestamp: str,
         disposition: str = "",
+        hold: bool = False,
     ) -> tuple[str, str | None, str]:
         last_error_class = (
             "secret_invalid"
@@ -3677,6 +3722,13 @@ class SqliteStore:
             # phase) is history, not a round report.  Keep the draft for an
             # explicit send request; never dispatch it automatically.
             return "stale_batch", None, last_error_class
+        if hold:
+            # The game day this report describes is not final yet: its work is
+            # still running, so the same day would otherwise produce one
+            # alarming report per retry round.  The row keeps the newest
+            # day-scoped content and is released by the Manager once the day is
+            # final (all required work done) or the game day has rolled over.
+            return "game_day_pending", None, last_error_class
         if secret_state == "configured":
             return "automatic", timestamp, ""
         if secret_state == "invalid":
@@ -3758,7 +3810,11 @@ class SqliteStore:
         timestamp = _now()
         secret_state = str(draft.get("secret_state", "missing"))
         gate, next_attempt_at, last_error_class = self._notification_dispatch_fields(
-            policy, secret_state, timestamp, str(draft.get("dispatch_disposition", ""))
+            policy,
+            secret_state,
+            timestamp,
+            str(draft.get("dispatch_disposition", "")),
+            bool(draft.get("dispatch_hold")),
         )
         with self._write_scope():
             current = self.get_notification_delivery(notification_id)
@@ -3779,7 +3835,7 @@ class SqliteStore:
                 UPDATE notification_deliveries SET
                     state = 'draft', dispatch_gate = ?, outcome = ?, subject = ?,
                     text_body = ?, html_body = ?, report_html = ?, attachment_refs_json = ?,
-                    next_attempt_at = ?, last_error_class = ?, updated_at = ?
+                    next_attempt_at = ?, last_error_class = ?, report_day = ?, updated_at = ?
                 WHERE notification_id = ? AND attempt_count = 0
                   AND last_error_class IN ('render_pending', 'render_failed')
                 """,
@@ -3793,6 +3849,7 @@ class SqliteStore:
                     _json(attachment_refs),
                     next_attempt_at,
                     last_error_class,
+                    str(draft.get("report_day", "")),
                     timestamp,
                     notification_id,
                 ),
@@ -3866,7 +3923,11 @@ class SqliteStore:
         )
         secret_state = str(draft.get("secret_state", "missing"))
         gate, next_attempt_at, last_error_class = self._notification_dispatch_fields(
-            policy, secret_state, timestamp, str(draft.get("dispatch_disposition", ""))
+            policy,
+            secret_state,
+            timestamp,
+            str(draft.get("dispatch_disposition", "")),
+            bool(draft.get("dispatch_hold")),
         )
         self.connection.execute(
             """
@@ -3875,9 +3936,9 @@ class SqliteStore:
                 recipient_binding_id, message_id, state, dispatch_gate,
                 outcome, subject, text_body, html_body, report_html, attachment_refs_json,
                 attempt_count, next_attempt_at, lease_owner, lease_token,
-                lease_expires_at, last_error_class, sent_at, created_at, updated_at
+                lease_expires_at, last_error_class, sent_at, created_at, updated_at, report_day
             ) VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL,
-                      NULL, NULL, ?, NULL, ?, ?)
+                      NULL, NULL, ?, NULL, ?, ?, ?)
             ON CONFLICT(batch_id, seal_version, channel, recipient_binding_id) DO NOTHING
             """,
             (
@@ -3898,6 +3959,7 @@ class SqliteStore:
                 last_error_class,
                 timestamp,
                 timestamp,
+                str(draft.get("report_day", "")),
             ),
         )
         record = self.get_notification_delivery(notification_id)
@@ -3961,7 +4023,75 @@ class SqliteStore:
             "sent_at": row["sent_at"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "report_day": row["report_day"],
         }
+
+    def list_game_day_notifications(
+        self, report_day: str, *, channel: str, recipient_binding_id: str
+    ) -> list[dict[str, Any]]:
+        """Every delivery that reports on one game day, newest first.
+
+        The Manager uses this to keep a game day to one report: the newest row
+        becomes the day report, the older held rows are superseded, and an
+        already released row tells it that the day's alert has been spent.
+        """
+
+        with self._lock:
+            rows = self.connection.execute(
+                """
+                SELECT * FROM notification_deliveries
+                WHERE report_day = ? AND channel = ? AND recipient_binding_id = ?
+                ORDER BY created_at DESC, notification_id DESC
+                """,
+                (report_day, channel, recipient_binding_id),
+            ).fetchall()
+        return [self._notification_delivery(row) for row in rows]
+
+    def list_game_day_pending_notifications(self) -> list[dict[str, Any]]:
+        """Held game-day reports whose day may have become final since."""
+
+        with self._lock:
+            rows = self.connection.execute(
+                """
+                SELECT * FROM notification_deliveries
+                WHERE dispatch_gate = 'game_day_pending' AND report_day != ''
+                  AND state IN ('draft', 'failed')
+                ORDER BY report_day, created_at DESC, notification_id DESC
+                """
+            ).fetchall()
+        return [self._notification_delivery(row) for row in rows]
+
+    def supersede_game_day_notification(
+        self, notification_id: str, *, reason: str
+    ) -> dict[str, Any]:
+        """Retire a held day report that a newer one replaces.
+
+        ``state='superseded'`` is outside the dispatchable states, so the row
+        stays as an audit record while it can never be sent.
+        """
+
+        timestamp = _now()
+        with self._write_scope():
+            current = self.get_notification_delivery(notification_id)
+            if current["state"] in {"sent", "sending"}:
+                return current
+            if current["dispatch_gate"] != "game_day_pending":
+                return current
+            self.connection.execute(
+                """
+                UPDATE notification_deliveries SET state = 'superseded',
+                    updated_at = ? WHERE notification_id = ?
+                """,
+                (timestamp, notification_id),
+            )
+            record = self.get_notification_delivery(notification_id)
+            self.append_event(
+                "notification.gate.changed",
+                "notification",
+                notification_id,
+                {"state": "superseded", "reason": reason},
+            )
+        return record
 
     def list_notification_attempts(
         self, notification_id: str
@@ -6542,6 +6672,18 @@ class SqliteStore:
             ).fetchall()
         return [self._event(row) for row in rows]
 
+    def list_step_capture_failures(self, run_attempt_id: str) -> list[dict[str, Any]]:
+        """Read this attempt's recorded failures using the existing entity index."""
+        with self._lock:
+            rows = self.connection.execute(
+                """SELECT * FROM events
+                   WHERE entity_type = 'run-attempt' AND entity_id = ?
+                     AND event_type = 'todo-step-capture.failed'
+                   ORDER BY sequence""",
+                (run_attempt_id,),
+            ).fetchall()
+        return [self._event(row) for row in rows]
+
     def list_log_events(
         self,
         *,
@@ -6629,7 +6771,23 @@ class SqliteStore:
         return int(value)
 
     def active_execution_summary(self) -> dict[str, list[dict[str, str]]]:
-        """Return durable executions that make Manager shutdown unsafe."""
+        """Return durable executions that make Manager shutdown unsafe.
+
+        A ``queued`` game run is reported only while its Batch can still
+        dispatch it.  The Batch coordinator deliberately leaves later members
+        ``queued`` when a Batch waits at a human gate or for a typed resume, and
+        those parked members own no attempt, no controller lease and no Host
+        process, so a Manager stop/restart (and Adapter promotion, which shares
+        this guard) stays safe.  Counting them made a paused Batch block every
+        release forever: on 2026-09-22 the six parked members of the
+        ``review_required`` Batch ``bb1faa27`` held the lifecycle gate from
+        05:09 until they were cooperatively cancelled, while nothing was
+        actually running.
+
+        A ``queued`` run without any Batch membership stays reported: no
+        coordinator will park it, so the conservative answer is correct.
+        """
+
         active_states = ("pending_execution", "queued", "running", "cancelling")
         placeholders = ",".join("?" for _ in active_states)
         with self._lock:
@@ -6639,10 +6797,25 @@ class SqliteStore:
                 active_states,
             ).fetchall()
             runs = self.connection.execute(
-                f"SELECT run_id, state FROM game_runs WHERE state IN ({placeholders}) "
-                "ORDER BY created_at",
+                "SELECT run_id, state FROM game_runs WHERE state IN "
+                "('pending_execution', 'running', 'cancelling') "
+                "ORDER BY created_at"
+            ).fetchall()
+            queued = self.connection.execute(
+                "SELECT r.run_id, r.state, "
+                "  (SELECT COUNT(*) FROM batch_run_memberships m "
+                "   WHERE m.run_id = r.run_id) AS membership_count, "
+                "  (SELECT COUNT(*) FROM batch_run_memberships m JOIN batches b "
+                "   ON b.batch_id = m.batch_id WHERE m.run_id = r.run_id "
+                f"   AND b.state IN ({placeholders})) AS active_membership_count "
+                "FROM game_runs r WHERE r.state = 'queued' ORDER BY r.created_at",
                 active_states,
             ).fetchall()
+        parked_ids = {
+            str(row["run_id"])
+            for row in queued
+            if int(row["membership_count"]) and not int(row["active_membership_count"])
+        }
         return {
             "batches": [
                 {"batchId": str(row["batch_id"]), "state": str(row["state"])}
@@ -6651,6 +6824,11 @@ class SqliteStore:
             "gameRuns": [
                 {"runId": str(row["run_id"]), "state": str(row["state"])}
                 for row in runs
+            ]
+            + [
+                {"runId": str(row["run_id"]), "state": str(row["state"])}
+                for row in queued
+                if str(row["run_id"]) not in parked_ids
             ],
         }
 
@@ -6666,9 +6844,17 @@ class SqliteStore:
             "created_at": row["created_at"],
         }
 
-    def quick_check(self) -> str:
+    def read_check(self) -> str:
+        """Probe storage availability without scanning the event history."""
         with self._lock:
-            return str(self.connection.execute("PRAGMA quick_check").fetchone()[0])
+            self.connection.execute("SELECT key FROM metadata LIMIT 1").fetchone()
+        return "ok"
+
+    def quick_check(self) -> str:
+        """Inspect committed WAL state without holding the Manager writer lock."""
+        uri = self.path.resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=10)) as reader:
+            return str(reader.execute("PRAGMA quick_check").fetchone()[0])
 
     # Ledger rows that must survive retention because a later read depends on
     # their existence rather than on the latest projection.
@@ -6819,16 +7005,10 @@ class SqliteStore:
         with self._lock:
             games = self.list_games()
             batches = self.list_batches(20)
-            game_runs = self.list_game_runs(100)
-            work_items = self.list_work_items(100)
-            decisions = self.list_claim_decisions(100)
             latest_sequence = self.latest_event_sequence()
         return {
             "games": games,
             "batches": batches,
-            "game_runs": game_runs,
-            "work_items": work_items,
-            "decisions": decisions,
             "latest_event_sequence": latest_sequence,
         }
 
@@ -6902,6 +7082,19 @@ class SqliteStore:
                 WHERE resource_type = ? ORDER BY created_at DESC LIMIT ?
                 """,
                 (resource_type, limit),
+            ).fetchall()
+        return [self._resource(row) for row in rows]
+
+    def list_run_artifacts(self, *, run_id: str, run_attempt_id: str) -> list[dict[str, Any]]:
+        """Read one attempt's diagnostic artifacts without decoding other runs."""
+        with self._lock:
+            rows = self.connection.execute(
+                """SELECT * FROM manager_resources
+                WHERE resource_type = 'artifact'
+                  AND json_extract(document_json, '$.runId') = ?
+                  AND json_extract(document_json, '$.runAttemptId') = ?
+                ORDER BY created_at DESC""",
+                (run_id, run_attempt_id),
             ).fetchall()
         return [self._resource(row) for row in rows]
 

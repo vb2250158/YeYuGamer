@@ -191,6 +191,18 @@
   - **测试**：`backend/tests/test_todo_dispatch.py` 新增 4 项（可进入新批次 / active_blocker 变体 / 三种"别的原因不得自动重试" / `forbidden` 风险仍 deferred_forbidden）；**区分度验证过**（把 reasonCode 判据临时改坏 ⇒ 两条正向测试精确失败为 `deferred_review`，负向测试仍通过）；`backend/tests` 全量 pytest `PYTEST_EXIT=0`、`undef_check2.py TOTAL=0`。
   - **仍有残余**：NIKKE 当日 1/3，失败在上游工具自己的行为树（`run_nikke_gui.py` / "无法识别回到大厅"），属上游缺陷族，**不在本次修法覆盖范围内**（正确行为：如实 review_required，下一步查上游 WeGame/UIA 通路）。
 
+- ★★ **2026-09-23 00:xx 邮件机制改造：从"每轮一封"改为"每天一封、报当天结果"（已改 + 已补测试，本轮发布）**
+  - **现象（用户原话）**："改一下邮件的发送机制，不是发那一轮的，而是更新当天的结果。不然我看到一堆失败，有点可怕……"
+  - **机制缺陷（两重）**：① `notification_deliveries` 的唯一键是 `(batch_id, seal_version, channel, recipient_binding_id)` ⇒ **每个封口批次必然一封**；一天多次补批就多封。② 更要紧的是**算错**：批次报告的"已验收"只按**本轮** `completionContracts` 算，而验收是跨批次累计的 ⇒ 当天已经 `accepted_done` 的游戏在后续轮次的邮件里掉回"待验收／本轮未执行"（实测 00:26 那封仍写 `已验收 0/7 · 完成受阻`，而当天实际已有 4 个游戏 accepted）。**不是文案问题，是口径问题。**
+  - **修法**：新增按**游戏日**汇总的报告轨道（`notification_policy.report_scope`，默认 `game_day`；`batch` 保留旧的每轮报告）。
+    - 内容来自 `todo_overview()`（**与 WebGUI 同一份选择域投影**）+ `_game_projection`，所以邮件数字与界面一致；游戏日的键取启用游戏当前 daily `period_key`（04:00 边界），**不能**用 `Batch.result.gameDay` 的 scope fingerprint（它随冻结待办集变化，答不了"还是不是同一天"），也要**排除禁用游戏**（FGO/BD2/CZN 注册的是 00:00 窗口，会把报告日提前 4 小时）。
+    - **不再自动携带截图附件**：证据字节靠单一不可变 seal 校验，跨批次的日报无法忠实携带；正文改为指向本机证据页。
+    - **一天最多一封**：`dispatch_hold` ⇒ 新门 `game_day_pending`（不在可派发状态内）。释放时机只有两个——**当天必做全部完成且无活动执行**（`all_required_completed`）、或**游戏日已滚过 04:00**（`game_day_rolled_over`，当天做到哪儿算哪儿）。同一游戏日的多封 held 行只留最新一封，其余 `state='superseded'`。
+    - **`human_required` 故意不作为终态**：否则第一次抛门就发一封"需人工处理"，门放掉、当天跑完后又会发一封自相矛盾的。日报里该游戏带"需人工处理"徽标，要立刻处理的操作员在 WebGUI 直接看得到。
+    - 释放按钮在 Manager 周期 tick（`_completion_review_watchdog_loop`，60s）上，所以**不依赖"当天还有没有新批次封口"**；日界兜底也走它。
+  - **测试**：`backend/tests/test_notification_game_day_report.py` 18 项（模板口径 / 策略默认与校验 / 终态判据 / held-不发 / 当日只发一封 / 已报告日不再发 / 未到达的日子绝不发 / 两个 scope 分流）；**两道重复守卫各自做了区分度验证**（破坏 rollover 守卫 ⇒ `test_a_day_that_already_reported_is_not_mailed_again` 精确失败；破坏 final 守卫 ⇒ `test_a_late_seal_of_an_already_reported_day_is_retired_too` 精确失败）。
+  - **残余（如实记）**：某天若**一个批次都没封口**（例如整天卡在未释放的人工门），就不存在该日的报告行 ⇒ 那天没有日报（比多报更安全，但不完美）；`report_scope` 目前只有 API（`PATCH /api/v1/notification-policy` 带 `reportScope`），WebGUI 尚未加开关。
+
 ## 8. 结束报告
 
-结束报告列出：范围与逐项结果、承接与本轮执行的区别、更新前后版本、根因及关键证据、YeYu commit/上游 PR、实际验证范围、残余阻塞及恢复点、客户端清理和整轮报告状态。原始日志保留本机，外发只用已审查的脱敏材料。整轮邮件按已有配置和授权发送，SMTP 受理不冒充送达。
+结束报告列出：范围与逐项结果、承接与本轮执行的区别、更新前后版本、根因及关键证据、YeYu commit/上游 PR、实际验证范围、残余阻塞及恢复点、客户端清理和报告状态。原始日志保留本机，外发只用已审查的脱敏材料。邮件按 `notification_policy.report_scope` 发送：默认 `game_day` = **一个游戏日一封、只报当天的最终结果**（不再按重试轮次逐轮发送）；`batch` = 旧的每轮报告。SMTP 受理不冒充送达。
