@@ -17,6 +17,7 @@ PY=C:/Users/Admin/.workbuddy/binaries/python/versions/3.13.12/python.exe
 | `hb-pids.py "<正则>"` | 按映像名报 pid / ppid / 启动时间 / 存活：`LIVE` 或 `exit=<退出码>`（`<非259>` = 已退出但仍被枚举的残留条目）。 |
 | `hb-probe.py <pid...>` | **判定"残留条目 vs 真的卡住"**：分别用 `QUERY_LIMITED_INFORMATION` / `SYNCHRONIZE` / `TERMINATE` 三种权限 `OpenProcess`，报 `GetExitCodeProcess`、`WaitForSingleObject`、`GetProcessTimes`（含 exitTime）、真实线程数。 |
 | `hb-mutex.py <probe\|threads\|reap>` | `probe <名字...>`：只读判断某个命名互斥体是否仍被持有（`CreateMutexW` + `ERROR_ALREADY_EXISTS`）——**遇到"客户端秒退/不建窗口"先跑这个**；`threads <pid...>` 列线程；`reap <pid...>` 从外部 `TerminateThread`（**实测对卡住的游戏客户端无效**，保留作诊断）。 |
+| `hb-adapters.py <status\|repair\|promote>` | **执行包晋级检查/自愈**。`status`：只读列出每个 `game-modules/<game>` 的 `promotion.status`/`executionReady`/receipt，**已启用却没有执行授权的游戏报警并以退出码 3 结束**——2026-09-23 StarRail 整天 0/4 就是这么被发现的（`Install-*Adapter.ps1` 只装未晋级的 candidate，发布脚本下一步才晋级；发布被中途杀掉就留下一个没有执行授权的模块，而规划器只会**静默 defer 那个游戏**）。`repair [--json]`：只对"已装候选 + 磁盘候选证据与安装载荷逐字段绑定（`payloadDigest`/`buildId`/`packageVersion`/`supportedGameIds`）"的包，用 Manager 自己的晋级接口补上那一步；**`DailySupervisor` 每个空闲 tick 自动调用它**（脚本跑源码树，无需发布）。`promote <GameId> [--wait-seconds N]`：单次手工用；带 `--wait-seconds` 时会写 `release-pending.flag` 认领空闲窗口（否则 5 分钟 supervisor 会把窗口全抢走），并在**所有退出路径**删掉该标志。退出码 0 正常 / 3 需要修复但执行在飞 / 4 不可修复（证据缺失或不匹配，**会大声记日志**）。 |
 | `hb-kill.py <pid...>` | 用 `PROCESS_TERMINATE` 句柄调 `TerminateProcess` 并报真实 Win32 错误码。**残留游戏进程实测恒为 `err=5`**（= `STATUS_PROCESS_IS_TERMINATING`），即用户态杀不掉。 |
 | `hb-parent.py <pid...>` | 报这些 pid 是否还活着、是什么进程。 |
 | `hb-procs.py` | 进程清单（带窗口/内存的粗略视图）。 |

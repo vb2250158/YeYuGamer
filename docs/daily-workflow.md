@@ -284,6 +284,19 @@
   - **两个候选修法（都不本轮改，等用户定口径；改错等于伪造成功）**：① **同轮共选** —— 规划期把入口待办和一个"当天已完成"的 app 放进同一 run 取标记（要动 Manager 的运行范围与 `todo_overview` 契约，且已完成 app 的事件会落到冻结范围之外的待办上，风险大）；② **同日证据归属** —— 同游戏日已观测到的"大世界"标记允许为入口待办背书（要新增一份可审计的跨 run 证据记录）。**在口径确定前，签到概率为 0 是"设计如此"，不是编排 bug**（`docs/daily-workflow.md` 本节 09-23 条目）。
   - **顺带发现（本轮已用，建议固化为常用手段）**：`POST /api/v1/batches` 的 `BatchCreateRequest` **支持 `gameIds`**（camelCase），所以"单游戏诊断"**不需要临时关别的游戏**：`{"kind":"daily","mode":"execute","gameIds":["ZZZ"],"requestedBy":"cli"}` + `If-Match`/`Idempotency-Key`/`X-Expected-State-Version` 即可，批次 `a3561463` 的 `gameIds` 实测就是 `['ZZZ']`，收尾 `blocked`、无人工门、队列回空闲。比"改 `enabled` 再恢复"更安全（不动配置、不需要恢复步骤）。
 
+- ★★ **2026-09-23 04:4x：「发布被中途杀掉」会把某个已启用游戏的适配器留在"已装未晋级"状态，于是那个游戏整天 0 项、而且毫无提示**（**已修：主管自动修复 + 新工具；见下**）
+  - **现象**：09-23 游戏日 04:04 规划出的批次 `c118c3df` 有 7 个 `gameIds`，实际只生成 **6 个 run 成员**；`StarRail` 整天 `req=0/4`、`runtime=planned`、`nextAction` 为空，**没有任何 run、没有 blocker、没有 `review_required`**。批次 `result` 里直接写着 `deferredGameIds: ["StarRail"]`。
+  - **机制（已追到最底层）**：`GET /todo-instances?gameId=StarRail` 显示今日 4 条必选全部 `dispatchDisposition=unsupported`、`dispatchReasonCode=execution_package_unpromoted`（"当前没有已验证并晋级的执行 manifest"）⇒ 规划期 `executableGameIds` 不含 StarRail ⇒ 整游戏被 deferred。落到 `todo_dispatch.py:321`：`facts.runtime["manifestVerified"] is False` 时直接把该 Todo 判为不可执行。
+  - **为什么 `manifestVerified=False`**：`GET /adapters` 的 `execution_bindings()` 会对 `runtime\adapters\game-modules\<game>` 重新校验已晋级的执行包。实测该目录里 `install-manifest.json` 的 `promotion.status = "candidate"`、`executionReady = false`、`promotion.receiptFile = ""` ⇒ 校验抛 `execution_package_unpromoted`。**比对全部 11 个模块：只有 `starrail` 是 candidate，其余全是 promoted。**
+  - **为什么会变成 candidate（根因，属本项目缺陷族）**：`scripts\Install-YeYuGamer*Adapter.ps1` **故意只接受未晋级的候选包**（`Install-YeYuGamerStarRailAdapter.ps1:78` 原文：*"StarRail promotion is Manager-owned; the installer accepts only candidate test evidence."*），晋级由发布脚本在**后面的步骤**调用 `POST /api/v1/adapter-versions/<版本>/promotion-requests` 完成。时间线：01:10:53 装机了一个 **promoted** 的 StarRail（`starrail.previous-20260922175712`，`receipt=True`）→ **01:57:12 又装了一个新构建（`starrail-20260922175513`）但只到 install、没跑到 promote**（那一轮发布被外部 `schtasks /end` 杀掉了）⇒ 旧的已晋级模块已被换走、新的没有执行授权。**这不是上游问题、不是环境问题，是我们自己的发布通道在"install 与 promote 之间被中断"时的破坏性副作用。**
+  - **安静程度是关键危害**：规划器把该游戏 deferred 掉，既不抛 blocker 也不发 `review_required`，日报也不会说"这个游戏今天没跑"⇒ 只有盯 `req=0/4` 才发现。这是"零意外"里最坏的一类：**静默丢一整个游戏**。
+  - **本轮修法（无人值守自愈，无需发布）**：
+    1. 新工具 `scripts/heartbeat/hb-adapters.py`：`status` 只读列出每个模块的 `promotion.status`/`executionReady`/是否有 receipt，并对**已启用但无执行授权**的游戏以退出码 3 报警；`repair [--json]` 只对"已装候选 + 磁盘上的候选测试证据与安装载荷逐字段绑定（`payloadDigest`/`buildId`/`packageVersion`/`supportedGameIds`）"的包调用 Manager 自己的晋级接口（幂等键 + 当前 `stateVersion`）；`promote <GameId> [--wait-seconds N]` 供单次使用，`--wait-seconds` 下会像发布一样写 `release-pending.flag` **认领下一个空闲窗口**（否则 5 分钟的 `DailySupervisor` 会把每个空闲窗口抢走，晋级永远排不上），并在**所有退出路径**删掉该标志。
+    2. `scripts\Invoke-YeYuGamerDailySupervisor.py` 在**队列空闲**的分支里、规划之前调用 `hb-adapters.py repair --json`：修好的游戏会被**同一 tick 紧接着发出的批次**带上，全程无人值守。晋级用 Manager 已审计的同一路径（发布脚本本来就是这么调的），只是把那次没跑成的步骤补上；证据不匹配则**拒绝**并**大声记日志**（`not_repairable`），不再静默。
+    3. `--selftest` 增加 5 条断言覆盖"无事发生必须安静 / 修过必须出声 / 拒绝必须出声"；**双向验证**：把 `summarize_repairs` 改成永远返回空 ⇒ `AssertionError: a repair is logged` 精确失败。
+  - **待补**：`Publish-YeYuGamerLocalRelease.ps1` 的 install→promote 之间仍不是原子的（被硬杀时 `finally` 也不会跑）。它与本节的 supervisor 自愈是一对：自愈负责收尾，发布侧若再加"安装前记录、失败则回滚"会更干净。**策略口径（是否允许自动晋级）**：发布脚本自己就自动晋级，本自愈只是重放同一步，未引入新的授权级别。
+  - **不要再当新问题查**：见到"某个已启用游戏整天 0/N 且批次里没有它的 run"，**第一步就是 `hb-adapters.py status`**，不要从图形层/客户端/上游查起。
+
 ## 8. 结束报告
 
 结束报告列出：范围与逐项结果、承接与本轮执行的区别、更新前后版本、根因及关键证据、YeYu commit/上游 PR、实际验证范围、残余阻塞及恢复点、客户端清理和报告状态。原始日志保留本机，外发只用已审查的脱敏材料。邮件按 `notification_policy.report_scope` 发送：默认 `game_day` = **一个游戏日一封、只报当天的最终结果**（不再按重试轮次逐轮发送）；`batch` = 旧的每轮报告。SMTP 受理不冒充送达。

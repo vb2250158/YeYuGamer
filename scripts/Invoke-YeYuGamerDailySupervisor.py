@@ -175,6 +175,21 @@ def selftest() -> int:
     assert advance_state(exhausted, rolled)["starts"] == 0, "rollover clears the cap"
     assert advance_state(exhausted, {})["starts"] == 8, "unknown day keeps the cap"
 
+    # Adapter repair: a healthy day must stay quiet, a repaired day must be loud.
+    assert summarize_repairs(0, '{"schemaVersion": 1, "repairs": []}') == "", "silent when nothing needs repair"
+    assert summarize_repairs(0, '"not json at all"') .startswith("unreadable"), "garbage is reported"
+    assert summarize_repairs(0, "") .startswith("unreadable"), "empty output is reported"
+    loud = summarize_repairs(
+        0,
+        '{"repairs": [{"gameId": "StarRail", "outcome": "promoted"}]}',
+    )
+    assert "StarRail" in loud and "promoted" in loud, "a repair is logged"
+    refused = summarize_repairs(
+        4,
+        '{"repairs": [{"gameId": "StarRail", "outcome": "not_repairable", "detail": "x"}]}',
+    )
+    assert refused.startswith("exit=4") and "not_repairable" in refused, "a refusal is logged loudly"
+
     print("selftest: game_day_key=%r starts_after_rollover=%d"
           % (game_day_key(today), advance_state(exhausted, rolled)["starts"]))
     return 0
@@ -201,6 +216,57 @@ def heal_reserve_pending() -> bool:
     except OSError:
         return False
     return age <= HEAL_RESERVE_FRESH_SECONDS
+
+
+def repair_unpromoted_adapters() -> str:
+    """Promote enabled games whose Adapter an interrupted release left unpromoted.
+
+    ``scripts\\Install-YeYuGamer*Adapter.ps1`` deliberately installs an Adapter as
+    an *unpromoted candidate* and ``Publish-YeYuGamerLocalRelease.ps1`` promotes
+    it in a later step.  A release killed in between therefore replaces a working
+    module with one that has no execution authority -- and nothing notices: the
+    planner marks every required Todo of that game ``unsupported`` and silently
+    defers the whole game out of the batch, so the game day ends short with no
+    blocker and no notification (measured 2026-09-23: StarRail rebuilt at 01:57,
+    never promoted, 0/4 all day).
+
+    Promotion is the Manager's own audited path, the same call the release makes;
+    this only replays the step that never ran, and only when the on-disk
+    candidate evidence is bound to the exact installed payload.  It runs on an
+    idle queue (this heartbeat returns early while a batch is active), which is
+    also the only state in which the Manager accepts a promotion.
+
+    Returns a log fragment, or ``""`` when nothing needed repair.
+    """
+
+    tool = Path(__file__).resolve().parent / "heartbeat" / "hb-adapters.py"
+    if not tool.is_file():
+        return "the adapter repair tool is missing at %s" % tool
+    try:
+        result = subprocess.run(
+            [sys.executable, str(tool), "repair", "--json"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return "could not run the adapter repair tool: %s: %s" % (type(error).__name__, error)
+    return summarize_repairs(result.returncode, (result.stdout or "") + (result.stderr or ""))
+
+
+def summarize_repairs(returncode: int, output: str) -> str:
+    """Turn the repair tool's JSON report into a log fragment.
+
+    ``""`` means "nothing needed repair", which must stay silent: this heartbeat
+    runs every five minutes and a healthy day must not fill the log with noise.
+    """
+
+    text = (output or "").strip()
+    try:
+        repairs = json.loads(text.splitlines()[-1]).get("repairs") or []
+    except (IndexError, ValueError, AttributeError):
+        return "unreadable repair report (exit=%s): %s" % (returncode, text[-300:] or "(no output)")
+    if not repairs:
+        return ""
+    return "exit=%s %s" % (returncode, json.dumps(repairs, ensure_ascii=False))
 
 
 def start_daily() -> str:
@@ -297,6 +363,10 @@ def main() -> int:
     if batch:
         log("queue busy (%s, batch=%s); leaving it alone" % (batch.get("state"), batch.get("batchId")))
         return 0
+
+    repaired = repair_unpromoted_adapters()
+    if repaired:
+        log("adapter repair: %s" % repaired)
 
     todo = payload.get("todo") or {}
     games = todo.get("games") or {}

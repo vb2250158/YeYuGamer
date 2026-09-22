@@ -35,6 +35,7 @@ C:/Users/Admin/.workbuddy/binaries/python/versions/3.13.12/python.exe scripts/he
 ## 2. 谁在干活：别和 `DailySupervisor` 抢
 
 - 机械动作（每 5 分钟）：计划任务 `\YeYuGamer\DailySupervisor`，队列空闲且有未完成必选项时自己 `start-daily`。日志 `.cache/logs/daily-supervisor/<日期>.log`；它读 `runtime\state\release-pending.flag` 并 `standing down`。
+  - **它还负责"执行包自愈"（2026-09-23 起）**：队列空闲时先跑 `scripts/heartbeat/hb-adapters.py repair`，把"已启用但被中断的发布留在 `candidate` 状态"的适配器重新晋级（只用 Manager 自己的晋级接口，且候选测试证据必须与已装载荷逐字段绑定）。修好的游戏会被**同一 tick 紧接着发出的批次**带上。⇒ **心跳看到"某已启用游戏 0/N"时，先确认它有没有修/为什么没修，不要自己抢着发批次**（见 §3 第 0 条）。
   - **"每日 8 次补批"配额按游戏日计**（`supervisor-state.json`），2026-09-23 03:2x 修掉了"读错字段导致配额永不重置"的缺陷（commit `20b9531`）。它打 `needs a decision` 只说明**当天 8 次已经用完**，换日（04:00）自动清零 ⇒ **这不算机械通路坏掉，心跳不要自己去补发**（除非本轮有改了代码、需要一次实跑去验证的修复）。若它长期刷这条而状态文件里的 `gameDay` 明明变了，才是缺陷。
 - 每日 04:00：计划任务 `\YeYuGamer\DailyRun` + Manager 开关 `dailyScheduleEnabled/dailyScheduleTime`（两处缺一不可）。
 - 每 10 分钟：计划任务 `\YeYuGamer\StuckClientHealer`，只在"启用中的游戏真的被残留客户端互斥体挡着 + 队列空闲 + 没人在用机器"时重启机器（§0/§7）。日志 `runtime\logs\stuck-client-heal.log`。它还会写 `client-heal-pending.flag` **认领**下一个空闲窗口（见 §0）——`DailySupervisor` 见新鲜标志就 stand down，所以"队列一直忙"不再等于"重启永远做不了"。
@@ -53,6 +54,7 @@ C:/Users/Admin/.workbuddy/binaries/python/versions/3.13.12/python.exe scripts/he
 
 ## 3. 归因顺序（证据优先级）
 
+0. **先看"某个已启用游戏整天 0/N 且批次里根本没有它的 run"** —— `scripts/heartbeat/hb-adapters.py status`：这类"游戏被静默 defer"几乎总是**执行包没晋级**（`execution_package_unpromoted`），根因是发布在 install 与 promote 之间被中断（2026-09-23 StarRail 整天 0/4 就是这个）。**别从图形层/客户端/上游查起**。修法见 §5。
 1. **阶段截图先看**：`C:\ProgramData\YeYuGamer\runtime\artifacts\game-ui-launch-phase-*.png`（按文件时间挑本轮那张）。**客户端自己的对话框就是答案**——2026-09-22 GF2 弹 `Fatal error / Another instance is already running`，一下子把"起了但不建窗口"变成"客户端拒绝启动"。没有它之前，这一族查了整整一天。
 2. 编排日志：`%ProgramData%\YeYuGamer\runtime\logs\runs\<日期>\<游戏>-<attemptId>\attempt.log`（`launch.launcher-waiting` 的 `running/writeActivity/bytesWrittenDelta`、`launch.listed_exited_processes`、`attempt.launch.failed code=`）。
 3. 进程与窗口：`scripts/heartbeat/hb-pids.py "<正则>"`（`exit=<非259>` = 已退出但仍被枚举；`LIVE` = 活）、`scripts/heartbeat/hb-windows.py`（可见窗口与 pid）、`scripts/heartbeat/hb-parent.py <pid...>`。
@@ -72,6 +74,7 @@ C:/Users/Admin/.workbuddy/binaries/python/versions/3.13.12/python.exe scripts/he
 - ❌ "Manager 重启即释放僵尸条目句柄" —— **已证伪**：`36880/38088` 熬过 11:37 那次重启仍可枚举。
 - ❌ "用 `taskkill` 能清掉死条目" —— 已证伪：报"没有此任务的实例在运行"却仍被枚举；**别再试**。
 - ❌★ "死条目是网易UU远程 / EdgeGameAssist / wegame 等外部 hook 造成的" —— **已证伪，别再顺着它做实验**。`handle64 -a` 全量 dump 证明持有者是 Windows 自身子系统 `svchost.exe`（RpcSs / Themes / Audiosrv，各 1 个 `Process` 句柄）+ GF2 自己的崩溃残骸（`UnityCrashHandler64.exe` / `crashpad_handler.exe`）+ 客户端自持的数百个自身 `Thread` 句柄。**没有第三方 hook 进程**。
+- ❌★ **"某个已启用游戏整天 0/N = 客户端/上游/图形层问题" —— 先查执行包晋级**。2026-09-23 StarRail 整天 `0/4`、批次里连 run 都没有、无任何 blocker：根因是发布在 install（装成 candidate）与 promote 之间被中断，模块留在 `promotion.status="candidate"` / `executionReady=false`，于是 `todo_dispatch` 把它的每条必选判成 `unsupported` 并把**整个游戏 deferred**。一条 `hb-adapters.py status` 就能定位（修法见 §5）。**这是"我们自己的发布通道被中断"的破坏性副作用，不是上游。**
 - ❌★ "客户端秒退 / 不建窗口是客户端层无解的黑盒" —— **已有确定的检查手段**：先看该游戏的**单实例互斥体**是否被占（`scripts/heartbeat/hb-mutex.py probe <名字>`；PGR = `comkurogameharukuro`，GF2 = `ilium-GF2-Game-GF2-Exilium-exe-SingleInstanceMutex-Default`）。被占 ⇒ 属主进程从未完成终止，用户态清不掉，**只有重启机器能解**。
 - ⛔ **不要自行重启机器**（现在由 `\YeYuGamer\StuckClientHealer` 守卫式执行，见 §0/§7）；心跳只核对结果。
 - ❌ "Endfield 的 `foreground-not-acquired` 是编排 bug" —— **先看当时谁占着前台**：`scripts/heartbeat/hb-foreground.py --all` 报前台窗口持有者与是否无响应。**前台锁是 Windows 的规则，不是我们的 bug**：只要有人正在交互（或前台进程是别人的窗口），`SetForegroundWindow` 就该失败。2026-09-22 12:07 Endfield 那次失败期间，机器上同时开着任务管理器/资源管理器/QQ/Chrome/WorkBuddy（秋雨正在用机器）⇒ 属"机器被占用"的环境层，不是编排缺陷。**同时注意**：若前台窗口所属线程是挂死的（`IsHungAppWindow`），连切换都做不到，会让**无关游戏**也启动失败——这是"一个卡死客户端污染整天"的第二条通路。
@@ -94,6 +97,7 @@ C:/Users/Admin/.workbuddy/binaries/python/versions/3.13.12/python.exe scripts/he
 | 自己补一发 | `hb-mutate.py start-daily-api`（先确认 supervisor 真的没动）|
 | **单游戏诊断**（只跑一个游戏、不动配置） | `POST /api/v1/batches` + `{"kind":"daily","mode":"execute","gameIds":["ZZZ"],"requestedBy":"cli"}`（配 `If-Match` / `Idempotency-Key` / `X-Expected-State-Version`）。**比"临时 `patch-enabled` 关掉别的游戏再恢复"更安全**：不动配置、无恢复步骤。实测 2026-09-23 03:33 批次 `a3561463`（ZZZ 单目标，约 40 秒收尾 `blocked`、无人工门）。 |
 | 客户端被残留互斥体挡住（当天做不完，只能重启）| 交给 `\YeYuGamer\StuckClientHealer`；预演用 `heal-stuck-clients.py --dry-run`，看 `runtime\logs\stuck-client-heal.log`。**别自己 `shutdown`** |
+| **已启用游戏整天 0/N、批次里没有它的 run**（被静默 defer）| `hb-adapters.py status` 看执行包；确认是 `execution_package_unpromoted` 后 `hb-adapters.py promote <GameId> --wait-seconds 540`（会认领空闲窗口并自动删标志）。**正常不必手动**：`DailySupervisor` 每个空闲 tick 已自动 `repair`，修好后同一 tick 就把它带进新批次 |
 | 前台被别的窗口占着、启动器抢不到前台 | `hb-foreground.py --all` 取证（前台持有者 + `IsHungAppWindow`）。有人正在用机器 ⇒ 如实记环境层，不要为它改编排 |
 
 - 门释放后 `_current_human_batch` 的退出条件会把游戏日交还，**下一次 5 分钟 tick 就自动补批**——不要手动救。
