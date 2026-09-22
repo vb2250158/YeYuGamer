@@ -111,6 +111,75 @@ def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
 
 
+def game_day_key(payload: dict) -> str:
+    """The game day the snapshot describes, or ``""`` when it cannot be read.
+
+    ``/api/v1/snapshot`` carries the game day at the top level; ``todo`` has no
+    ``gameDay`` member (measured 2026-09-23).  Reading ``todo["gameDay"]`` made
+    the start budget a *lifetime* cap instead of a per-game-day one: after eight
+    batches the supervisor logged "needs a decision" on every tick for the rest
+    of the machine's uptime (the state file kept ``gameDay`` empty), so the
+    five-minute timer stopped carrying the game day forward and only a heartbeat
+    or the 04:00 daily ever started batches again.
+    """
+
+    top = payload.get("gameDay")
+    if isinstance(top, str) and top:
+        return top
+    return str((payload.get("todo") or {}).get("scopeKey") or "")
+
+
+def advance_state(state: dict, payload: dict) -> dict:
+    """Clear the per-game-day start budget when the game day has rolled over.
+
+    An unreadable game day keeps whatever budget is left rather than clearing
+    it: a transient snapshot omission must not hand out extra restarts.
+
+    A state file with no game day at all was written by the version that read a
+    member the snapshot never carried, and every start in it was spent on the
+    game day that is running now -- so label it instead of clearing it.
+    Otherwise adopting the fix would hand the day a second ration of batches.
+    """
+
+    game_day = game_day_key(payload)
+    if not game_day:
+        return state
+    if state.get("gameDay") == game_day:
+        return state
+    if not state.get("gameDay"):
+        return {**state, "gameDay": game_day}
+    return {"gameDay": game_day, "starts": 0, "lastStartAt": 0.0}
+
+
+def selftest() -> int:
+    """Read-only check of the budget bookkeeping (no Manager calls)."""
+
+    today = {"gameDay": "daily:manager:aaa", "todo": {"scopeKey": "daily:manager:aaa"}}
+    rolled = {"gameDay": "daily:manager:bbb", "todo": {"scopeKey": "daily:manager:bbb"}}
+    legacy = {"todo": {"scopeKey": "daily:manager:aaa"}}  # no top-level member
+    exhausted = {"gameDay": "daily:manager:aaa", "starts": 8, "lastStartAt": 1.0}
+
+    assert game_day_key(today) == "daily:manager:aaa"
+    assert game_day_key(legacy) == "daily:manager:aaa", "todo.scopeKey is the fallback"
+    assert game_day_key({}) == "", "an unknown game day stays empty"
+
+    # The live state file holds gameDay="" (written by the bug): the budget it
+    # records was spent on the game day running now, so it must be kept, not
+    # cleared -- clearing it here would start a ninth batch on a capped day.
+    stale = {"gameDay": "", "starts": 8, "lastStartAt": 1.0}
+    adopted = advance_state(stale, today)
+    assert adopted["starts"] == 8, "an unlabelled budget is kept, not cleared"
+    assert adopted["gameDay"] == "daily:manager:aaa", "and it takes the running day"
+    assert advance_state(adopted, today)["starts"] == 8, "adopting is idempotent"
+    assert advance_state(exhausted, today)["starts"] == 8, "same game day keeps the cap"
+    assert advance_state(exhausted, rolled)["starts"] == 0, "rollover clears the cap"
+    assert advance_state(exhausted, {})["starts"] == 8, "unknown day keeps the cap"
+
+    print("selftest: game_day_key=%r starts_after_rollover=%d"
+          % (game_day_key(today), advance_state(exhausted, rolled)["starts"]))
+    return 0
+
+
 def outstanding(games: dict, scope: list[str]) -> list[str]:
     """In-scope games whose required todos are not all completed yet."""
 
@@ -241,9 +310,15 @@ def main() -> int:
         return 0
 
     state = load_state()
-    game_day = str((payload.get("todo") or {}).get("gameDay") or "")
-    if state.get("gameDay") != game_day:
-        state = {"gameDay": game_day, "starts": 0, "lastStartAt": 0.0}
+    previous_day = state.get("gameDay") or ""
+    state = advance_state(state, payload)
+    if (state.get("gameDay") or "") != previous_day:
+        if previous_day:
+            log("game day changed to %s; the start budget starts over (was %s)"
+                % (state.get("gameDay"), previous_day))
+        else:
+            log("adopted game day %s with the %s starts already recorded"
+                % (state.get("gameDay"), state.get("starts")))
     now = time.time()
     if state["starts"] >= MAX_STARTS_PER_GAME_DAY:
         log("outstanding %s but the start budget (%d) is exhausted; needs a decision"
@@ -264,4 +339,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if "--selftest" in sys.argv[1:]:
+        sys.exit(selftest())
     sys.exit(main())
