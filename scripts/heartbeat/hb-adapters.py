@@ -181,6 +181,12 @@ def _busy_conflict(status: int, payload: object) -> bool:
     return "execution is active" in text or "adapter_busy" in text
 
 
+# The Manager bumps stateVersion continuously while a batch runs, so the pair
+# "read stateVersion, then mutate" races and answers 412.  ``Publish-YeYuGamer
+# LocalRelease.ps1`` retries the promotion three times for exactly this reason.
+STATE_VERSION_ATTEMPTS = 3
+
+
 def promote(game_id: str, wait_seconds: int = 0) -> int:
     """Promote one enabled game's installed candidate. Returns a process exit code."""
 
@@ -203,6 +209,7 @@ def promote(game_id: str, wait_seconds: int = 0) -> int:
     deadline = time.monotonic() + max(0, wait_seconds)
     claimed = False
     attempt = 0
+    stale = 0
     try:
         while True:
             attempt += 1
@@ -222,6 +229,10 @@ def promote(game_id: str, wait_seconds: int = 0) -> int:
             )
             if status in (200, 201, 202):
                 break
+            if status == 412 and stale < STATE_VERSION_ATTEMPTS:
+                stale += 1
+                time.sleep(2)
+                continue
             if _busy_conflict(status, payload) and time.monotonic() < deadline:
                 if not claimed:
                     RELEASE_FLAG.write_text(

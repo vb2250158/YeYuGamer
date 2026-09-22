@@ -292,6 +292,7 @@
   - **安静程度是关键危害**：规划器把该游戏 deferred 掉，既不抛 blocker 也不发 `review_required`，日报也不会说"这个游戏今天没跑"⇒ 只有盯 `req=0/4` 才发现。这是"零意外"里最坏的一类：**静默丢一整个游戏**。
   - **本轮修法（无人值守自愈，无需发布）**：
     1. 新工具 `scripts/heartbeat/hb-adapters.py`：`status` 只读列出每个模块的 `promotion.status`/`executionReady`/是否有 receipt，并对**已启用但无执行授权**的游戏以退出码 3 报警；`repair [--json]` 只对"已装候选 + 磁盘上的候选测试证据与安装载荷逐字段绑定（`payloadDigest`/`buildId`/`packageVersion`/`supportedGameIds`）"的包调用 Manager 自己的晋级接口（幂等键 + 当前 `stateVersion`）；`promote <GameId> [--wait-seconds N]` 供单次使用，`--wait-seconds` 下会像发布一样写 `release-pending.flag` **认领下一个空闲窗口**（否则 5 分钟的 `DailySupervisor` 会把每个空闲窗口抢走，晋级永远排不上），并在**所有退出路径**删掉该标志。
+       - ⚠️ **晋级请求必须对 412 重试**：`read stateVersion → POST` 这件事在批次运行期间必然与 Manager 的连续 stateVersion 自增打竞态。实测 12 次探测里 **2 次是 `412 state_version_conflict`**（`expected 108797, current 108802`）。第一版没重试，于是在同一分钟内一会儿报 `deferred_busy`、一会儿报**假的** `promotion_failed`。现与 `Publish-YeYuGamerLocalRelease.ps1` 同一配方重试 3 次。
     2. `scripts\Invoke-YeYuGamerDailySupervisor.py` 在**队列空闲**的分支里、规划之前调用 `hb-adapters.py repair --json`：修好的游戏会被**同一 tick 紧接着发出的批次**带上，全程无人值守。晋级用 Manager 已审计的同一路径（发布脚本本来就是这么调的），只是把那次没跑成的步骤补上；证据不匹配则**拒绝**并**大声记日志**（`not_repairable`），不再静默。
     3. `--selftest` 增加 5 条断言覆盖"无事发生必须安静 / 修过必须出声 / 拒绝必须出声"；**双向验证**：把 `summarize_repairs` 改成永远返回空 ⇒ `AssertionError: a repair is logged` 精确失败。
   - **待补**：`Publish-YeYuGamerLocalRelease.ps1` 的 install→promote 之间仍不是原子的（被硬杀时 `finally` 也不会跑）。它与本节的 supervisor 自愈是一对：自愈负责收尾，发布侧若再加"安装前记录、失败则回滚"会更干净。**策略口径（是否允许自动晋级）**：发布脚本自己就自动晋级，本自愈只是重放同一步，未引入新的授权级别。
