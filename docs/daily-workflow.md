@@ -189,9 +189,9 @@
     `"OneDragon run ended without an upstream normal-world readiness marker"` / `"...an operable normal-world readiness marker"` 开头，且 `risk ∈ {routine_action, observe_only}` 时才允许"新请求的**整轮** daily 批次从头重跑该入口待办"。
     **其它 `upstream_observation_missing` 原因（如 NIKKE 的 `formalGui=run_nikke_gui.py; ... Behavior Tree Result failure`、`OneDragon formal selected daily timed out`、`missing_reward_evidence`）一律仍留在 review_required** —— 已在测试里逐条锁死。
   - **测试**：`backend/tests/test_todo_dispatch.py` 新增 4 项（可进入新批次 / active_blocker 变体 / 三种"别的原因不得自动重试" / `forbidden` 风险仍 deferred_forbidden）；**区分度验证过**（把 reasonCode 判据临时改坏 ⇒ 两条正向测试精确失败为 `deferred_review`，负向测试仍通过）；`backend/tests` 全量 pytest `PYTEST_EXIT=0`、`undef_check2.py TOTAL=0`。
-  - **仍有残余**：NIKKE 当日 1/3，失败在上游工具自己的行为树（`run_nikke_gui.py` / "无法识别回到大厅"），属上游缺陷族，**不在本次修法覆盖范围内**（正确行为：如实 review_required，下一步查上游 WeGame/UIA 通路）。
+  - **仍有残余（该归因已于 2026-09-23 01:1x 作废，见本节后面"NIKKE 永远只能完成第一个待办"条）**：NIKKE 当日 1/3。曾有结论说"失败在上游工具自己的行为树（`run_nikke_gui.py` / 无法识别回到大厅）、属上游缺陷族"——**错**：行为树本身成功，是我们自己的驱动用 `--exit` 在第一个子树后杀掉了客户端。
 
-- ★★ **2026-09-23 00:xx 邮件机制改造：从"每轮一封"改为"每天一封、报当天结果"（已改 + 已补测试，本轮发布）**
+- ★★ **2026-09-23 00:xx 邮件机制改造：从"每轮一封"改为"每天一封、报当天结果"（已改 + 已补测试；`bf27b88`，装机待重发）**
   - **现象（用户原话）**："改一下邮件的发送机制，不是发那一轮的，而是更新当天的结果。不然我看到一堆失败，有点可怕……"
   - **机制缺陷（两重）**：① `notification_deliveries` 的唯一键是 `(batch_id, seal_version, channel, recipient_binding_id)` ⇒ **每个封口批次必然一封**；一天多次补批就多封。② 更要紧的是**算错**：批次报告的"已验收"只按**本轮** `completionContracts` 算，而验收是跨批次累计的 ⇒ 当天已经 `accepted_done` 的游戏在后续轮次的邮件里掉回"待验收／本轮未执行"（实测 00:26 那封仍写 `已验收 0/7 · 完成受阻`，而当天实际已有 4 个游戏 accepted）。**不是文案问题，是口径问题。**
   - **修法**：新增按**游戏日**汇总的报告轨道（`notification_policy.report_scope`，默认 `game_day`；`batch` 保留旧的每轮报告）。
@@ -202,6 +202,87 @@
     - 释放按钮在 Manager 周期 tick（`_completion_review_watchdog_loop`，60s）上，所以**不依赖"当天还有没有新批次封口"**；日界兜底也走它。
   - **测试**：`backend/tests/test_notification_game_day_report.py` 18 项（模板口径 / 策略默认与校验 / 终态判据 / held-不发 / 当日只发一封 / 已报告日不再发 / 未到达的日子绝不发 / 两个 scope 分流）；**两道重复守卫各自做了区分度验证**（破坏 rollover 守卫 ⇒ `test_a_day_that_already_reported_is_not_mailed_again` 精确失败；破坏 final 守卫 ⇒ `test_a_late_seal_of_an_already_reported_day_is_retired_too` 精确失败）。
   - **残余（如实记）**：某天若**一个批次都没封口**（例如整天卡在未释放的人工门），就不存在该日的报告行 ⇒ 那天没有日报（比多报更安全，但不完美）；`report_scope` 目前只有 API（`PATCH /api/v1/notification-policy` 带 `reportScope`），WebGUI 尚未加开关。
+  - ⚠️ **自查教训（已修，`bf019fa`）**：`_game_day_report_snapshot` 第一版调 `self.todo_overview(games=…, current_items_by_game=…)`，而 `Manager.todo_overview()` **不接参数** ⇒ 封口的通知渲染会 TypeError 并被 `seal_batch` 吞掉（**一封邮件都不发**）、60s tick 永久刷 `game_day_report.tick_failed`。测试没抓到，因为**前面的用例把整个 snapshot stub 掉了**。⇒ 给包装层写 test double 时，必须留至少一个用例跑真实实现。
+
+- ★★ **2026-09-23 00:5x：入口待办 `attach-home` 在"当天只剩它一条必选"时永远完不成 —— ZZZ 与 NTE 各差 1 项是同一个机制**（**未修，需用户定契约口径**）
+  - **现象**：`daily:manager:59b5068fae16c5a5` 走到 35/39 后停住：ZZZ `8/9`、NTE `5/6`、NIKKE `1/3`；`DailySupervisor` 的每日 8 次补批预算也在 00:39 用尽（`the start budget (8) is exhausted; needs a decision`）。ZZZ 唯一缺的是入口待办 `attach-home`（"启动并确认已进入大世界"），NTE 唯一缺的也是 `attach-home`（"经官方启动器进入可操作主界面"）。
+  - **决定性对照（同一个游戏日内）**：
+    - `ZZZ-9087cc36`（05:40，冻结 9 条、含 `attach-home`）⇒ 客户端未出窗口，`launch.capture unavailable`，收 `OneDragon formal selected daily timed out`，`attach-home` 未完成。
+    - `ZZZ-c5dbdf94`（08:26，冻结 8 条、**不含** `attach-home`）⇒ **`attempt.result status=completed`，8/8 全完成**，且 `adapter.stdout.jsonl` 的 `sequence=56` 有 `指令[ 返回大世界 ] 执行成功 返回状态 大世界-普通`。
+      ⇒ **那一天确实到达过大世界，只是当时 `attach-home` 因 06:10 那次瞬时 review 被排除在冻结范围外，没人把这次到达记在它名下**。
+    - 之后 ZZZ 只剩 `attach-home`：`00:19`/`00:39` 两次 attempt 都在 **0.4 秒内**结束，驱动 stderr = `unstarted operation=attach-home; No selected official application can produce the normal-world marker`，`driverExit=20`。
+  - **机制（两侧都已查实，别再重查）**：
+    - **驱动侧**（`adapter-host/classic-runner/classic_tool_driver.py:1070-1083`）：`selected_app_ids = [ZZZ_APPS[i] for i in selected if i != "attach-home"]`；**该列表为空时直接 `_emit(review_required)` + `return 20`，一个进程都不启**。
+    - **上游侧**（`.cache/upstream-candidates/zzz-main-9f53b56-runtime/ZZZ/official-source/src/one_dragon/base/operation/application/group_application.py:63-91`）：`GroupApplication.run_app()` 只对 `enabled` **且** `run_record` 未完成的 app 调 `app.execute()`，而"打开游戏/进入游戏/返回大世界"是 `Application.execute()` 内部的 `op_to_enter_game`（`zzz_one_dragon_app.py` 把 `OpenAndEnterGame` 传进去）⇒ **没有启用的 app 就不会进游戏，也就不会出现大世界标记**；而当天 8 个 app 的 `app_run_record` 已 done，即便强行置 `enabled` 也会被 `is_done` 跳过。⇒ **`attach-home` 单独时在官方工具侧无解**，不是驱动写错。
+    - **NTE 同形**（另一套驱动）：`NTE-25475c7a` 冻结 `['attach-home']`，54 秒后 `run_terminal review_required`，原因码 `nte_scope_without_routine_operation`（"该范围里没有例行操作可跑"）。
+  - **结论**：入口待办本质是**就绪前置确认**，它的可完成性**依赖同一次 run 里存在真实业务待办**。一旦业务待办先完成（或被一次瞬时 review 排除），它就永久悬空 ⇒ 该游戏当天不可能全绿。与"自动跑完 / 零意外"冲突 ⇒ 这是**完成契约层面的设计缺口**，不是编排 bug，也不是"工具不支持该项"。
+  - **候选修法（本轮未实施，需用户定口径）**：
+    1. **同轮共选（最小、最保守）**：规划时只要入口待办未完成，就必须与至少一个业务待办同轮冻结 —— 健康环境里它必然随大世界标记一起完成（`ZZZ-c5dbdf94` 那次就是现成证据）。
+    2. **同日证据归属**：把"同游戏日任一次 run 观测到大世界标记"作为入口待办的就绪证据（事实存在，不是伪造成功）—— 需要 Manager 侧跨 run 的证据归属，改动面比 1 大。
+    - **不建议**：为了触发标记去 `enabled`/重跑某个业务 app（会重复消耗官方每日任务，违反"不为接入重写游戏任务"）。
+  - **附带发现（本轮已修，见下条）**：这个缺口之所以一直看像"协议 bug"，是因为我们的协议层把它变成了 `invalid_schema`。
+
+- ★★ **2026-09-23 00:5x：0 字节 artifact 会中止整条事件流，把驱动故意发的 `review_required` 吞成"协议崩溃"**（**两层都已修 + 已补测试**）
+  - **证据链**：`ZZZ-73b72e90` 的 `adapter.stdout.jsonl` 只有 3 条：`hello` → `run_progress code=official_operation_not_started message="No selected official application can produce the normal-world marker" metrics.reportedStatus=review_required` → `run_artifact_staged kind=upstream-tool-log fileName=classic-upstream-zzz-lifecycle-*.log sizeBytes=0 sha256=e3b0c442…（空串摘要）`。
+    ⇒ 第 3 条被 `adapter_protocol._consume_artifact()` 的 `_integer(minimum=1)` 判成 `invalid_schema: sizeBytes is out of range` ⇒ `adapter.watch.end protocolFailure=invalid_schema → transport=crashed`、`attempt.result protocolValid=False`。
+  - **为什么 0 字节是合法的**：官方工具的生命周期日志在首次使用时才创建；失败路径（没跑到任何上游输出）下它就是 0 字节。**驱动发这条事件是有意的**，Manager 却把整条流废掉，于是：① 真实原因被掩盖（前几轮 ZZZ 一直被记成"Adapter invalid_schema"，看着像协议/适配器 bug）；② 明明走的是"如实 review_required"却被算成协议崩溃；③ 顺带解释了 `upstream_observation_missing` 这一族在 ZZZ 上认不出来。
+  - ★ **同一处缺陷有**两层**闸门，只修一层不够（这是本次实测抓到的）**：修好解析层后，`01:13` 那轮 ZZZ attempt 的失败码从 `invalid_schema` 变成 **`artifact_size_rejected`** —— `adapter_artifacts.py:526-533`（导入/入账路径）也在无条件要求 `size >= 1`。两层必须一致。
+  - **修法（两处，同一判据）**：
+    - `backend/yeyu_gamer_manager/services/adapter_protocol.py::_consume_artifact` → `minimum=1 if mime.startswith("image/") else 0`；
+    - `backend/yeyu_gamer_manager/services/adapter_artifacts.py::import_staged` → `minimum_size = 1 if str(event["mimeType"]).startswith("image/") else 0`（**补时故意做成同名变量，方便以后一眼看出两处必须同步**）。
+    **非图片（日志类）允许 0 字节**（下游仍按 hash/magic/encoding 逐项 fail-closed），**图片仍必须非空**（空帧就是拍摄失败）。
+  - **测试**：`backend/tests/test_adapter_protocol.py::test_empty_text_artifact_is_accepted_but_empty_image_is_not` 与 `backend/tests/test_adapter_artifacts.py::test_empty_text_artifact_imports_but_empty_image_is_rejected` / `::test_empty_image_artifact_is_rejected`；**两处都做了区分度验证**（各自临时改回 `>= 1` ⇒ 精确复现生产里那条 `sizeBytes is out of range` / `artifact_size_rejected`）。`backend/tests` 全量 pytest `EXIT=0`（0 FAILED）、`undef_check2.py TOTAL=0`。
+
+- ★★ **2026-09-23 01:1x：NIKKE 永远只能完成第一个待办 —— 是我们自己的驱动用 `--exit` 把客户端杀了**（**已修 + 已补测试 + 区分度验证；属本项目缺陷，不是上游缺陷**）
+  - **推翻上一轮的错误归因**：第 192 行曾把 NIKKE 记成"失败在上游工具自己的行为树（`run_nikke_gui.py` / 无法识别回到大厅）"。**该结论作废** —— 事后看 `attempt.log` 与上游日志，行为树本身是**成功**的。
+  - **现象**：`NIKKE-0f9b6241`（01:14–01:37）冻结 `['attach-lobby','dispatch-friend']`。`attach-lobby` → `completed`（`reasonCode=upstream_task_succeeded`，`subtree=nikke_return_lobby.json; exit=0`），`dispatch-friend` → `review_required`（`subtree=nikke_dispatch_friend.json; timeout without upstream terminal marker`），20 分钟后才收尾。当日 NIKKE 长期卡在 `1/3`。
+  - **客户端其实起来了**：`launch.ready elapsed=32.0s pids=[1360,20768] launchState=started readyWindowPid=1360 readyWindowWidth=1925 readyWindowHeight=1083`，阶段截图 `game-ui-launch-ready-dd9694ba…png` 也在；上游 `01:16:28` 找到窗口（`hwnd changed from 0 to 2492896 … nikke.exe UnityWndClass real:0,0,1925,1083 visible:True`）并起了 WGC 采集。⇒ **不是"客户端不建窗口"那一族**。
+  - **决定性证据（上游日志，同一 attempt 的两个 artifact）**：
+    - `attach-lobby`（`artifact-98169e18…txt`，01:16:27→01:17:39）：`info_set Behavior Tree Result success` → `TaskExecutor:Successfully Executed Task, Exiting Game and App!` → `DeviceManager:stop_hwnd C:\Game\胜利女神：新的希望(2002017)\nikke.exe` → `process:Trying to kill the exe {… 'pid': 1360}`。
+    - `dispatch-friend`（`artifact-5f864be6…txt`，01:17:44→01:37:40）：**14 497 行里整整 20 分钟只有** `hwnd_window:bring_to_front failed: no hwnd found` 与 `bitblt_utils:capture_by_bitblt invalid params: hwnd=0, w=0, h=0`。
+    ⇒ **第一个子树跑完就把客户端杀了，第二个子树从头到尾没有窗口**。Manager 侧 `attempt.game_cleanup state=already-closed requested=[] remaining=[]` 也印证"客户端不是我们关的"。
+  - **机制（两侧查实）**：`adapter-host/classic-runner/classic_tool_driver.py::run_nikke` 对**每个**选中子树各起一个 GUI 进程，命令里带 `--exit`；ok-script 把 `--exit` 解析成 `exit_after`（`ok/util/process.py` → `ok/gui/MainWindow.py:400` → `StartController.do_start`），而 `ok/task/TaskExecutor.py:572` 在一次性任务结束后看到它就走
+    `Successfully Executed Task, Exiting Game and App!` → `DeviceManager.stop_hwnd()` → `kill_exe(abs_path=…)`（`ok/device/DeviceManager.py:108-112`）。
+    **该布尔量同时驱动"退出 App"和"关掉游戏"，没有只退出 App 的开关**；而"一个 GUI 会话只跑一个子树"是本驱动的结构（一次会话 = 一个 stage 子树，`NIKKE_TREE_FOLDER` 只指一个 `selected.json`），所以 `--exit` 必然在第一个子树后打死客户端。
+  - **修法（驱动侧，最小面）**：`run_nikke` **不再传 `--exit`**；改为由驱动接管收尾 —— `_collect_nikke_output` 现在在**任一**树终态标记（新增 `NIKKE_SUCCESS_MARKER` / `NIKKE_TERMINAL_MARKERS`）出现时结束等待，给工具 `NIKKE_RESULT_GRACE_SECONDS`(5s) 做完自身收尾，然后自己 `kill()`。
+    成功判据也随之改为纯看上游标记（`_nikke_subtree_succeeded`），不再依赖退出码 —— 退出码现在反映的是驱动的收尾动作。**客户端保持存活到最后一个子树**，尝试结束时由 Manager 自己的 `game_cleanup` 关闭（这才是设计中的生命周期）。
+  - **测试**：`adapter-host/tests/test_nikke_output_collection.py` 新增 `test_success_result_ends_the_wait_without_waiting_for_gui_exit`（成功标记必须立刻结束等待，而不是耗满 20 分钟超时）与 `test_selected_subtree_never_asks_the_tool_to_exit_the_game`（用假 Popen 捕获 argv，断言**不含** `--exit`、且该子树仍被记为 `completed`）。
+    ⚠️ `adapter-host/tests/validate_classic_selected_daily.py:153` 原本断言 `'str(gui_entry), "--task", "1", "--exit"' in source` —— **这条既有守卫把缺陷固化成了期望**，已翻转为 `not in source` 并补了 3 条正向断言。**区分度验证**（`.cache/bidir-nikke.py`）：把 `--exit` 加回去 ⇒ argv 测试精确失败；把终态标记换回只认失败标记 ⇒ 成功等待测试精确失败；两处实验后文件 md5 与实验前一致。`adapter-host/tests` 全量 40 项 unittest `EXIT=0`、`validate_classic_selected_daily.py` 31 项 `passed`。
+  - **发布**：改动在**Classic 适配器包**（不是 Manager），所以 `Build-YeYuGamerClassicAdapter.ps1` 的 `$PackageVersion` 由 `0.3.0-classic-upstream.26` → `.27`，按 `publish-classic-correct.ps1` 的配方（PGR/ZZZ/NIKKE 三个候选绑定**必须显式传**，否则包被判 untrusted）发布。
+  - **待验证**：需要一次真实 NIKKE 跑（`attach-lobby` 之后 `dispatch-friend` 能找到窗口并完成），才能把这条从"已修"升级为"已验证"。
+
+
+- ★★ **2026-09-23 02:0x：日报轨道自己在生产里每 60 秒崩一次 —— `KeyError: 'WW'`**（**已修 + 已补测试 + 区分度验证**）
+  - **现象（新装机版的真实日志）**：`manager.log` 每 60 秒一条 `ERROR game_day_report.tick_failed`，回溯为
+    `manager.py::_game_day_report_snapshot` → `manager_todos.py:894 todo_overview` → **`KeyError: 'WW'`**。上一轮那个 `todo_overview() got an unexpected keyword argument`（`bf019fa`）已经修好、这次也确实走到了真正的实现，**这是它的下一层**。
+  - **机制**：`todo_overview` 的契约是"`current_items_by_game` 必须覆盖 `games` 里的每一个游戏"（`current_items = current_items_by_game[game_id]`，无 `.get`）。而 `_game_day_report_snapshot` 传的是 **`games = self.store.list_games()`（整个目录，含禁用的 WW/FGO/BD2/CZN）** 配 **只含启用游戏的 `current`** ⇒ 第一个禁用游戏就 KeyError。异常被 `_completion_review_watchdog_loop` 吞掉 ⇒ **一封日报都发不出去**（正是用户要的那个功能）。
+  - **为什么测试没抓到**：现成用例 `test_the_snapshot_covers_exactly_the_enabled_games` **确实跑了真实实现**，但测试环境的目录里**只有启用的 PGR**，没有"目录里有禁用游戏"这个生产常态。
+  - **修法（调用方，1 行）**：把 `games` 收窄成 `enabled_games` 再传给 `todo_overview` —— 与 `current` 一致，也正合报告口径（日报本来就跳过禁用游戏；`scope_game_ids` 也只看 `enabled`，所以语义不变）。**没有**改 `todo_overview` 的契约（那是 WebGUI 也在用的投影，不应为了一个调用方的错而放宽）。
+  - **测试**：`backend/tests/test_notification_game_day_report.py::test_the_snapshot_survives_a_disabled_game_in_the_catalog`（往目录里塞一个 `enabled=False` 的 WW，断言真实快照不抛异常且行仍只有 PGR）。**区分度验证**：把 `games=enabled_games` 改回 `games=games` ⇒ 该用例精确失败。`backend/tests` 全量 `PYTEST_EXIT=0`（0 FAILED）、`scripts/heartbeat/undef_check2.py TOTAL=0`。
+  - ⚠️ **踩坑记录**：区分度实验一开始用 `Path.read_text()/write_text()` 做"改回去再恢复"，**文本模式往返会把行尾规范化**，恢复后 md5 与实验前不一致（git diff 仍然只有预期的 10/4 行，所以内容没坏，但这是不该有的副作用）。**以后这类实验一律用 `read_bytes()/write_bytes()`**；`.cache/bidir-nikke.py` 已改成二进制读写。
+
+- ★★ **2026-09-23 01:5x：发布通道在最后一步"心跳体检"上失败，并把 Manager 留在了停机状态**（**环境/配置层，未改代码；处置配方已写入 `heartbeat-playbook.md` §6**）
+  - **现象**：`publish-hb0923d` 跑到最后一步抛
+    `Start-YeYuGamer.ps1:82 → YeYu Gamer desktop host did not become healthy before the startup timeout.`，打印 `{"status":"installed-unpromoted", "managerRestarted":false}`，**且没有写 `PUBLISH_EXIT=`**。
+  - **实际损失为 0**：`install-manifest.json` 的 `installedAt` = 01:57:02，`.venv/Lib/site-packages/yeyu_gamer_manager/services/adapter_artifacts.py`（mtime 01:56:34）**含本轮 `minimum_size` 修复**、`adapter_protocol.py` 含 `minimum=1 if mime.startswith("image/")` ⇒ **文件都已装机**，只有"体检 + 提升声明"没走完。
+  - **根因**：`desktop-host.log` 里 `17:57:14 manager-start-requested` → `17:59:44 manager-start-timeout budgetSeconds=150`，即 **Manager 启动用了 147–164 秒，超过 150 秒预算**。而同一台机器上更早几次启动只要 58–69 秒（`17:10:54→17:11:52`）。差别是**发布自己当时的磁盘 IO**（PyInstaller 6 个构建 + 8 GB 产物拷贝 + 安装目录整树复制）把 `snapshot` 的 `store` 阶段从 ~300 ms 抬到 6.4–9.4 s（`snapshot.slow` 记录），启动全程被拉长 ⇒ **体检超时是 IO 争用，不是新代码起不来**。
+  - **代价（真实发生）**：体检失败 ⇒ 发布脚本抛出 ⇒ **Manager 没被重启，停在停机状态**（`/health` 连接被拒），而 `release-pending.flag` 当时还在 ⇒ `DailySupervisor` 一直 `standing down`、**连 `ensure_manager()` 都走不到**（第 213 行早于第 223 行）⇒ 队列整段停摆。**删掉标志后 supervisor 的下一个 tick（02:04）自己把 Manager 拉起来了**（`manager recovery: started (exit=0)`，用时 86 s，磁盘安静时就够）。
+  - **教训（已写进 playbook §6）**：① 发布失败后**第一件事是删 `release-pending.flag`** —— 它既挡 supervisor 发批次、也挡 supervisor 恢复 Manager；② 判别"到底装没装"看 `install-manifest.json.installedAt` 与已装文件里的修复标记，**不要只看脚本有没有抛**；③ 别在发布同刻跑别的重 IO 任务（本轮发布前跑全量 pytest 是无害的，因为它已经结束；真正害事的是发布自身的构建）。
+  - **仍未修（记录在案）**：150 秒体检预算对"启动本身要 ~60 s、且发布必然伴随重 IO"的场景偏紧，**建议把它提到 300 s**（改 `Start-YeYuGamer.ps1` 调用方的 `-TimeoutSeconds`/bootstrap 预算）。本轮**没有**去动它——那会改到承重的启动脚本，且当晚没有余量再验证一轮；下一次专门做。
+
+- **2026-09-23 02:0x 附带发现（未修，非当日阻塞）**：`game_launcher.py:1227` 起的 `nte-launcher-upgrade-watch` 是 **daemon 线程、无停止句柄、不 join**，会活过它所属的 attempt；测试里表现为 `PytestUnhandledThreadExceptionWarning`（线程在 `subprocess.run` 已被 mock 掉之后醒来 ⇒ `TypeError: 'Mock' object does not support the context manager protocol`）。生产影响很低（该线程只做只读的启动器探测），但"watcher 活过 attempt"本身该修。
+- ★★ **2026-09-23 03:2x：`DailySupervisor` 的"每日 8 次补批"预算从来不会重置 —— 一个打字错误把它变成终身上限**（**已修 + 已提交 `20b9531`；脚本跑源码树，无需发布**）
+  - **现象**：09-23 00:39 起，每 5 分钟一条 `outstanding ZZZ:8/9;NTE:5/6;NIKKE:1/3 but the start budget (8) is exhausted; needs a decision`，一直到 03:24 仍是这一条；`supervisor-state.json` = `{"gameDay": "", "starts": 8, "lastStartAt": 1790095142.74}`（`lastStartAt` 换算为 09-23 01:0x 本地 ⇒ 这 8 次全花在**同一个游戏日**内，不是跨日累计）。
+  - **机制**：原代码读 `payload["todo"]["gameDay"]`，但 `/api/v1/snapshot` 的 `todo` 对象**没有这个成员**（顶层才有 `gameDay`，`todo` 只有 `scopeKey`/`scopeFingerprint`/…）⇒ 取值恒为 `""`，与状态文件里的 `""` 相等 ⇒ 第 245 行的"游戏日变更就清零"永不触发。`MAX_STARTS_PER_GAME_DAY` 因此退化成一个**终身**计数：8 次之后五 分钟定时器**永久**不再补批（"needs a decision" 会一直刷），当天剩下的活只剩 04:00 的 `DailyRun` 与心跳，正是"两条机械通路同时坏掉"的形态。
+  - **修法**：新增 `game_day_key(payload)`（顶层 `gameDay`，退化到 `todo.scopeKey`）与 `advance_state(state, payload)`；**游戏日真的换了才清零**，快照读不出游戏日时**保留剩余预算**（瞬时缺字段不该多发批次），而状态文件里 `gameDay` 为空的**遗留**状态是"被写坏的版本留下的"——它记的 8 次**就花在当前这个游戏日**，所以只打标签、不发放第二份配额（否则修复本身会白送第 9 批）。日志会写明是"rolled over"还是"adopted"。
+  - **验证**：`--selftest`（新增，只读、不碰 Manager）覆盖 5 种情形并断言；**双向验证**：把 `game_day_key` 换回旧读法 ⇒ `advance_state` 对当前游戏日返回 `starts: 8`（预算照旧死着，缺陷精确复现）。实跑一次 supervisor：`adopted game day daily:manager:59b5068fae16c5a5 with the 8 starts already recorded` → 仍按预算挡住（未白送批次），队列保持空闲；`undef_check2.py TOTAL=0`。
+  - **下一个游戏日（04:00 之后）**：`gameDay` 变成新键 ⇒ 状态清零、8 次配额恢复；这是设计意图，无需人工干预。
+
+- ★★ **2026-09-23 03:33：0 字节 artifact 的两层修复在生产里验证通过；ZZZ 唯一缺口是"入口待办单独跑不出来"**（**已修并已验证；契约缺口仍待用户定口径**）
+  - **验证（本轮实跑，`ZZZ-db8dc9d3`，单游戏批次 `a3561463`）**：同一份 `attach-home` 单目标，事件流变成 `seq=2 run_artifact_staged`（**被接受**，不再 `adapter.event.rejected`）→ `seq=3 run_terminal {'status':'failed','exitCode':20}` ⇒ `attempt.result status=failed protocolValid=True code=run_terminal`。对照 00:19/00:40 的 `invalid_schema`（解析层：`sizeBytes is out of range`）与 01:13 的 `artifact_size_rejected`（导入层：`artifact size is outside its limit`）⇒ **两层修复都真的生效**，驱动"故意发的终态"不再被记成协议崩溃；游戏级 `nextAction` 也从误导性的 `Adapter artifact_size_rejected` 变回 `Adapter run_terminal`。
+  - **仍然完不成的是契约缺口**：驱动 `classic_tool_driver.py:1073-1085` 在 `selected_app_ids` 为空（当天只剩 `attach-home`）时直接 `_emit(..., "review_required", "No selected official application can produce the normal-world marker")` 并 `return 20`。上游 OneDragon 的"进入游戏"是**跑 app 时**的副作用（`op_to_enter_game` 在 `app.execute()` 里），且它会跳过 `app_run_record` 里已完成的行 ⇒ **当天别的 app 全完成之后，入口待办在本工具链里就是不可观测的**。09-22 的对照很干净：`ZZZ-c5dbdf94`（冻结 8 条、不含 attach-home）**8/8 completed 且日志里真的出现 `返回大世界 ] 执行成功 返回状态 大世界-普通`**，而只剩 attach-home 的 4 次尝试全部秒退。
+  - **两个候选修法（都不本轮改，等用户定口径；改错等于伪造成功）**：① **同轮共选** —— 规划期把入口待办和一个"当天已完成"的 app 放进同一 run 取标记（要动 Manager 的运行范围与 `todo_overview` 契约，且已完成 app 的事件会落到冻结范围之外的待办上，风险大）；② **同日证据归属** —— 同游戏日已观测到的"大世界"标记允许为入口待办背书（要新增一份可审计的跨 run 证据记录）。**在口径确定前，签到概率为 0 是"设计如此"，不是编排 bug**（`docs/daily-workflow.md` 本节 09-23 条目）。
+  - **顺带发现（本轮已用，建议固化为常用手段）**：`POST /api/v1/batches` 的 `BatchCreateRequest` **支持 `gameIds`**（camelCase），所以"单游戏诊断"**不需要临时关别的游戏**：`{"kind":"daily","mode":"execute","gameIds":["ZZZ"],"requestedBy":"cli"}` + `If-Match`/`Idempotency-Key`/`X-Expected-State-Version` 即可，批次 `a3561463` 的 `gameIds` 实测就是 `['ZZZ']`，收尾 `blocked`、无人工门、队列回空闲。比"改 `enabled` 再恢复"更安全（不动配置、不需要恢复步骤）。
 
 ## 8. 结束报告
 

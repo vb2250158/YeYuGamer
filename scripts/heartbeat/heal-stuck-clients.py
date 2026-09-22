@@ -80,6 +80,10 @@ RESERVE_FLAG = RUNTIME / "state" / "client-heal-pending.flag"
 RESERVE_FRESH_SECONDS = 1500
 
 HEARTBEAT_LOCK = pathlib.Path(r"C:\Projects\YeYuGamer\.cache\heartbeat.lock")
+# A heartbeat that dies without releasing the wake lock must not fence restarts
+# for the rest of the uptime; the lock is only meaningful while it is fresh
+# (same 25-minute rule the heartbeat itself uses for takeover).
+HEARTBEAT_LOCK_STALE_SECONDS = 1500
 
 # Evidence-based registry: only games measured on this installation, paired with
 # the client image names that appear in the leftover entries.
@@ -305,7 +309,8 @@ def selftest() -> int:
     print("  release flag exists  = %s" % RELEASE_FLAG.exists())
     print("  reserve flag         = %s (age=%s, fresh<=%s)"
           % (RESERVE_FLAG.exists(), reserve_age_seconds(), RESERVE_FRESH_SECONDS))
-    print("  wake lock exists     = %s" % HEARTBEAT_LOCK.exists())
+    print("  wake lock            = %s (age=%s, blocking while fresh<=%s)"
+          % (HEARTBEAT_LOCK.exists(), heartbeat_lock_age(), HEARTBEAT_LOCK_STALE_SECONDS))
     try:
         snap = snapshot()
     except Exception as error:  # noqa: BLE001
@@ -378,6 +383,15 @@ def reserve_age_seconds() -> float | None:
         return None
 
 
+def heartbeat_lock_age() -> float:
+    """Seconds since the wake lock was taken; a missing lock counts as ancient."""
+
+    try:
+        return time.time() - HEARTBEAT_LOCK.stat().st_mtime
+    except OSError:
+        return float("inf")
+
+
 def main() -> int:
     dry_run = "--dry-run" in sys.argv
     force = "--force" in sys.argv
@@ -423,7 +437,7 @@ def main() -> int:
     blockers = []
     if RELEASE_FLAG.exists():
         blockers.append("release pending")
-    if HEARTBEAT_LOCK.exists():
+    if HEARTBEAT_LOCK.exists() and heartbeat_lock_age() <= HEARTBEAT_LOCK_STALE_SECONDS:
         blockers.append("heartbeat wake lock held")
     idle = console_idle_seconds()
     if idle is not None and idle < CONSOLE_IDLE_SECONDS:

@@ -19,28 +19,23 @@
 
 ## 1. 唤醒互斥（先做，10 秒）
 
-同一分钟可能有第二路唤醒（2026-09-22 实测出现过互抢 controller lease）。开工前取锁：
+同一分钟可能有第二路唤醒（2026-09-22 实测出现过互抢 controller lease）。开工前取锁 —— **用工具，别手工 `echo $$`**（旧配方"先测存在再写"不是互斥：2026-09-23 两个心跳真的并发跑过，一个杀掉了对方正在跑的发布、另一个留下了 `release-pending.flag`）：
 
 ```bash
 cd /c/Projects/YeYuGamer
-LOCK=.cache/heartbeat.lock
-if [ -f "$LOCK" ]; then
-  age=$(( $(date +%s) - $(stat -c %Y "$LOCK") ))
-  pid=$(cat "$LOCK" 2>/dev/null)
-  alive=$(tasklist /FI "PID eq ${pid:-0}" /FO CSV /NH 2>/dev/null | grep -cE '^"')
-  if [ "$age" -lt 1500 ] && [ "${alive:-0}" -gt 0 ]; then
-    echo "another heartbeat holds the lock (age=${age}s pid=$pid); exiting"; exit 0
-  fi
-fi
-echo $$ > "$LOCK"
+C:/Users/Admin/.workbuddy/binaries/python/versions/3.13.12/python.exe scripts/heartbeat/hb-lock.py take || exit 0
 ```
-收尾时 `rm -f "$LOCK"`（**任何路径都要删，包括中途放弃**）。锁超过 25 分钟、或锁里的 pid 已经不在，视为陈旧，可抢占。
+
+- 退出码 **3 = 已有心跳在跑**（或被一把新鲜锁挡着）⇒ **静默退出**，不要做任何事。
+- 陈旧判定**只看年龄**（1500s / 25 分钟），不看 pid：本机每一步都是独立短命进程，"pid 已消失"几乎立刻成立，用它判存活等于没有锁。
+- 收尾：`... hb-lock.py release`（**任何退出路径都要释放**，包括中途放弃）。`heal-stuck-clients.py` 的守卫④只认**新鲜**锁，陈旧锁会被忽略 ⇒ 崩掉的心跳最多把重启推迟 25 分钟，不会永久封死。
 
 顺带看一眼 `runtime\state\stuck-client-heal.json` 的 `lastRestartAt`：若是不久前，说明自愈器刚重启过机器，**先按 §7 末核对三件事**（自动登录 / Manager / 残留是否清掉）再决定这一轮做什么。
 
 ## 2. 谁在干活：别和 `DailySupervisor` 抢
 
 - 机械动作（每 5 分钟）：计划任务 `\YeYuGamer\DailySupervisor`，队列空闲且有未完成必选项时自己 `start-daily`。日志 `.cache/logs/daily-supervisor/<日期>.log`；它读 `runtime\state\release-pending.flag` 并 `standing down`。
+  - **"每日 8 次补批"配额按游戏日计**（`supervisor-state.json`），2026-09-23 03:2x 修掉了"读错字段导致配额永不重置"的缺陷（commit `20b9531`）。它打 `needs a decision` 只说明**当天 8 次已经用完**，换日（04:00）自动清零 ⇒ **这不算机械通路坏掉，心跳不要自己去补发**（除非本轮有改了代码、需要一次实跑去验证的修复）。若它长期刷这条而状态文件里的 `gameDay` 明明变了，才是缺陷。
 - 每日 04:00：计划任务 `\YeYuGamer\DailyRun` + Manager 开关 `dailyScheduleEnabled/dailyScheduleTime`（两处缺一不可）。
 - 每 10 分钟：计划任务 `\YeYuGamer\StuckClientHealer`，只在"启用中的游戏真的被残留客户端互斥体挡着 + 队列空闲 + 没人在用机器"时重启机器（§0/§7）。日志 `runtime\logs\stuck-client-heal.log`。它还会写 `client-heal-pending.flag` **认领**下一个空闲窗口（见 §0）——`DailySupervisor` 见新鲜标志就 stand down，所以"队列一直忙"不再等于"重启永远做不了"。
 - ⇒ **心跳不重复发批次**。只在两处同时坏掉（supervisor 日志停更/一直误判 busy）时才自己补一次。
@@ -84,6 +79,8 @@ C:/Users/Admin/.workbuddy/binaries/python/versions/3.13.12/python.exe scripts/he
 - ❌ WER 里那批 `BlueScreen`（0x133/0x141 等）是 09-20 20:18 的旧崩溃延迟冲刷，**不是当日事件**。
 - ❌ NTE `artifact_count_exceeded`（21 条 > `MAX_ARTIFACTS_PER_TODO=20`）有 3 处测试固定 = **设计决策**，勿擅改，记录等用户确认。
 - ⛔ **NTE 必选 5/7 不可自动化**；NIKKE 走 WeGame（按钮必须点、UIA 不可用）；ZZZ 客户端过期用 CDP 点更新（禁止改 `game_path` 为 launcher.exe）。
+- ❌ "`review_required` 一律只能人工复核、当天没救" —— **不全是**。入口待办的瞬时"客户端没出窗口"审查（`upstream_observation_missing` + reason 以 `OneDragon run ended without an upstream|an operable normal-world readiness marker` 开头，`retryable=false`）会让该游戏当天永远凑不齐必选项；**自 2026-09-22（`56acdef`，release `20260922153800-b2f08636`）起，这类会在下一次显式请求的整轮 daily 批次里被重新派发**（`todo_dispatch.legacy_retryable_readiness_marker_review`）。⇒ 遇到"某游戏只差入口待办、且 review 时间落在客户端坏窗口内"，**不要当人工项、也不要手工改状态**，等 supervisor 补批即可（可用 `/todo-instances?gameId=X` 看 `dispatchDisposition` 是否已变 `eligible`）。**其余** `upstream_observation_missing` 原因（NIKKE 的 `formalGui=run_nikke_gui.py … Behavior Tree Result failure`、`OneDragon formal selected daily timed out`、缺奖励证据等）**仍留在 `review_required`**，不要为"凑完成"去放宽它们（测试已逐条锁死）。
+- ❌ **"只剩入口待办（`attach-home`）时跑不完 = 编排 bug"** —— 不是。0 字节 artifact 的两层修复已在生产验证通过（2026-09-23 03:33：`run_terminal` 取代 `invalid_schema` / `artifact_size_rejected`）；**剩下的秒退是结构性的**：当天其余 app 全完成后，OneDragon 不会为了一个只有观察意义的入口项再进游戏（`classic_tool_driver.py:1073-1085`，`No selected official application can produce the normal-world marker`）。两个候选修法（同轮共选 / 同日证据归属）写在 `docs/daily-workflow.md` §7 2026-09-23 条目里，**等用户定口径，别再当新问题查、也别为"凑完成"放宽契约**。
 
 ## 5. 运维处置配方（typed API，均需当前 `stateVersion`）
 
@@ -95,6 +92,7 @@ C:/Users/Admin/.workbuddy/binaries/python/versions/3.13.12/python.exe scripts/he
 | 有 parked 的 queued 成员且零活跃 attempt | `hb-mutate.py cancel-batch <batchId> "<reason>"`（这是清 parked run 的合法路径）|
 | 开关游戏 | `hb-mutate.py patch-enabled <GameId> <true\|false>` |
 | 自己补一发 | `hb-mutate.py start-daily-api`（先确认 supervisor 真的没动）|
+| **单游戏诊断**（只跑一个游戏、不动配置） | `POST /api/v1/batches` + `{"kind":"daily","mode":"execute","gameIds":["ZZZ"],"requestedBy":"cli"}`（配 `If-Match` / `Idempotency-Key` / `X-Expected-State-Version`）。**比"临时 `patch-enabled` 关掉别的游戏再恢复"更安全**：不动配置、无恢复步骤。实测 2026-09-23 03:33 批次 `a3561463`（ZZZ 单目标，约 40 秒收尾 `blocked`、无人工门）。 |
 | 客户端被残留互斥体挡住（当天做不完，只能重启）| 交给 `\YeYuGamer\StuckClientHealer`；预演用 `heal-stuck-clients.py --dry-run`，看 `runtime\logs\stuck-client-heal.log`。**别自己 `shutdown`** |
 | 前台被别的窗口占着、启动器抢不到前台 | `hb-foreground.py --all` 取证（前台持有者 + `IsHungAppWindow`）。有人正在用机器 ⇒ 如实记环境层，不要为它改编排 |
 
@@ -137,6 +135,14 @@ C:/Users/Admin/.workbuddy/binaries/python/versions/3.13.12/python.exe scripts/he
    装机文件 mtime 必须**早于** Manager 进程启动时间（`scripts/heartbeat/hb-status.py` 的 `startedAt`），否则跑的还是旧构建。全量测试：`PYTHONPATH=backend/tests .cache/build-python/Scripts/python.exe -m pytest backend/tests -q`（`platform/tests`、`adapter-host/tests` 按改动范围另跑；该 venv 若被清掉就重建一个再跑）。
 7. ⛔ **不要再用 `.cache/publish-watch.py`**：那套"后台 watcher + `release-pending.flag`"会卡在自己的等待循环里、把标志一直留着，2026-09-22 实际压住过整条心跳几十分钟。发布就按上面 1–6 步前台跑完、自己收尾。
 8. ⚠️ **网络：`pypi.org` 可能不通，先备镜像（2026-09-22 22:1x 实测）**。脚本第 1 步是 `pip install --require-hashes` 装 release tools（`Publish-YeYuGamerLocalRelease.ps1:520`，**没有 `--index-url`**）。若日志出现 `SSLError(SSLEOFError(8, ...UNEXPECTED_EOF_WHILE_READING))` / `No matching distribution found for <pkg>`，先做 10 秒只读诊断：`https://pypi.org/simple/<pkg>/` 是否 SSL EOF，而 `pypi.tuna.tsinghua.edu.cn` / `mirrors.aliyun.com` 是否 200。**修法（已验证可用）**：在 driver `.cmd` 里加 `set PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple` 再跑（镜像与 PyPI 同文件同 hash，`-I`/`-E` 只屏蔽 `PYTHON*` 不屏蔽 `PIP_*`）。**不要**改系统级 `pip.ini`。注意环境里 `HTTP(S)_PROXY=http://127.0.0.1:7897` 是 Clash Verge，重启后这条路可能变了；**游戏服务器是国内的，pypi 不通不影响玩游戏**。
+9. ⛔⛔ **发布失败或被中断后，第一件事是删 `release-pending.flag`**（2026-09-22 23:xx 实测踩过，代价是整条队列停摆）。
+   - 脚本可能在**最后一步**失败（`Start-YeYuGamer.ps1:82` 抛 `did not become healthy before the startup timeout`）并把 **Manager 留在停机状态**；此时标志若还留着，`Invoke-YeYuGamerDailySupervisor.py` 会在**读 snapshot 之前**就 `standing down`（检查标志那行早于 `ensure_manager()` 那行）⇒ **既不补批、也不会把 Manager 拉起来**，游戏日静默死掉。
+   - 处置顺序：`schtasks /delete` → `rm -f /c/ProgramData/YeYuGamer/runtime/state/release-pending.flag` → 等下一个 5 分钟 tick 自己恢复（实测 02:04 tick 自主 `manager recovery: started (exit=0)`）。**不要手动起 Manager。**
+   - 同一个道理：`client-heal-pending.flag` 是**自愈器认领的重启窗口**，发布前先看它在不在（见 §7 / §0）。
+10. ⚠️ **"装没装"不能只看脚本有没有抛**，也不能只看退出码——两个方向都会骗你。
+   - 实例：2026-09-22 的 `publish-hb0923d` **抛异常且没写 `PUBLISH_EXIT=`**，但两处修复**确实已装机**（已装 `adapter_artifacts.py` 里能 grep 到 `minimum_size`、`adapter_protocol.py` 里有图片非空判据）。
+   - **判据**：① `install-manifest.json` 的 `installedAt`；② 在已装 `site-packages` 里直接 grep 本次改动的**特征串/函数名**；③ 全树 md5（§6 第 6 条）；④ 装机 mtime 早于 Manager `startedAt`。
+11. ⚠️ **别在发布跑的同一时刻做重 IO 的事**（另开一轮全量测试、大范围 md5 扫描、复制大目录）。上面的"体检超时"根因就是发布自身的 IO 争用：`snapshot.store` 从 ~300ms 抬到 6.4–9.4s，Manager 启动实测 147–164s，而 `Start-YeYuGamer.ps1` 的体检预算是 **150s** ⇒ **是预算不够，不是新代码起不来**。建议把该预算提到 300s（承重脚本，2026-09-22 未动）。
 
 ## 7. "客户端秒退 / 不建窗口"这一族：结论已定，别再重查
 
