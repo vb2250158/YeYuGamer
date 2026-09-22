@@ -156,12 +156,39 @@ def evaluate_todo_dispatch(facts: TodoDispatchFacts) -> dict[str, object]:
             )
         )
     )
+    # Measured on this installation 2026-09-22: ZZZ's session-entry Todo
+    # (``attach-home``) was reviewed with ``upstream_observation_missing`` /
+    # "OneDragon run ended without an upstream normal-world readiness marker"
+    # during a window in which the client never produced a window at all -- the
+    # same attempt logged ``WindowCaptureError: no visible, non-minimized
+    # registered game window was found`` and the run ended with the driver's
+    # exit code 23.  A later batch on the *same* game day then reached the
+    # normal world and completed every other Todo of that game, which proves the
+    # failure was the transient environment, not the session entry itself.
+    # ``retryable=false`` nevertheless deferred ``attach-home`` for the rest of
+    # the game day, so the only remaining required Todo could never be
+    # re-observed and the day could not be completed.  A newly requested *full*
+    # daily batch restarts the session entry from the beginning, which is safe,
+    # so the readiness-marker variant is retryable here; every other
+    # ``upstream_observation_missing`` reason keeps its review.
+    legacy_retryable_readiness_marker_review = (
+        status == "review_required"
+        and blocker_kind in {"", "review_required"}
+        and review_reason_code == "upstream_observation_missing"
+        and review_reason.startswith(
+            (
+                "OneDragon run ended without an upstream normal-world readiness marker",
+                "OneDragon run ended without an operable normal-world readiness marker",
+            )
+        )
+    )
     retryable_routine_review = (
         status == "review_required"
         and (
             not blocker
             or retryable_review_blocker
             or legacy_retryable_formal_gui_review
+            or legacy_retryable_readiness_marker_review
         )
         and (
             bool(
@@ -169,6 +196,7 @@ def evaluate_todo_dispatch(facts: TodoDispatchFacts) -> dict[str, object]:
                 and facts.latest_attempt.get("retryable") is True
             )
             or legacy_retryable_formal_gui_review
+            or legacy_retryable_readiness_marker_review
         )
         and facts.risk in {"routine_action", "observe_only"}
     )

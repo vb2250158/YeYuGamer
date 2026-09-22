@@ -179,6 +179,17 @@
   - **二次尝试的已验证配方**：`Publish-YeYuGamerLocalRelease.ps1:520` 是 `& $python -I -B -m pip install ... --require-hashes`，**没有 `--index-url`** ⇒ 在 driver `.cmd` 里加 `set PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple` 即可（该镜像已实测含 `annotated-doc 0.0.5` 的 4 个文件；`-I`/`-E` 只屏蔽 `PYTHON*`，不屏蔽 `PIP_*`）。**不要**为此改系统级 pip.ini。
   - 处置：删除 `\YeYuGamer\Publish0922i` 任务与 `release-pending.flag`（**标志绝不能留**，见 heartbeat-playbook §9），把当天运行时间让给游戏。当前装机与源码的差异**只剩这一个文件**，所以"客户端层失败不是构建差异造成的"这个结论仍然成立。
 - ★ **跨日遗留人工门已批量清除（2026-09-22 22:1x）**：`/game-runs` 里有 **10 个 `human_required` run**（09-18~09-21，WW×6 / StarRail×2 / Endfield×1 + NIKKE 等）从未被释放——它们全属**过去的游戏日**，因此没有拦住今天，但是"跨批次遗留人工门堵死整条新日队列"这一族的现成火药（记忆里 05:0x 已经因此报废过一天）。全部用 `POST /game-runs/{id}/takeover-release-requests` 释放 ⇒ `human_required` 10→0、`review_required` 11→21，**如实保留为 review_required，不伪造成功**。以后心跳在发布/发批前顺手核一遍这个计数。
+- ★★ **2026-09-22 23:3x 新缺陷：一次瞬时"客户端没出窗口"把整天的入口待办永久锁死**（已修 + 已补测试，本轮发布）。
+  - **现象**：重启后 PGR 7/7 ✓、Endfield 3/3 ✓、GF2 7/7 ✓、StarRail 4/4 ✓ 全部真跑完成，`accepted=3`；但 **ZZZ 卡在 8/9**，唯一缺的必选是入口待办 `todo.v1.zzz.daily.attach-home`（"启动并确认已进入大世界"），状态 `review_required`、`updatedAt=2026-09-21T22:10:22Z`（本地 09-22 06:10，即**重启前的坏窗口**）。
+  - **机制**：那次 attempt（`ZZZ-9087cc36`）在 05:40 就 `todo.step_capture.failed reason=WindowCaptureError: no visible, non-minimized registered game window was found`（客户端还没出窗口），OneDragon 因此拿不到"大世界就绪"标记，收尾发给 Manager 的终态是
+    `todo_terminal status=review_required reasonCode=upstream_observation_missing reason="OneDragon run ended without an upstream normal-world readiness marker" retryable=false`（driver exit=23）。
+    而 `todo_dispatch.evaluate_todo_dispatch()` 的 `retryable_routine_review` 要求 `latest_attempt.retryable is True`（或命中已有的 `legacy_retryable_formal_gui_review` 允许列表）⇒ 这条被判为 `deferred_review`（`review_resolution_required`），**当天再发多少次新批次都不会重新派发它**。
+  - **为什么是缺陷而不是"如实标记"**：同一个游戏日更晚的批次（08:2x–08:42）里 ZZZ 客户端正常出窗口、其余 8 个必选全部 completed ⇒ 环境已自愈，**只有这一条因为 `retryable=false` 永远回不来**。入口待办回不来 = 该游戏当天不可能 9/9。这与"自动跑完 / 零意外"直接冲突，也与"review_required 只用于'工具不支持/官方没有该项'或真实需人工"的口径不符：它不是策略决定，是一次瞬时环境失败。
+  - **修法（`backend/yeyu_gamer_manager/services/todo_dispatch.py`，Manager 侧、最小面）**：新增 `legacy_retryable_readiness_marker_review`，与既有的 `legacy_retryable_formal_gui_review` 同构 —— 仅当 `status=review_required` 且 `review_reason_code == "upstream_observation_missing"` 且 reason 以
+    `"OneDragon run ended without an upstream normal-world readiness marker"` / `"...an operable normal-world readiness marker"` 开头，且 `risk ∈ {routine_action, observe_only}` 时才允许"新请求的**整轮** daily 批次从头重跑该入口待办"。
+    **其它 `upstream_observation_missing` 原因（如 NIKKE 的 `formalGui=run_nikke_gui.py; ... Behavior Tree Result failure`、`OneDragon formal selected daily timed out`、`missing_reward_evidence`）一律仍留在 review_required** —— 已在测试里逐条锁死。
+  - **测试**：`backend/tests/test_todo_dispatch.py` 新增 4 项（可进入新批次 / active_blocker 变体 / 三种"别的原因不得自动重试" / `forbidden` 风险仍 deferred_forbidden）；**区分度验证过**（把 reasonCode 判据临时改坏 ⇒ 两条正向测试精确失败为 `deferred_review`，负向测试仍通过）；`backend/tests` 全量 pytest `PYTEST_EXIT=0`、`undef_check2.py TOTAL=0`。
+  - **仍有残余**：NIKKE 当日 1/3，失败在上游工具自己的行为树（`run_nikke_gui.py` / "无法识别回到大厅"），属上游缺陷族，**不在本次修法覆盖范围内**（正确行为：如实 review_required，下一步查上游 WeGame/UIA 通路）。
 
 ## 8. 结束报告
 

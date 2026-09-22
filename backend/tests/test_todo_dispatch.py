@@ -222,6 +222,95 @@ class TodoDispatchPolicyTests(unittest.TestCase):
         self.assertEqual(projection["dispatchDisposition"], "eligible")
         self.assertTrue(projection["actionAvailability"]["execute"])
 
+    def test_readiness_marker_review_from_a_missing_window_can_enter_a_fresh_batch(self):
+        """The ZZZ ``attach-home`` verdict measured on 2026-09-22.
+
+        The client never produced a window, so OneDragon ended without the
+        normal-world readiness marker and the Adapter stored ``retryable=false``.
+        A new full daily batch restarts the session entry safely, so this exact
+        verdict must stay reachable instead of locking the game day.
+        """
+
+        projection = evaluate_todo_dispatch(
+            self.facts(
+                status="review_required",
+                latest_attempt={
+                    "retryable": False,
+                    "reasonCode": "upstream_observation_missing",
+                    "reason": (
+                        "OneDragon run ended without an upstream normal-world "
+                        "readiness marker"
+                    ),
+                },
+            )
+        )
+        self.assertEqual(projection["dispatchDisposition"], "eligible")
+        self.assertTrue(projection["actionAvailability"]["execute"])
+
+    def test_readiness_marker_review_survives_as_an_active_blocker(self):
+        projection = evaluate_todo_dispatch(
+            self.facts(
+                status="review_required",
+                latest_attempt={
+                    "retryable": False,
+                    "reasonCode": "upstream_observation_missing",
+                    "reason": (
+                        "OneDragon run ended without an operable normal-world "
+                        "readiness marker"
+                    ),
+                },
+                active_blocker={
+                    "kind": "review_required",
+                    "code": "upstream_observation_missing",
+                    "retryable": False,
+                    "reason": (
+                        "OneDragon run ended without an operable normal-world "
+                        "readiness marker"
+                    ),
+                },
+            )
+        )
+        self.assertEqual(projection["dispatchDisposition"], "eligible")
+        self.assertTrue(projection["actionAvailability"]["execute"])
+
+    def test_other_observation_missing_reviews_are_not_auto_retried(self):
+        """Only the readiness-marker variant is retried, never the whole code."""
+
+        for reason in (
+            "missing_reward_evidence",
+            "OneDragon formal selected daily timed out",
+        ):
+            with self.subTest(reason=reason):
+                projection = evaluate_todo_dispatch(
+                    self.facts(
+                        status="review_required",
+                        latest_attempt={
+                            "retryable": False,
+                            "reasonCode": "upstream_observation_missing",
+                            "reason": reason,
+                        },
+                    )
+                )
+                self.assertEqual(projection["dispatchDisposition"], "deferred_review")
+                self.assertFalse(projection["actionAvailability"]["execute"])
+
+    def test_readiness_marker_review_of_a_forbidden_todo_stays_deferred(self):
+        projection = evaluate_todo_dispatch(
+            self.facts(
+                status="review_required",
+                risk="forbidden",
+                latest_attempt={
+                    "retryable": False,
+                    "reasonCode": "upstream_observation_missing",
+                    "reason": (
+                        "OneDragon run ended without an upstream normal-world "
+                        "readiness marker"
+                    ),
+                },
+            )
+        )
+        self.assertEqual(projection["dispatchDisposition"], "deferred_forbidden")
+
 
 if __name__ == "__main__":
     unittest.main()
