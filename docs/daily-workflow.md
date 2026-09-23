@@ -320,6 +320,23 @@
     1. **快速失败**：只在**"完全拿不到帧"**这一条上计时（启动器窗口存在但连续 N 分钟 `no frames`）⇒ 提前收尾让 supervisor 早重试。**必须键在"没有帧"而不是"按钮找不到"**——后者在游戏更新期间是正常的（`_extend_deadline_for_update()` 就是为它存在的），键错会打坏"自动更新版本"这条根本目标。
     2. **升级上游工具**：本机绑定的是 `ok-nte v1.3.11`，而上游已有到 **`v1.3.20`（2026-09-21）**（`auditedRelease` 落后 9 个版本）。抓帧重启逻辑很可能已改过 ⇒ 优先按 `docs/integrations/` 的候选构建流程升到最新，再实跑验证；**不要**直接改 `C:\Game\YeYuGamerCandidates\` 里已绑定哈希的载荷（`tool-binding.json` 逐文件 sha256 绑定，改了就失去执行授权）。
 
+- ★★★ **2026-09-23 09:1x：NTE 全黑这一族"客户端侧"被彻底排除；黑帧是**精确全零**的缓冲，不是渲染结果**（心跳第 19 轮，只读取证；队列忙 ⇒ 未发布、未发批次、未动在跑批次）
+  - **触发**：今日第 4 次全黑（`0b50ec55`，08:15:31→09:10:35 跑满 3300s，`completed=0`）。
+  - **客户端自己的日志直接回答"客户端有没有问题"（最快的一条路，先看它）**：`C:\Program Files\Neverness To Everness\NTELauncher\UserData\Log\`
+    - `NTEGame.log`：`08:15:56` 起启动器正常起 QWebBrowser/视频背景，`08:16:00.372 [GameClientAgent::onGameElementUpdateFinished] all ready, wait for start game` ⇒ **客户端在 30 秒内就绪并在等"开始游戏"**；直到 `09:10:35 app aboutToQuit`（我们的 game_cleanup 关的）期间无异常；`lifespan=3285sec`。
+    - `NTEUpdate.log`：`Check update succeed, no need update` / `Run Update result = 201` / `No file need download`（`_CheckAllLocalFiles return 0 (0/667)`，磁盘剩 479GB）⇒ **没有在更新、也不是被更新挡住**。
+    - ⇒ 这一族**不是**"客户端要更新客户端版本"，**也不是**单实例互斥体（互斥体家族只对 PGR/GF2 实测过、且会表现为进程秒退；NTE 的启动器进程活满 54 分钟）。**以后遇到 NTE 全黑，禁止再从"客户端版本/更新/互斥体"入手。**
+  - **黑帧是什么**：`runtime\artifact-inbox\0b50ec55-*\nte-launcher-*.png`（26 张，`before-start` / `capture_launcher` / `exception-run`）用 cv2 实测 **`mean=0.0 / max=0 / 非黑 0.0%` = 整帧纯零**。任何真实渲染（哪怕深色主题）都不可能全通道恒零 ⇒ 这是**缓冲区从未被填充**，不是"画面黑"。**判据升级**：以后不必再靠 `color 0.0` 这类上游日志猜测，直接量 PNG 的 `max`。
+  - **对照（本轮新做，只读）**：`hb-nte-capture.py` 增援证据 —— 对机器上另外两个**长驻、已知正常**的启动器窗口做同一套抓帧：`米哈游启动器`（`Qt51517QWindowIcon`）`printwin PW_RENDERFULLCONTENT mean=119.72 / 非黑 97.66%`、WGC 新会话 `8/8 帧 mean=122.32 / 非黑 99.98%` ⇒ **这台机器此刻的 WGC/GDI 抓帧链路完全健康**；`鹰角启动器` 则是 WGC `CreateForWindow` 直接 `HRESULT 0x80070057`（窗口类不支持），属另一族。⇒ 全零帧**只发生在那一场 attempt 里**，与 08:0x 的结论一致，且排除了"机器级抓帧退化"。
+  - **新增一条可复现的相关性（供下一轮判断是否值得重启）**：本次开机（09-22 22:00）以来 NTE 的 **7 次 attempt 里只有 1 次成功**（`45931c70`，开机后 53 分钟），此后 **03:18 / 04:39 / 05:53 / 06:22 / 07:15 / 08:15 连续 6 次全零**（开机 5–11 小时）。历史成功率约 46 次里 39 次成功 ⇒ 连续 6 次失败不是偶然。**但这不等于"重启就能修"**：本轮对照已证明机器级抓帧健康，**不要仅凭这条相关性去重启机器**（重启有"回不来"的真实代价，见 `docs/heartbeat-playbook.md` §7 末）。
+  - **处置**：口径不变（重试仍是正确处置；不建人工门、不放宽契约、不改状态）。候选修法仍是上面 08:0x 条的两个（快速失败 / 升上游 `v1.3.20`），**仍未做，仍需单独一轮带测试与发布**。
+
+- ★★ **2026-09-23 09:15：NIKKE 出现新形态 `missing_run_terminal` —— 驱动已经如实发了终态，但**协议流里没有 `run_terminal`**（属本项目缺陷，待修）**
+  - **现象**：`NIKKE-6f2ff3f3`（09:12:21 launch.ready → 09:15:55 收尾）`adapter.watch.end exit=20 transport=crashed code=missing_run_terminal`、`attempt.result status=failed protocolValid=False`；`adapter.stderr.log` 只有一行 `driverExit=20; tail=`（驱动**零输出**，无 traceback）。
+  - **但 stage 文件里有诚实终态**：`runtime\artifact-inbox\6f2ff3f3-*\classic-stage-*.jsonl` 三行 = `started` → `upstream_log` → **`review_required`（`formalGui=run_nikke_gui.py; subtree=nikke_return_lobby.json; exit=1; upstreamTerminal=Behavior Tree Result failure`）**。⇒ 驱动按设计走完 `run_nikke` 的失败路径并 `return 20`，**真实原因是 NIKKE 上游行为树失败（已知族）**，与"协议崩溃"完全是两回事。
+  - **危害**：终态在协议流里丢掉 ⇒ Manager 记成 `protocolValid=False / missing_run_terminal`，**诚实原因被替换成一个假的协议故障**（报告/日报会显示更差且不准确的状态）；若同类竞态发生在**成功**路径上，就会把已完成的 Todo 记成失败并触发不必要的重跑。今日仅此 1 例（近两日 grep 只有这一条），但属"丢终态"这一族（与 09-23 两个 0 字节 artifact 修复同源）。
+  - **下一轮该做的定位起点（不要再从游戏/上游查）**：`adapter-host\classic-runner\Program.cs` 的 `RunDriver`（152–159：`WaitForExit(150)` 轮询 + 退出后**再** `DrainStages` 一次）与 `Emit`（404：`Console.Out.WriteLine + Flush`）看起来都对 ⇒ 怀疑点在**宿主侧读管道与进程退出的竞态**（`adapter.stdout.jsonl` 只到 `seq=3`，而 `run_terminal` 应在 `Main` 第 114 行之后发出）。定位手段：把该 attempt 的 `classic-stage-*.jsonl` 当作固定输入做一次**重放**（仓库已有 `adapter-host/tests` 的重放类测试），对比"应当发出的协议序列"与"实际发出的"。
+
 ## 8. 结束报告
 
 结束报告列出：范围与逐项结果、承接与本轮执行的区别、更新前后版本、根因及关键证据、YeYu commit/上游 PR、实际验证范围、残余阻塞及恢复点、客户端清理和报告状态。原始日志保留本机，外发只用已审查的脱敏材料。邮件按 `notification_policy.report_scope` 发送：默认 `game_day` = **一个游戏日一封、只报当天的最终结果**（不再按重试轮次逐轮发送）；`batch` = 旧的每轮报告。SMTP 受理不冒充送达。
