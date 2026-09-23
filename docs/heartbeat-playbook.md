@@ -176,6 +176,8 @@ C:/Users/Admin/.workbuddy/binaries/python/versions/3.13.12/python.exe scripts/he
 10. ⚠️ **"装没装"不能只看脚本有没有抛**，也不能只看退出码——两个方向都会骗你。
    - 实例：2026-09-22 的 `publish-hb0923d` **抛异常且没写 `PUBLISH_EXIT=`**，但两处修复**确实已装机**（已装 `adapter_artifacts.py` 里能 grep 到 `minimum_size`、`adapter_protocol.py` 里有图片非空判据）。
    - **判据**：① `install-manifest.json` 的 `installedAt`；② 在已装 `site-packages` 里直接 grep 本次改动的**特征串/函数名**；③ 全树 md5（§6 第 6 条）；④ 装机 mtime 早于 Manager `startedAt`。
+   - ⚠️ **核对适配器（`runner.exe` 这类 .NET 载荷）时，指纹串必须按 UTF-16LE 检索**：`.NET` 的字符串字面量在 `#US` 堆里是 UTF-16，**ASCII `grep`/`strings` 全部漏检**；而类/成员名会以 ASCII 出现在元数据里 ⇒ 很容易得出"已装"的错误结论（2026-09-23 实测：`.11` 的 `runner.exe` 里 `launcher_retry_storm` 有、`log_silence_seconds` 没有，这正是区分 `.11`/`.12` 的可靠指纹）。配方：`python -c "print(open(p,'rb').read().count('指纹串'.encode('utf-16-le')))"`。
+   - ⚠️ **别只看 `$PackageVersion` 是否被 bump**：源码版本号可以领先于装机（本轮 `.12` 就曾"改了但没发"），判断"有没有欠发布"要以**已装载荷里的指纹 + 版本号**两者同时为准。
 11. ⚠️ **别在发布跑的同一时刻做重 IO 的事**（另开一轮全量测试、大范围 md5 扫描、复制大目录）。上面的"体检超时"根因就是发布自身的 IO 争用：`snapshot.store` 从 ~300ms 抬到 6.4–9.4s，Manager 启动实测 147–164s，而 `Start-YeYuGamer.ps1` 的体检预算是 **150s** ⇒ **是预算不够，不是新代码起不来**。建议把该预算提到 300s（承重脚本，2026-09-22 未动）。
 
 ## 7. "客户端秒退 / 不建窗口"这一族：结论已定，别再重查
