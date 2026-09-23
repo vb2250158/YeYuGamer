@@ -97,6 +97,26 @@ if __name__ == "__main__":
         )
         print("status", status)
         print(json.dumps(payload, ensure_ascii=False)[:900] if isinstance(payload, dict) else payload[:900])
+    elif mode == "start-daily-games":
+        # start-daily-games <GameId> [<GameId> ...] —— 单/多游戏诊断批次（不动 enabled 配置）
+        game_ids = [item for item in sys.argv[2:] if item]
+        if not game_ids:
+            raise SystemExit("start-daily-games needs at least one game id")
+        version = state_version()
+        status, payload = call(
+            "POST",
+            "/batches",
+            {
+                "kind": "daily",
+                "mode": "execute",
+                "gameIds": game_ids,
+                "requestedBy": "cli",
+            },
+            idem="hb-batch-%s-%d" % ("-".join(game_ids), version),
+            expect=version,
+        )
+        print("status", status)
+        print(json.dumps(payload, ensure_ascii=False)[:900] if isinstance(payload, dict) else payload[:900])
     elif mode == "patch-enabled":
         # patch-enabled <GameId> <true|false>
         game_id, raw = sys.argv[2], sys.argv[3]

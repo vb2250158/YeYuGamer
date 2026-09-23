@@ -102,6 +102,10 @@ C:/Users/Admin/.workbuddy/binaries/python/versions/3.13.12/python.exe scripts/he
   桥接留的 `runtime\artifact-inbox\<attempt>\nte-launcher-before-start-*.png` 每 ~4 分钟一张，是同一件事的独立佐证。⇒ 遇到 NTE 长耗时**先数这个**，别再从"某处阻塞了 55 分钟"找起。
 - ★ **NTE 失败的 attempt 用的是"新起的启动器窗口"，旧说法要收窄**：`ensure_capture window size 0x0`（该 attempt 首轮，启动器还没起）→ 之后才是 `hwnd changed … Qt51517QWindowOwnDC real:0,0,1280,720`；且每次 attempt 收尾 Manager 的 `game_cleanup` 会把启动器关掉（**attempt 之间本机没有 NTEGame.exe**）⇒ "坏的是长驻会话"这条**只对 round-18 那个旧 hwnd 成立**。要在失败进行中复测就用 `hb-nte-capture.py`（见 §5）。
 - ❌ **"NIKKE 的 `无法识别回到大厅` 也是抓帧坏了" —— 不同源（2026-09-23 13:2x 负对照）**：NIKKE 当日 `game-ui-launch-phase-*.png` 实测 `mean≈97 / max=255`（真实画面）⇒ 它的失败在**上游识别层**，别和 NTE 合并成"机器级抓帧退化"。
+- ❌★ **"NTE 抓帧失败是因为启动器窗口还没建好 / 先起启动器就能修" —— 已证伪（2026-09-23 14:38–14:43 受控实验，别再试）**：预启动 `NTEGame.exe` 并确认窗口可见 60 秒后才发单游戏批次，attempt 走 `Launcher is already running; preparing launcher capture` → `Found process and window …`，**`ensure_capture` 仍返回 `window size 0x0`**、`launcher_button color 0.0` 到底 ⇒ **判别量不是窗口存不存在**。详见 `docs/daily-workflow.md` §7 第 23 轮条。
+- ❌ **"`top_hwnd_class` 不匹配导致抓不到启动器窗口" / "`selected_hwnd` 残留指向旧窗口"** —— 源码级排除：`ok/util/window.py:348-360`（`top_hwnd_class` 只是补充匹配，主匹配只看 `hwnd_class`）、`window.py:393` + `DeviceManager.py:870-876`（`selected_hwnd` 只在已匹配结果里加权，且传 `exe/hwnd_class` 时被归零）。
+- ★★ **"新会话能拿到帧 ⇒ 机器/环境没问题" 这个判据本身会漂移（2026-09-23 14:42 实测，推翻 09:2x 的乐观结论）**：同一个启动器窗口上，`hb-nte-capture.py` 全新 WGC 会话 **08:00 是 20/20，14:42（坏 attempt 跑了 3 分钟时）只有 5/20**，且 `PrintWindow PW_RENDERFULLCONTENT` 精确全零而 legacy flag 有内容。⇒ 机器级抓帧会**随坏 attempt 一起退化**（首选机制：坏 attempt 每 10s 一轮 `no frame→destroy→start WGC` 的风暴把整机 WGC 拖垮）。**用途**：`hb-nte-capture.py` 只在"坏 attempt 刚开始"时做对照才有意义；**与其做对照，不如尽快收掉坏 attempt**（快速失败的设计见 `docs/daily-workflow.md` §7 第 22 轮条⑥）。
+- ★ **显示器侧现状（2026-09-23 14:4x 只读）**：只有 `\\.\DISPLAY1`（NVIDIA RTX 5060 Ti）active/primary，10 个 `GameViewer Virtual Display Adapter` **全 inactive**（不是远程/虚拟显示顶屏）；上游探针报 `Windows HDR enabled: True (\\.\DISPLAY1: enabled=True, supported=False, bits=10)`（`adv_value=2`），而成功那次报 `supported=True`。⇒ **与失败同现但不是单独成因**（08:00 新会话在同状态下 20/20），登记为待跟线索，**不要**据此去改显示设置或重启。
 
 ## 5. 运维处置配方（typed API，均需当前 `stateVersion`）
 
