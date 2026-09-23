@@ -17,6 +17,7 @@ internal static class NteLauncherRetryStormReplay
     private static MethodInfo observe;
     private static MethodInfo observeStage;
     private static MethodInfo shouldAbort;
+    private static MethodInfo shouldAbortAt;
     private static MethodInfo describe;
 
     static int Main(string[] args)
@@ -26,8 +27,9 @@ internal static class NteLauncherRetryStormReplay
         observe = stormType.GetMethod("ObserveLog");
         observeStage = stormType.GetMethod("ObserveStage");
         shouldAbort = stormType.GetMethod("ShouldAbort");
+        shouldAbortAt = stormType.GetMethod("ShouldAbortAt");
         describe = stormType.GetMethod("Describe");
-        if (observe == null || observeStage == null || shouldAbort == null || describe == null)
+        if (observe == null || observeStage == null || shouldAbort == null || shouldAbortAt == null || describe == null)
             throw new Exception("The launcher retry watchdog is missing from the built runner");
 
         int successFirst = NeverAborts(SuccessStream(), "successful attempt");
@@ -44,6 +46,8 @@ internal static class NteLauncherRetryStormReplay
             throw new Exception("A restart storm must end early instead of burning the lease: " + stormFirst + "/" + stormTotal);
 
         Boundary();
+        ButtonScore();
+        LogSilence();
         Console.WriteLine("{\"suite\":\"nte-launcher-retry-storm\",\"passed\":true,\"gameStarted\":false" +
             ",\"successAbortIndex\":" + successFirst + ",\"updateWaitAbortIndex\":" + updateFirst +
             ",\"starvingAbortIndex\":" + starvingFirst + ",\"starvingRecords\":" + starvingTotal +
@@ -124,14 +128,59 @@ internal static class NteLauncherRetryStormReplay
             if ((bool)shouldAbort.Invoke(matched, null))
                 throw new Exception("A run that already matched the launcher button must not be ended");
         }
+    }
 
-        // An unmatched button score of 0.0 is not progress; a fractional score
-        // above zero is.
-        object fractional = NewStorm();
-        Feed(fractional, "LauncherTask:launcher_button color 0.4");
-        for (int start = 0; start < 30; start++) Feed(fractional, "LauncherTask:Launcher task started");
-        if ((bool)shouldAbort.Invoke(fractional, null))
-            throw new Exception("A non-zero launcher button score must not end a run");
+    // The button score marks real progress only near 1.0. This machine's starving
+    // attempts emitted 0.0 plus sub-0.03 noise that the official logger itself
+    // labels "launcher button not found" — none of those may disable the watchdog.
+    private static void ButtonScore()
+    {
+        object noise = NewStorm();
+        Feed(noise, "LauncherTask:launcher_button color 0.00125");
+        Feed(noise, "LauncherTask:launcher button not found");
+        Feed(noise, "LauncherTask:launcher_button color 0.025");
+        Feed(noise, "LauncherTask:launcher_button color 0.4");
+        for (int start = 0; start < 30; start++)
+        {
+            Feed(noise, "LauncherTask:Launcher task started");
+            Feed(noise, "LauncherTask:launcher_button color 0.0");
+        }
+        if (!(bool)shouldAbort.Invoke(noise, null))
+            throw new Exception("Sub-threshold button scores must not look like official progress");
+    }
+
+    // A wedged capture call stops the official logger; ten minutes of silence
+    // after a launcher start is a hang, not a wait.
+    private static void LogSilence()
+    {
+        object hung = NewStorm();
+        Feed(hung, "LauncherTask:Launcher task started");
+        Feed(hung, "LauncherTask:launcher_button color 0.00125");
+        DateTime start = DateTime.UtcNow;
+        if (!AbortsAt(hung, start.AddSeconds(660)))
+            throw new Exception("Silent official logging must end a wedged attempt");
+
+        object fresh = NewStorm();
+        Feed(fresh, "LauncherTask:Launcher task started");
+        DateTime held = DateTime.UtcNow;
+        if (AbortsAt(fresh, held.AddSeconds(30)))
+            throw new Exception("Normal official logging cadence must not end an attempt");
+
+        object updating = NewStorm();
+        Feed(updating, "LauncherTask:Launcher task started");
+        Feed(updating, "upstream:LauncherTask._extend_deadline_for_update:waiting_for_official_update");
+        if (AbortsAt(updating, DateTime.UtcNow.AddSeconds(660)))
+            throw new Exception("An official update wait must never be ended for silence");
+
+        object early = NewStorm();
+        Feed(early, "ok:ok-script init dev, ['main.py', '--task', '2', '--exit']");
+        if (AbortsAt(early, DateTime.UtcNow.AddSeconds(660)))
+            throw new Exception("Silence before the official launcher starts is not this watchdog's case");
+    }
+
+    private static bool AbortsAt(object storm, DateTime nowUtc)
+    {
+        return (bool)shouldAbortAt.Invoke(storm, new object[] { nowUtc });
     }
 
     private static IEnumerable<string> SuccessStream()
