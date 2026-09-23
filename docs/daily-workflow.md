@@ -401,6 +401,20 @@
   - **运维口径（给后续轮次）**：今后看到 NTE attempt **提前结束**且 `trigger=launcher_retry_storm`，**那是设计行为，不是缺陷**，不要当新问题查；只要 `protocolValid=True` 且 Todo 仍是 `eligible`，就按"上游抓帧层缺陷"归因（见 §4 禁查项），重试即正确处置，成本已降到约 10 分钟/次。
   - **本机时间读数的坑（写下来免得再犯）**：判断"日志多久没更新"必须用 `time.time() - os.path.getmtime(p)`；第 24 轮我把 `os.path.getmtime(p)` 的原始 epoch 当成"年龄"打印，差点据此把"日志静默"写成事实。
 
+- ★★ **2026-09-23 16:26–17:2x（心跳第 25 轮）：`.11` 的"一个噪声样本永久关掉看门狗"在生产里被完整复现 ⇒ `.12` 从"已知缺陷"变成"已确证必须发布"**
+  - **实例**：attempt `d6b44f9d`（批次 `2e5e804f`，**单游戏 NTE**，16:26:30 起）。`nte-upstream-console-*.jsonl` 里 `LauncherTask:launcher_button color 0.00125` 出现在**第 1 轮**（16:27:10），此后 `Launcher task started` 共 **9 轮**（16:26:51 / 16:29:10 / 16:31:22 / 16:33:23 / 16:35:30 / 16:37:30 / 16:39:42 / 16:41:43 / 16:43:55，约 2 分钟一轮）、**按钮匹配 0 次**、`no frame for 10 sec` 47 次、`launcher button not found` 102 次。
+  - ⇒ 按 `.12` 的判据本该在 `starts>=6`（16:37:30）就早停；实际因 `.11` 把 0.00125 当匹配（`buttonMatches != 0`）而**一路烧满 3300s 租约**。这就是"上一轮发现的缺陷在生产里的完整形态"，也解释了为什么必须等队列空闲把它换掉。
+  - **顺带的口径确认**：本轮**不再做** `hb-nte-capture.py` 对照（受控诊断额度当日已用；第 23 轮已判决性定案，且当时就提出"**与其做对照，不如尽快收掉坏 attempt**"）。真正的解法就是 `.12` 的自动早停。
+  - **`2e5e804f` 是单游戏批次**（`runMemberships` 只有 NTE 一条）⇒ 该 attempt 结束后队列**直接空闲**，是发布 `.12` 的窗口。
+
+- ★★★ **2026-09-23 18:16–18:5x（心跳第 26 轮）：`.12` 已发布装机，并用"带 0.00125 噪声的 attempt"在生产里做成 A/B 判决**
+  - **为什么必须先发布**：`.11`（上一轮装机）的判据是 `score > 0`，而 `launcher_button color 0.00125` 是**上游噪声**（真匹配恒为 1.0，上游紧接着自己打印 `launcher button not found`）⇒ 一个噪声样本就让 `buttonMatches != 0`、看门狗对该 attempt 永久失效、一路烧到租约（`d6b44f9d` 实测 50m17s + `protocolValid=False`）。`.12` 把阈值改成命名常量 `LauncherButtonMatchScore = 0.5`，并补 600s 日志静默兜底（`adapter-host/tests/NteLauncherRetryStormReplay.cs` 双向锁死）。
+  - **发布与装机核对**（队列空闲 + `DailySupervisor` 配额当日 8/8 用尽 ⇒ 无机械通路抢队列）：`releaseId 20260923102128-47332470`、`PUBLISH_EXIT=0`、`promotedGames=["NTE"]`；已装模块 `0.2.0-nte.12` / `buildId nte-20260923103011` / `installedAt 10:30:38Z` / `promotion=promoted` / `executionReady=true`；Manager 全树 md5 `mismatched=0`；Manager `startedAt 10:31:32Z` 晚于装机；`hb-adapters.py status` 11 个模块全 promoted（PGR/ZZZ/NIKKE 仍是 `0.3.0-classic-upstream.28`）。发布前建 `release-pending.flag`、完成后已删，`\YeYuGamer\Publish0923E` 任务已删，只剩三个生产任务。
+  - ★ **"装没装"的可靠判据（新，比版本号更硬）**：`.12` 的 `Describe()` 才输出 `log_silence_seconds` ⇒ 在已装 `runner.exe` 里按 **UTF-16LE** 检索该串（`.11` = 0 次、`.12` = 1 次）。**教训**：`.NET` 字符串字面量在 `#US` 堆里是 UTF-16，用 ASCII `grep`/`strings` 会**全部漏检**（`launcher_retry_storm` 只以 ASCII 出现在元数据里，所以 `.11` 看起来"有"）。
+  - ★★★ **生产 A/B（判决性）**：单游戏批次 `7c0d4b7d` → attempt `02aefd8d`（18:33:20 → 18:44:27，**11m07s**）里上游**同样打印了 `launcher_button color 0.00125`（1 次）+ `0.0` × 61 + `1.0` × 0**；看门狗在 `starts=6` 触发（`trigger=launcher_retry_storm`）→ `attempt.result status=failed protocolValid=True code=run_terminal`、`completed=0 unresolved=5`（5 条必选项**回到 `pending / eligible`**，可重试性未受损）、批次日正常封口、无人工门。**同一噪声样本，`.11` = 50m17s + 协议失败，`.12` = 11m07s + 协议完整** ⇒ 缺陷与修法都在生产里闭环。
+  - **今日 NTE 与 NIKKE 的结构性上限（如实记，不凑完成）**：NTE 必选 7 条 = 5 条 `eligible`（受上游启动器抓帧层限制，今日 0/11 次成功）+ 2 条 `review_required/deferred_review`（`adapter:upstream_operation_unavailable:daily-activity`、"现有工具尚未实现这些随机每日行"）；NIKKE 必选 9 条 = 1 条 completed + 8 条 `deferred_review`（`nikke_outpost.json` / `nikke_dispatch_friend.json` 上游行为树失败、`当前 ark 战斗分支未启用`、`当前行为树没有稳定导航` ×3、`三个旧 Mark 不能证明每日任务全部完成`）。⇒ **二者今天都不存在"跑到完成"的通路**，重试只会复现；已按 §4 禁查项归因为上游能力缺口，**未放宽任何契约**。
+  - **本轮不再重试的理由**：NTE 今日同一失败路径已复现 ≫3 次且本轮代码变更已用一次实跑验证完毕；受控诊断（`hb-nte-capture.py`）当日额度已由第 23 轮用尽 ⇒ 收手，转记录。
+
 ## 8. 结束报告
 
 
