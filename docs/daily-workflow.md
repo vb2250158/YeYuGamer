@@ -298,6 +298,28 @@
   - **待补**：`Publish-YeYuGamerLocalRelease.ps1` 的 install→promote 之间仍不是原子的（被硬杀时 `finally` 也不会跑）。它与本节的 supervisor 自愈是一对：自愈负责收尾，发布侧若再加"安装前记录、失败则回滚"会更干净。**策略口径（是否允许自动晋级）**：发布脚本自己就自动晋级，本自愈只是重放同一步，未引入新的授权级别。
   - **不要再当新问题查**：见到"某个已启用游戏整天 0/N 且批次里没有它的 run"，**第一步就是 `hb-adapters.py status`**，不要从图形层/客户端/上游查起。
 
+- ★ **2026-09-23 06:5x：NTE 的 `adapter_timeout` 是上游官方工具的抓帧层间歇性失效，不是编排/环境缺陷**（**已定案；候选改进只是"让失败快速失败"，不改契约**）
+  - **现象**：NTE attempt 跑满 `timeoutSeconds=3300` 却 `completed=0 unresolved=6`，期间只有 `todo=official-launch` 的 `run_progress`；收尾 `attempt.adapter_finished code=adapter_timeout` → `attempt.game_cleanup state=close-failed requested=[2716] remaining=[2716]` → `attempt.result code=game_cleanup_failed`。今日 04:38（`3b340468`）与 05:52（`31939090`）连续 2 次同形，白占队列 ~55 分钟/次。
+  - **上游一手证据**（`runtime\artifact-inbox\<attempt>\nte-upstream-console-*.jsonl`）：`windows_graphics:no frame for 10 sec, try to restart` 146–148 次 + `LauncherTask:launcher_button color 0.0` 302–304 次 + `LauncherTask:launcher button not found` 302–304 次 ⇒ **WGC 抓不到启动器窗口的画面**（帧全黑），"开始游戏"按钮永远识别不到，于是循环到超时。
+  - **对照（判决性）**：成功的 attempt（如 `45931c70`）在同一步骤 `Switching capture to launcher window` 之后 **57ms 就 `launcher_button color 1.0`**，30 秒内 `Found process and window HTGame.exe` 进游戏。全部 attempt 统计：**46 次里 39 次抓帧成功（~85%）、7 次撞全黑墙（~15%）**，失败散布在 09-22 的 `12bc6772`/`f50b31c9`/`3d80dea8`/`e0d07988`/`020b9815`/`9129fa5a` 与 09-23 的 `3b340468`/`31939090` ⇒ **长期间歇性，不是本次改动引入的**。
+  - **已排除（勿重查）**：① **窗口不存在** —— 上游自己的 `hwnd_window` 报 `hwnd=6490930 visible:True exists:1 window:1280x720 self.window:1280x720`；② **多屏/虚拟显示落点** —— `EnumDisplayMonitors` 本机**只有 1 块** 2560x1440 主屏，窗口 x=640 y=336 正好居中于主屏；③ **提权不匹配（WGC 最经典成因）** —— 监听 8877 的 Manager 进程 `TokenElevation=1`（**已提升**），而 `NTEGame.exe` 的清单正是 `<requestedExecutionLevel level="requireAdministrator">` ⇒ 链路同级，方向也反了；④ **残留客户端** —— 失败收尾后已无 `HTGame.exe`/`NTEGame.exe`/`NTELauncher.exe` 进程，且 `hb-mutex.py probe comkurogameharukuro "ilium-GF2-..."` 两个互斥体都 **free**。
+  - **因此处置口径**：NTE 每次尝试是"大概率能成"的偶发，**"再试一次"本身就是正确处置**（`DailySupervisor` 补批会自动重试，NTE 的必选项 `dispatchDisposition` 保持 `eligible`）。**不要**为它建人工门、**不要**放宽完成契约、**不要**为凑完成改状态。若同一游戏日再出现第 3 次全黑抓帧 ⇒ 才按 `docs/heartbeat-playbook.md` §7 做受控诊断（验证"重启后是否恢复"，即是否与运行时状态累积相关）。
+  - **候选改进（未做，别当缺陷修）**：唯一可治的是"失败也白占 3300s"。方向是在 NTE 适配器/驱动层加一条**快速失败**（例如启动器窗口已存在但连续 N 分钟抓帧全黑 ⇒ 提前发 `review_required` 并退出），属于"降低失败代价"，**不改变完成口径**；要动承重路径与适配器包版本，需单独一轮带测试与发布。
+
+- ★★ **2026-09-23 08:0x：NTE 全黑抓帧的**判决性判别**已做出来 —— 黑帧不是窗口/WGC/OS 的属性，而是"那一个长驻捕获会话"的状态**（同日第 3 次全黑触发 SOP §3 第 7 条受控诊断；**只读、未停任何服务、未改配置**）
+  - **触发**：今日 04:38（`3b340468`）→ 05:52（`31939090`）→ 07:15（`69550905`）连续 3 次同一签名，期间零代码/配置变更 ⇒ 按纪律停止重试、转受控诊断。
+  - **判别实验（可复用：`scripts/heartbeat/hb-nte-capture.py`）**：拿**上游自己的**抓帧类（`ok.device.capture_methods.windows_graphics.WindowsGraphicsCaptureMethod`，跑上游 venv）对一个 stub 窗口对象直接抓 `异环启动器` 那个 hwnd。结果：
+    - `08:00:57` **20 次取帧全部成功**、`08:04:11` 复跑（工具版）**15/20 次成功**（开头一次 10s 停顿后帧就持续到来），首帧都是 `(720,1280,4) mean=12.31 max=255` ⇒ **真实内容**；
+    - 同一分钟（`08:02:29`）正在跑的 attempt 仍写 `no frame for 10 sec` / `launcher_button color 0.0`。
+    - 绑定对象完全一致：窗口 `异环启动器` `hwnd=4850356(=0x4A02B4)`、`pid=1280 NTEGame.exe`、class `Qt51517QWindowOwnDC`（top `Qt51517QWindowToolSaveBitsOwnDC`）、`visible=True`、未最小化、`cloaked=0`、client `1280x720`、位于 `(640,336)`；上游自报的 `hwnd=4850356 ... visible:True exists:1 1280x720` 逐字段吻合。
+  - ⇒ **结论（收窄到机制层）**：窗口在、WGC 在、提权在、驱动/会话正常；**同一个 hwnd、重叠时间**下新会话能拿到帧、老会话 45 分钟拿不到 ⇒ 缺陷在**上游工具长驻进程里的抓帧会话生命周期**（`windows_graphics._do_get_frame()` 的"`no frame for 10 sec` → `close()` → 递归重建"循环没能真正把会话救回来），不是环境。
+  - **顺带解掉"我们的证据截图为什么全黑"**：`NteYeYuBridge._launcher_frame()` 存的是 `executor.nullable_frame()`（上游官方缓冲区），全黑是**继承**上游那一帧，不是我们截图坏了。
+  - ⚠️ **一条自我更正（别拿它当依据）**：首次诊断里"该 Qt 窗口 `PrintWindow(PW_RENDERFULLCONTENT=2)` 恒为纯黑"**不可复现**——同一个 hwnd 第二次跑（`hb-nte-capture.py` 08:04）两种 flag 都给出有内容（`mean 12.31 / 非黑 6.3%`）。⇒ **PrintWindow 结果在这台机器上不稳定，不能用作证据**；"换成 `BitBlt_RenderFull` 就能修好"既未证实也未证伪（它走 PW_RENDERFULLCONTENT），要改抓帧方式必须先做对照实验。**唯一可复现的判决性事实**是下面那条 WGC 对照。
+  - **因此处置口径不变**："再试一次"仍是正确处置（每次 attempt 都是**新进程 = 新会话**），不要建人工门、不要放宽契约、不要改状态。**新增**：遇到 NTE 全黑，**先跑 `hb-nte-capture.py`** 判别"会话坏了"还是"窗口/环境坏了"，不要再回到图形层/提权/多屏去查。
+  - **真正的两个修法（都需单独一轮，本轮未做）**：
+    1. **快速失败**：只在**"完全拿不到帧"**这一条上计时（启动器窗口存在但连续 N 分钟 `no frames`）⇒ 提前收尾让 supervisor 早重试。**必须键在"没有帧"而不是"按钮找不到"**——后者在游戏更新期间是正常的（`_extend_deadline_for_update()` 就是为它存在的），键错会打坏"自动更新版本"这条根本目标。
+    2. **升级上游工具**：本机绑定的是 `ok-nte v1.3.11`，而上游已有到 **`v1.3.20`（2026-09-21）**（`auditedRelease` 落后 9 个版本）。抓帧重启逻辑很可能已改过 ⇒ 优先按 `docs/integrations/` 的候选构建流程升到最新，再实跑验证；**不要**直接改 `C:\Game\YeYuGamerCandidates\` 里已绑定哈希的载荷（`tool-binding.json` 逐文件 sha256 绑定，改了就失去执行授权）。
+
 ## 8. 结束报告
 
 结束报告列出：范围与逐项结果、承接与本轮执行的区别、更新前后版本、根因及关键证据、YeYu commit/上游 PR、实际验证范围、残余阻塞及恢复点、客户端清理和报告状态。原始日志保留本机，外发只用已审查的脱敏材料。邮件按 `notification_policy.report_scope` 发送：默认 `game_day` = **一个游戏日一封、只报当天的最终结果**（不再按重试轮次逐轮发送）；`batch` = 旧的每轮报告。SMTP 受理不冒充送达。
