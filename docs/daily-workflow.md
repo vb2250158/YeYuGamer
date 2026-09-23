@@ -380,6 +380,22 @@
     ⚠️ **口径更正（必读）**：第 17 轮记的"46 次里 39 次成功（~85%）"是**帧/会话级**口径，**不是 attempt 级**。按 `manager.log` 的 `attempt.result` 重算：09-22 NTE 共 9 次 attempt（1 `completed` + 2 `review_required` + 4 `adapter_timeout` + 1 `artifact_count_exceeded` + 1 其它），09-23 共 8 次**全部失败**（7 `adapter_timeout` + 1 `game_cleanup_failed`）。⇒ 以后引用 NTE 成功率**必须写明是哪个口径**，不要再用"~85% 成功"推导"重试就够、不用修"。
   - 显示器侧取证（只读，用于排除"远程/虚拟显示顶屏"）：使用 `EnumDisplayDevices` 实测共 14 个适配器，**只有 `\\.\DISPLAY1`（NVIDIA RTX 5060 Ti）active/primary**，10 个 `GameViewer Virtual Display Adapter` **全部 inactive**；上游 GPU 探针在每个失败 attempt 都报 `Windows HDR enabled: True (\\.\DISPLAY1: enabled=True, supported=False, bits=10)`，当下直接用上游函数实测 `adv_value=2`（supported=False / enabled=True）；而 09-22 22:56 那次成功报的是 `supported=True`。⇒ 与失败**同现但不能单独成因**（08:00 新会话在同状态下 20/20）：**"advanced color 开着却不被支持"这个自相矛盾的显示态**登记为待跟线索。
 
+- ★★★ **2026-09-23 16:0x–16:3x（心跳第 24 轮）：「快速失败」已在 C# runner 落地、发布、生产验证通过**（队列全程空闲 ⇒ 本轮做了发布与实跑验证）
+  - **背景**：13:2x 条⑥ 已定"中止必须落在能保证进程终止的一层（C# runner）"，14:4x 条又证明"坏 attempt 会把机器级抓帧一起拖垮"。本轮把两件事一起解决。
+  - **实现（只改 `adapter-host/nte-runner/Program.cs`，一个文件，不新增源文件、不动构建脚本的编译清单）**：
+    - 新增只读看门狗 `Program.LauncherRetryStorm`，**只喂上游自己的日志流**（runner 早已通过 `OfficialLogReader` 实时读 `nte-upstream-*.jsonl`，logger=`ok`），统计三项：`Launcher task started` 次数、`no frame for 10 sec, try to restart` 次数、`launcher_button color <score>` 里 **score > 0 的匹配次数**。
+    - **判据**：`starts >= 6` **或** `noframe >= 30`，**且** `launcher_button_matches == 0`，**且** 本次 attempt 从未出现官方更新等待（`waiting_for_official_update`，来自桥接 stage 事件，因为上游日志里没有这个标记）。
+    - 触发后：以 `cleanupReason=launcher_retry_storm` **精确杀掉官方子进程**（复用既有 `ConfirmToolStopped`），并**走既有失败收尾路径**（`stageUpstreamLogs()` → pending 终态 → 未完成者 `failed` → `run_terminal`）。**不新增终态语义、不碰完成口径**。
+    - `detail` 追加 `;aborted_early:launcher_retry_storm:launcher_starts=..;no_frame_ticks=..;launcher_button_matches=..;official_update_wait=..`；协议新增一条 `run_progress code=official_launcher_abort`。
+  - **阈值来自本机实测（不是猜的）**：全量 attempt 统计——成功的一次 `starts=2 / noframe=2 / color_pos=2`；**所有**失败 attempt `starts >= 24 / color_pos=0`（多数还带 `noframe` 146–300+）。⇒ 阈值 6 相对成功样本有 **3 倍余量**，且用 `color_pos == 0` 兜住"官方已经认出启动器按钮"的进度证据。
+  - **测试（双向验证过）**：新增 `adapter-host/tests/NteLauncherRetryStormReplay.cs`（反射加载真 runner），覆盖 ① 成功序列**永不停**、② 官方更新等待序列**永不停**、③ 真实失败形态（27 轮）**在第 85/459 条即中止**、④ 无帧饥饿 30 次即中止、⑤ 阈值边界（5 轮不停、第 6 轮停）、⑥ 非零按钮分数不停。已挂进 `Test-YeYuGamerNteAdapter.ps1` 并计入 `replaySuiteDigest`。**破坏守卫（删掉 `updateWait`/`buttonMatches` 两个保护）⇒ 测试精确失败**（`The watchdog ended a run it must keep: official update wait at record 46`），恢复后全绿。
+  - **发布与装机核对**：`$PackageVersion` 升 `0.2.0-nte.11`；`releaseId 20260923080021-bebd70de`、`PUBLISH_EXIT=0`、`promotedGames=["NTE"]`；已装模块 `install-manifest.json` = `0.2.0-nte.11` / `installedAt 08:10:53Z` / `promotion.status=promoted` / `executionReady=true`；已装 `runner.exe` 里能 grep 到 `launcher_retry_storm` / `official_launcher_abort` / `launcher_button color ` 等特征串；Manager 全树 md5 `mismatched=0`、`startedAt 08:11:44Z` 晚于装机；`hb-adapters.py status` 全部 promoted。发布前建 `release-pending.flag`、完成后已删；`\YeYuGamer\Publish0923D` 任务已删。
+  - ★★★ **生产验证通过（批次 `43cfea8c` → attempt `9f92a364`，无人干预）**：16:14 起跑，16:24:16 看门狗触发 —— `adapter.stderr.tail {"eventType":"tool.stop.requested","trigger":"launcher_retry_storm","targetPid":29496,"action":"kill_exact_child"}` → `tool.stop.result exited:true` → `run_terminal {'status':'failed','transportOutcome':'crashed'}` → `attempt.adapter_finished status=failed transport=crashed code=run_terminal` → **`attempt.result status=failed protocolValid=True code=run_terminal`**。
+    - 对比：此前同类 attempt 是 **`adapter_timeout` + `protocolValid=False` + 跑满 3300s**；现在 **约 10 分钟**结束且**协议完整**。⇒ 单次失败成本从 ~55 分钟降到 ~10 分钟（≈5×），且不再有"坏 attempt 长时间独占机器抓帧"的通路。
+    - **可重试性未受损（关键不变式）**：5 条未完成必选项回到 `pending / dispatchDisposition=eligible`；批次正常封口（`activeBatch=None`，无人工门）。唯一一条 `review_required / deferred_review` 是**既有的结构性项** `检查每日活跃度达到100（需支持检查的工具候选）`（`adapter:upstream_operation_unavailable:daily-activity`，见 09-23 结构性上限条）——它此前被 `adapter_timeout` 的协议失败**掩盖**（Manager 丢弃越界/无效事件），现在随"诚实终态"一起如实上报。**这是可见性改善，不是新增缺口**：该项本来就无法由官方工具完成。
+  - **运维口径（给后续轮次）**：今后看到 NTE attempt **提前结束**且 `trigger=launcher_retry_storm`，**那是设计行为，不是缺陷**，不要当新问题查；只要 `protocolValid=True` 且 Todo 仍是 `eligible`，就按"上游抓帧层缺陷"归因（见 §4 禁查项），重试即正确处置，成本已降到约 10 分钟/次。
+
 ## 8. 结束报告
+
 
 结束报告列出：范围与逐项结果、承接与本轮执行的区别、更新前后版本、根因及关键证据、YeYu commit/上游 PR、实际验证范围、残余阻塞及恢复点、客户端清理和报告状态。原始日志保留本机，外发只用已审查的脱敏材料。邮件按 `notification_policy.report_scope` 发送：默认 `game_day` = **一个游戏日一封、只报当天的最终结果**（不再按重试轮次逐轮发送）；`batch` = 旧的每轮报告。SMTP 受理不冒充送达。
