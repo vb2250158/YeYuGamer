@@ -437,6 +437,19 @@
   - ⚠️ **顺带的 fixture 债（重要教训）**：全套测试里大量用 `42/10/20/2` 这类**主机上并不存在的 pid** 代表"存在的进程"，此前**靠旧的保守返回值偶然成立**。语义修正后 6 个测试立刻失败。它们的主题是**路径身份/队列关闭规则**，现已显式 pin `_process_is_live`（`QueueGameCloseTests` 在 `setUp` 统一 pin）⇒ **写 fixture 时用假 pid 必须同时 pin 存活判定，否则测试在偷偷测主机的 pid 表**。
   - **同批次对照（说明该缺陷是时序相关、不是普遍现象）**：紧随其后的 ZZZ `b21c2b0c` **9/9 完成**且 `attempt.game_cleanup state=closed requested=[45232] remaining=[]` → `attempt.result status=completed protocolValid=True`，未被误判。
 
+- ★★ **2026-09-25 01:22–01:35：自愈器重启后不清认领标志，把游戏日锁死 25 分钟**（**已修 + 已补可失败自测 + 双向验证；commit `78f46e4`**）
+  - **事实链**：`StuckClientHealer` 按设计在 **01:22:16** 重启机器清除 PGR 单实例互斥体（守卫全过：队列空闲、`console idle 1774s`）。**机器 2 分钟就回来了**（01:22 关机 → 01:24:21 启动，**没有**重演 09-22 那次 7h46m）。重启后三项核对全过：`console Admin 1 Active` + explorer 已加载（pid 10912）；`comkurogameharukuro` 与 `ilium-GF2-…` **均 free (not held)**；无任何残留进程。⇒ **自愈器这一轮是成功的**，卡了几天的 PGR/GF2 互斥体被真正清掉。
+  - **缺陷**：自愈器在 **01:30:04** 醒来时**早于** desktop host 恢复，走 `except Exception` 分支只打一行 `ERROR cannot read the Manager snapshot` 就 `return 1`，**没有清掉自己写的 `client-heal-pending.flag`**。于是死锁：该标志"新鲜"（≤1500s）期间 `DailySupervisor` 一律 stand down（**含它的 `ensure_manager()` 恢复路径**），而自愈器已无事可做（互斥体已 free，但它要读 snapshot 才能判 "healthy" 并 `clear_reserve()`）⇒ **Manager 一直不被拉起，游戏日静默停摆**。实测手工删除该标志后，supervisor 下一个 tick（01:34）立刻 `manager recovery: started (exit=0)`。
+  - **修法**：Manager 不可读时也释放认领（读不到 snapshot 就判不出有卡住的客户端，本轮什么也治不了，而认领不该比它的理由活得更久）。
+  - ⚠️ **同时修掉一个"只打印不返回"的自测**：`main()` 丢弃了 `selftest()` 的返回值，所以即使契约被破坏 `--selftest` 仍退出 0 ⇒ **无人值守下回归不会被发现**。现改为 `return selftest()`，并新增一条契约检查（unreadable-Manager 分支必须释放认领）。
+  - **通用教训**：这是 `docs/heartbeat-playbook.md` §9 那条"标志必须与真实状态一致"的**第二个实例**（第一个是 `release-pending.flag`）。**任何"认领窗口"式标志都必须有一条不依赖被恢复对象的清除路径**，否则它会在恢复对象缺席时按新鲜度上限封锁恢复。
+- ★★ **2026-09-25 01:0x 顺带：安装守卫正确拦下一次发布，同时暴露了它自己的归因盲区**
+  - 发布在事务**开始前**被 `Assert-YeYuGamerInstallTargetsAreMovable` 拦下，明确报出 `app` 不可移动 —— **未产生任何半损坏装机**（对比 09-24 那次：600s 超时后留下 desktop host 丢失）。这正是该守卫要达到的效果。
+  - 但归因只写 "the holder is unidentified"。实测持有者是 **LDPlayer 的孤儿 `adb.exe` fork-server**（`C:\Game\LDPlayer9\adb.exe`）：它的**工作目录是 `C:\Windows`**，真正占用的是**一个打开的目录句柄**（`handle64` 显示 `File (RW-) …\YeYuGamer\app\desktop-host`）⇒ 按工作目录扫描**必然匹配不到**。报告现在区分「工作目录占用」与「打开的目录句柄」两类，并说明只需停掉持有者、安装本身无需改动。
+  - **注意**：该 `adb.exe` 会被 LDPlayer 服务**反复拉起**（当日已在 21:29、22:23、22:16 三次重生）。发布前值得先确认它不在；**不要**擅自停用 LDPlayer 服务本身。
+- ★ **2026-09-25 01:39 重启后的队列实测（WW 除外全部真实开跑）**：删除陈旧标志后 supervisor 于 01:39 自动补批 `718ff972`（正确跳过已 `done` 的 StarRail/ZZZ/GF2，且正确打出 `game day changed … the start budget starts over`）。**重启清掉互斥体后效果立现**：PGR `launch.ready 82.9s readyWindowPid=13436 1280x720`、Endfield `launch.ready 155.3s readyWindowPid=16676 1920x1080`（**此前当日 Endfield 是"13 次动作不出窗口"**）⇒ 与 09-22 22:2x 的自然实验同构，再次印证"客户端不出窗口"这一族与互斥体残留强相关。
+  - PGR 这次仍 `failed` 但**形态全新**：客户端正常出窗口、运行约 60 秒后**自己退出**（客户端日志 `XApplication Exit.` / `XFightNetwork.Disconnect` @01:43:00），MPA 随即报 `监控循环中检测到控制器断开` → `任务 '进入游戏' 执行失败` → 级联到"拟战场域"。编排侧**如实**记录（`protocolValid=True code=run_terminal`，`game_cleanup state=already-closed`）。⇒ 归因指向**上游工具与客户端交互层**（控制器断连），不是编排缺陷。
+
 ## 8. 结束报告
 
 
