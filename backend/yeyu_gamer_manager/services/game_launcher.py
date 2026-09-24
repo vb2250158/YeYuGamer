@@ -580,6 +580,10 @@ try {
     # Exit-code probes inform readiness only. An enumerated residual with an
     # unusual exit state does not establish why it remains or free its resources.
     STILL_ACTIVE = 259
+    # OpenProcess failures that prove the process id no longer exists, as opposed
+    # to a permission problem that must stay conservative.  See
+    # ``_process_is_live``: misreading these as live downgraded a completed daily.
+    PROCESS_GONE_ERROR_CODES = frozenset({87, 1168})  # INVALID_PARAMETER, NOT_FOUND
     # Current official public-desktop shortcut targets the root Launcher.exe.
     # Games.exe may also omit --region (observed with signed launcher 1.5.0).
     # Preserve its official default; reject conflicting explicit selectors.
@@ -3510,10 +3514,24 @@ exit 4
 
     @classmethod
     def _process_is_live(cls, process_id: int) -> bool:
-        """Filter observed final exit codes for launch readiness only.
+        """Whether an enumerated entry still has a running process behind it.
 
-        Access/query failures conservatively return True. This check does not
-        explain an enumerated residual or prove that resources were released.
+        Access/query failures stay conservative (``True``), because "cannot ask"
+        is not proof of anything.  But a failed ``OpenProcess`` reports *why*
+        through the last error, and two of those codes are proof the process is
+        gone rather than merely unreadable:
+
+        * ``ERROR_INVALID_PARAMETER`` (87) -- no such process id.
+        * ``ERROR_NOT_FOUND`` (1168) -- the id no longer resolves.
+
+        Treating those as live is what recorded a finished StarRail daily as a
+        failure (measured 2026-09-24 23:18, attempt ``0db14fa7``): all four
+        required Todos completed and the Adapter ended cleanly, but the trailing
+        residual re-read still listed the exited client, this check called it
+        live, and the attempt was downgraded to
+        ``status=failed protocolValid=False code=game_cleanup_failed``.
+        ``ERROR_ACCESS_DENIED`` (5) keeps the conservative answer, so a process
+        owned by another user is never written off as exited.
         """
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -3525,7 +3543,7 @@ exit 4
         kernel32.CloseHandle.restype = wintypes.BOOL
         handle = kernel32.OpenProcess(0x1000, False, process_id)
         if not handle:
-            return True
+            return ctypes.get_last_error() not in cls.PROCESS_GONE_ERROR_CODES
         try:
             exit_code = wintypes.DWORD()
             if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):

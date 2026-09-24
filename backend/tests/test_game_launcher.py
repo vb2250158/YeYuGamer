@@ -950,6 +950,125 @@ ConvertTo-Json -InputObject $results -Compress
         self.assertEqual(receipt.state, "started")
         self.assertEqual(receipt.ready_window_pid, 55)
 
+    def test_a_gone_process_id_is_not_reported_live(self) -> None:
+        """A pid that cannot exist must not count as a live residual.
+
+        Measured 2026-09-24: ``_process_is_live(2147483000)`` returned True even
+        though OpenProcess failed with ERROR_INVALID_PARAMETER, so an exited
+        StarRail client stayed a "residual" and turned a fully completed daily
+        into ``game_cleanup_failed``.  Only a permission failure may stay
+        conservative.
+        """
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # A pid far above any live id: OpenProcess reports it does not exist.
+        gone = 2147483000
+        handle = kernel32.OpenProcess(0x1000, False, gone)
+        if handle:
+            kernel32.CloseHandle(handle)
+            self.skipTest("this host resolved the probe pid; cannot test the gone case")
+        self.assertNotIn(
+            ctypes.get_last_error(), (), "get_last_error must be read after the call"
+        )
+        self.assertFalse(GameLaunchService._process_is_live(gone))
+
+    def test_an_unreadable_process_stays_conservatively_live(self) -> None:
+        """A process we may not query must still count as possibly live."""
+
+        with mock.patch(
+            "ctypes.WinDLL"
+        ) as dll, mock.patch(
+            "ctypes.get_last_error", return_value=5  # ERROR_ACCESS_DENIED
+        ):
+            kernel32 = mock.Mock()
+            kernel32.OpenProcess.return_value = 0
+            dll.return_value = kernel32
+            self.assertTrue(GameLaunchService._process_is_live(4242))
+
+    def test_close_started_does_not_revive_a_client_that_already_exited(self) -> None:
+        """A successful close must not be re-opened by a stale re-read.
+
+        Measured 2026-09-24 23:18 on this host (StarRail attempt ``0db14fa7``):
+        all four required Todos completed with ``upstream_task_succeeded`` and
+        the Adapter ended cleanly (``adapter.watch.end exit=0 -> status=completed
+        transport=clean``), yet the attempt was recorded as
+        ``status=failed protocolValid=False code=game_cleanup_failed`` because
+        ``attempt.game_cleanup`` reported ``requested=[39716]
+        remaining=[39716]``.  The pid was gone seconds later -- the exit ladder
+        had actually closed the client, and only the trailing
+        ``remaining |= self._listed_cleanup_residuals(...)`` re-read brought the
+        exited entry back as a blocker.  A finished daily must not be downgraded
+        because Windows kept enumerating an exited process.
+        """
+
+        receipt = GameLaunchReceipt(
+            "started", 39716, "StarRail.exe", (), ("starrail.exe",),
+        )
+        # The ladder sees the client once, requests its close, then the client
+        # is gone from the running enumeration -- but the raw enumeration still
+        # lists the exited entry.
+        owned_calls = {"n": 0}
+
+        def list_running(_names):
+            owned_calls["n"] += 1
+            return {39716: "StarRail.exe"} if owned_calls["n"] == 1 else {}
+
+        with mock.patch.object(
+            self.launcher, "_list_running", side_effect=list_running,
+        ), mock.patch.object(
+            self.launcher, "_list_enumerated", return_value={39716: "StarRail.exe"},
+        ), mock.patch.object(
+            self.launcher, "_request_graceful_close",
+        ), mock.patch.object(
+            self.launcher, "_terminate_owned",
+        ) as terminate, mock.patch.object(
+            GameLaunchService, "_process_is_live", return_value=False,
+        ), mock.patch.object(
+            GameLaunchService, "_list_zombies", return_value={},
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.sleep"
+        ):
+            result = self.launcher.close_started(receipt)
+
+        # An already-exited entry is not a residual: the close succeeded and the
+        # exit ladder did not have to force anything.
+        self.assertEqual(result.state, "closed")
+        self.assertEqual(result.remaining_process_ids, ())
+        terminate.assert_not_called()
+
+    def test_close_started_still_reports_a_live_unclosable_client(self) -> None:
+        """The inverse: a client that really is alive must stay a residual.
+
+        Guards the fix above from weakening cleanup -- only an exited entry may
+        be dropped, never a live one.
+        """
+
+        receipt = GameLaunchReceipt(
+            "started", 39716, "StarRail.exe", (), ("starrail.exe",),
+        )
+        with mock.patch.object(
+            self.launcher, "_list_running", return_value={39716: "StarRail.exe"},
+        ), mock.patch.object(
+            self.launcher, "_list_enumerated", return_value={39716: "StarRail.exe"},
+        ), mock.patch.object(
+            self.launcher, "_request_graceful_close",
+        ), mock.patch.object(
+            self.launcher, "_terminate_owned",
+        ), mock.patch.object(
+            GameLaunchService, "_process_is_live", return_value=True,
+        ), mock.patch.object(
+            GameLaunchService, "_list_zombies", return_value={},
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.sleep"
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.monotonic",
+            side_effect=[0.0, 1000.0] * 40,
+        ):
+            result = self.launcher.close_started(receipt)
+
+        self.assertEqual(result.state, "close-failed")
+        self.assertEqual(result.remaining_process_ids, (39716,))
+
     def test_exited_but_still_listed_entry_is_not_a_cleanup_residual(self) -> None:
         """An exited process kept listed by another handle must not block the queue.
 
@@ -2075,7 +2194,12 @@ ConvertTo-Json -InputObject $results -Compress
         with mock.patch(
             "yeyu_gamer_manager.services.game_launcher.subprocess.run",
             return_value=completed,
-        ) as run:
+        ) as run, mock.patch.object(
+            # The subject is name filtering, and pid 2 is arbitrary.  Liveness is
+            # pinned because `_process_is_live` now reports a nonexistent id as
+            # not live (see the sibling test below, which exercises that).
+            type(self.launcher), "_process_is_live", return_value=True,
+        ):
             observed = self.launcher._list_running({"starrail.exe"})
 
         self.assertEqual(observed, {2: "StarRail.exe"})
@@ -2147,6 +2271,11 @@ ConvertTo-Json -InputObject $results -Compress
             self.launcher, "_list_zombies", return_value={1234: "StarRail.exe"}
         ), mock.patch.object(
             self.launcher, "_list_enumerated", return_value={1234: "StarRail.exe"}
+        ), mock.patch.object(
+            # The subject is "a *live* enumerated residual must not be reported as
+            # already-closed", so the fixture pins liveness; the pid itself is
+            # arbitrary and does not exist on the host.
+            GameLaunchService, "_process_is_live", return_value=True,
         ):
             result = self.launcher.close_started(receipt)
         self.assertEqual(result.state, "close-failed")
@@ -2169,6 +2298,18 @@ class QueueGameCloseTests(unittest.TestCase):
         memory = mock.patch.object(self.launcher, "_available_memory", return_value=None)
         memory.start()
         self.addCleanup(memory.stop)
+        # Every test in this class drives queue-close and path-identity rules
+        # through fixtures whose pids (42, 10, 20, ...) do not exist on the host.
+        # `_process_is_live` now answers "not live" for an id Windows reports as
+        # nonexistent -- the fix for a completed StarRail daily being recorded as
+        # `game_cleanup_failed` -- so liveness is pinned here to keep each test's
+        # subject its own rule rather than the host's pid table.  Tests that care
+        # about liveness override this patch themselves.
+        liveness = mock.patch.object(
+            GameLaunchService, "_process_is_live", return_value=True
+        )
+        liveness.start()
+        self.addCleanup(liveness.stop)
 
     def test_preexisting_authorized_client_closes_gracefully_with_memory_observations(self) -> None:
         present = ({42: self.identity}, set())
@@ -2238,6 +2379,11 @@ class QueueGameCloseTests(unittest.TestCase):
         }
         with mock.patch.object(GameLaunchService, "_list_enumerated", return_value={pid: "StarRail.exe" for pid in identities}), mock.patch.object(
             GameLaunchService, "_queue_process_identity", side_effect=identities.get,
+        ), mock.patch.object(
+            # Fixture pids are arbitrary; pin liveness so the subject under test
+            # stays the path-identity rule rather than Windows' answer for an id
+            # that happens not to exist.
+            GameLaunchService, "_process_is_live", return_value=True,
         ):
             verified, unknown = self.launcher._queue_close_snapshot(self.root, {"starrail.exe"})
         self.assertEqual(verified, {42: self.identity})
@@ -2487,6 +2633,11 @@ class QueueGameCloseTests(unittest.TestCase):
             return ()
         with mock.patch.object(GameLaunchService, "_list_enumerated", side_effect=lambda _: dict(names)), mock.patch.object(
             GameLaunchService, "_queue_process_identity", side_effect=identities.get,
+        ), mock.patch.object(
+            # The fixture's pids are arbitrary, so liveness is pinned: this test
+            # is about a live sibling surviving its bootstrap's exit, not about
+            # how Windows reports a nonexistent id.
+            GameLaunchService, "_process_is_live", return_value=True,
         ), mock.patch.object(self.launcher, "_close_verified_queue_processes", side_effect=close) as action:
             result = self.launcher.close_for_queue("NTE", str(launcher))
         self.assertEqual(result.state, "close-failed")
@@ -2598,7 +2749,13 @@ class QueueGameCloseTests(unittest.TestCase):
         receipt = GameLaunchReceipt("started", 42, "Client-Win64-Shipping.exe", (), ("client-win64-shipping.exe",), ww_launcher_path=str(self.root / "launcher.exe"))
         with mock.patch.object(self.launcher, "_list_ww_running", return_value={}), mock.patch.object(self.launcher, "_list_zombies", return_value={}), mock.patch.object(
             GameLaunchService, "_list_enumerated", return_value={42: "Client-Win64-Shipping.exe"},
-        ), mock.patch.object(GameLaunchService, "_process_executable_path", return_value=None), mock.patch.object(self.launcher, "_request_graceful_close") as close:
+        ), mock.patch.object(GameLaunchService, "_process_executable_path", return_value=None), mock.patch.object(
+            # This case is about an *unreadable image path*, so the process is
+            # pinned live explicitly: `_process_is_live` now answers "not live"
+            # for an id Windows says does not exist, and letting the fixture's
+            # arbitrary pid 42 decide that would test the wrong thing.
+            GameLaunchService, "_process_is_live", return_value=True,
+        ), mock.patch.object(self.launcher, "_request_graceful_close") as close:
             result = self.launcher.close_started(receipt)
         self.assertEqual(result.state, "close-failed")
         self.assertEqual(result.remaining_process_ids, (42,))
