@@ -989,7 +989,20 @@ function Assert-YeYuGamerInstallTargetsAreMovable {
     $lines = foreach ($entry in $blocked) {
         $holders = @($entry.Holders)
         if ($holders.Count -eq 0) {
-            "  {0} (no process working directory matched; the holder is unidentified)" -f $entry.Path
+            # A directory can be held without being anyone's working directory:
+            # a process may simply have an open handle to it.  Measured
+            # 2026-09-24 and again 2026-09-25: LDPlayer's orphaned adb.exe
+            # fork-server kept `app\desktop-host` open (working directory was
+            # C:\Windows, so the scan above correctly did not match it) and
+            # blocked the install transaction.  Naming the mechanism keeps the
+            # failure actionable even when the exact process cannot be resolved
+            # from a working-directory scan.
+            "  {0}" -f $entry.Path
+            "      no holder's working directory matched, so this is an open" +
+                " handle rather than a current-directory lock."
+            "      Check for orphaned emulator/ADB helpers and other long-lived" +
+                " third-party processes, then retry.  Only the holder must go;" +
+                " nothing in the installation needs to change."
         } else {
             foreach ($holder in $holders) {
                 "  {0} <- {1} (pid {2}) working directory {3}" -f `

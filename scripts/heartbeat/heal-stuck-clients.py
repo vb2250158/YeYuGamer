@@ -326,6 +326,21 @@ def selftest() -> int:
               % (game, (runtime.get(game) or {}).get("enabled"), remaining,
                  (runtime.get(game) or {}).get("runtimeState")))
     print("== decision ==")
+    # Contract: a Manager that cannot be read must release the restart claim.
+    # Measured 2026-09-25 01:30 -- the healer restarted the machine at 01:22,
+    # then woke before the desktop host was back, logged "cannot read the
+    # Manager snapshot" and returned *without* clearing its claim, so the
+    # supervisor kept standing down and neither side restored the Manager until
+    # the claim aged out 25 minutes later.  Verified by reading the source, since
+    # the failure path requires an unreachable Manager.
+    import inspect
+    source = inspect.getsource(main)
+    marker = "clear_reserve()"
+    failure_branch = source.split("except Exception as error:", 1)
+    if len(failure_branch) == 2 and marker not in failure_branch[1].split("return 1", 1)[0]:
+        print("  CLAIM RELEASE   = MISSING in the unreadable-Manager branch (fails the contract)")
+        return 1
+    print("  claim release on unreadable Manager = present (contract holds)")
     return 0
 
 
@@ -398,13 +413,24 @@ def main() -> int:
     no_observe = "--no-observe" in sys.argv
 
     if "--selftest" in sys.argv:
-        selftest()
-        return 0
+        # Propagate the verdict: a contract check that only prints would let a
+        # regression pass unnoticed in an unattended run.
+        return selftest()
 
     try:
         snap = snapshot()
     except Exception as error:  # noqa: BLE001 - a missing Manager must not crash the task
-        log("ERROR cannot read the Manager snapshot: %s" % error)
+        # A Manager that cannot be read cannot show a stuck client, so nothing can
+        # be healed on this tick -- and the claim must go, otherwise the claim
+        # outlives the reason for it.  This is precisely the state right after
+        # this script restarts the machine: the healer wakes before the desktop
+        # host is back, and while the claim is fresh the supervisor stands down
+        # instead of starting the Manager, so neither side can make progress
+        # until the claim ages out (measured 2026-09-25 01:30: the restart
+        # finished at 01:22, the healer logged "cannot read the Manager snapshot",
+        # and the game day sat idle until the flag was cleared by hand).
+        clear_reserve()
+        log("ERROR cannot read the Manager snapshot: %s (released the restart claim so the supervisor can restore the Manager)" % error)
         return 1
 
     runtime = {g.get("gameId"): g for g in (snap.get("games") or [])}

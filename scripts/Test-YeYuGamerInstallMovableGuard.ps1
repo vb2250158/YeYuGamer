@@ -111,6 +111,27 @@ try {
     Assert-YeYuGamerInstallTargetsAreMovable -DirectoryTargets @([pscustomobject]@{ Path = $held })
 
     # ------------------------------------------------------------------
+    # 2b. An unavailable path is reported as an open handle, not as "unknown".
+    # ------------------------------------------------------------------
+    # Measured 2026-09-24 and 2026-09-25: LDPlayer's orphaned adb.exe fork-server
+    # held `app\desktop-host` open while its working directory was C:\Windows, so
+    # the working-directory scan correctly matched nothing and the report said
+    # only "the holder is unidentified".  The two mechanisms are different and
+    # the report must say which one applies so the operator knows what to stop.
+    $openHandle = $null
+    try {
+        Assert-YeYuGamerInstallTargetsAreMovable -DirectoryTargets @(
+            [pscustomobject]@{ Path = 'C:\Windows\System32\config' }
+        )
+    } catch {
+        $openHandle = [string]$_.Exception.Message
+    }
+    if ($null -ne $openHandle) {
+        Assert-Guard ($openHandle -match 'open handle|working directory') `
+            'A blocked target must be reported as either a working-directory lock or an open handle.'
+    }
+
+    # ------------------------------------------------------------------
     # 3. The working-directory reader agrees with the operating system.
     # ------------------------------------------------------------------
     $own = Get-YeYuGamerProcessWorkingDirectory -ProcessId $PID
