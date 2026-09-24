@@ -429,6 +429,14 @@
   - **当前残余（如实记录）**：WW 客户端层仍是**空壳**（`Wuthering Waves.exe` 8.5MB / `Client-Win64-Shipping.exe` 32.6MB、**0 窗口**、`bytesWrittenDelta` 恒 768），属客户端层缺陷，非编排问题；WW 的 run 如实保留为 `cancelled`（**未伪造成功**）。PGR 本次失败于**上游网络错误** `requests.exceptions.ChunkedExecutionError: Connection broken: IncompleteRead(...)`，其待办保持 `eligible`（可重试）。
   - **下一轮待办**：① 队列跑完后**恢复 `WW enabled=true`**；② WW 客户端空壳按 §4/§5 排查（先查互斥体与客户端自身日志，**不要**再从图形层查起）。
 
+- ★★ **2026-09-24 23:18：跑完的每日被"已退出但仍被枚举"的进程判成失败**（**已修 + 已补测试 + 双向验证；commit `6470c7d`**）
+  - **现象**：StarRail attempt `0db14fa7` 的 4 条必选**全部 `completed`**（`upstream_task_succeeded`），Adapter 干净收尾（`adapter.watch.end exit=0 -> status=completed transport=clean`），**但** `attempt.game_cleanup state=close-failed requested=[39716] remaining=[39716]` → `attempt.result status=failed protocolValid=False code=game_cleanup_failed`。数秒后 39716 **已不存在**（`OpenProcess` `err=87`）⇒ **关闭阶梯其实成功了，是收尾复核把它推翻**。
+  - **根因**：`_process_is_live()` 在 `OpenProcess` 失败时**一律返回 True**（"保守"）。但失败带原因，其中两个恰恰证明进程已不存在：`ERROR_INVALID_PARAMETER`(87) 与 `ERROR_NOT_FOUND`(1168)；因此**已退出的条目**被当作活残留，`close_started` 末尾的 `remaining |= _listed_cleanup_residuals(...)` 把一次成功的关闭重新变成 blocker。实测 `_process_is_live(2147483000)`（不可能存在的 id）修前返回 `True`、修后 `False`；`ERROR_ACCESS_DENIED`(5) 仍保持保守，不会把别人的进程写死。
+  - **危害**：**完成了的每日被记为失败**（`protocolValid=False`），直接违背"零意外"；且会误导日报与重试判断。
+  - **测试**：正向 `test_close_started_does_not_revive_a_client_that_already_exited`、反向 `test_close_started_still_reports_a_live_unclosable_client`（防止清理被削弱）、`test_a_gone_process_id_is_not_reported_live`、`test_an_unreadable_process_stays_conservatively_live`；双向验证（改回 `return True` ⇒ 精确失败 `True is not false`）。
+  - ⚠️ **顺带的 fixture 债（重要教训）**：全套测试里大量用 `42/10/20/2` 这类**主机上并不存在的 pid** 代表"存在的进程"，此前**靠旧的保守返回值偶然成立**。语义修正后 6 个测试立刻失败。它们的主题是**路径身份/队列关闭规则**，现已显式 pin `_process_is_live`（`QueueGameCloseTests` 在 `setUp` 统一 pin）⇒ **写 fixture 时用假 pid 必须同时 pin 存活判定，否则测试在偷偷测主机的 pid 表**。
+  - **同批次对照（说明该缺陷是时序相关、不是普遍现象）**：紧随其后的 ZZZ `b21c2b0c` **9/9 完成**且 `attempt.game_cleanup state=closed requested=[45232] remaining=[]` → `attempt.result status=completed protocolValid=True`，未被误判。
+
 ## 8. 结束报告
 
 
