@@ -415,6 +415,20 @@
   - **今日 NTE 与 NIKKE 的结构性上限（如实记，不凑完成）**：NTE 必选 7 条 = 5 条 `eligible`（受上游启动器抓帧层限制，今日 0/11 次成功）+ 2 条 `review_required/deferred_review`（`adapter:upstream_operation_unavailable:daily-activity`、"现有工具尚未实现这些随机每日行"）；NIKKE 必选 9 条 = 1 条 completed + 8 条 `deferred_review`（`nikke_outpost.json` / `nikke_dispatch_friend.json` 上游行为树失败、`当前 ark 战斗分支未启用`、`当前行为树没有稳定导航` ×3、`三个旧 Mark 不能证明每日任务全部完成`）。⇒ **二者今天都不存在"跑到完成"的通路**，重试只会复现；已按 §4 禁查项归因为上游能力缺口，**未放宽任何契约**。
   - **本轮不再重试的理由**：NTE 今日同一失败路径已复现 ≫3 次且本轮代码变更已用一次实跑验证完毕；受控诊断（`hb-nte-capture.py`）当日额度已由第 23 轮用尽 ⇒ 收手，转记录。
 
+- ★★★ **2026-09-24 20:04–23:1x（DSH 目标模式会话）：WW 两次把整条队列卡死 16 小时，定位到三处本项目缺陷并全部修复装机**（commit `2bd2845`）
+  - **接续到的真实状态**：批次 `7da2bded`（09-24 04:04 由 supervisor 发出，11 个游戏）**4 秒后首个成员 WW 就抛人工门**，此后 16 小时 `DailySupervisor` 每 5 分钟只打 `queue busy (human_required)`，当天 **0/62**、10 个游戏连 run 都没有。这就是 §7"一次门污染整天"的又一次实例。
+  - **缺陷①：回收分支重启的启动器拿不到就绪宽限期**（`game_launcher.py`）。`deadline` 在循环前按 `START_TIMEOUT_SECONDS`(45s) 计算，而**阻塞的** `_wait_until_ready`(300s) 在同一个循环体里跑完 ⇒ 回收分支 `continue` 回去时截止时间早已过期，循环立刻退出、**丢弃它刚启动并已如实记账的启动器**。实测 04:12 启动 pid 2080 后 **1 毫秒**抛 `ww_launcher_process_not_observed` + `pids=[]`（20:18 形状相同，pid 40176）。**该分支结构上永远不可能成功**。修法：`restart_deadlines` 为重启后的启动器追加独立宽限期。生产验证（21:38）：回收→启动 pid 2712→**继续观察 34 秒**并拿到真实进程集 `pids=[27996,31972,44620]`。
+  - **缺陷②：回收目标取自等待前的陈旧快照**。`observed` 在循环开头枚举，楔死启动器在**阻塞等待期间**拉起的客户端空壳不在其中 ⇒ 只回收启动器本身，活下来的空壳让新启动器立刻 `ww_launcher_existing_client_unready` 失败。实测 21:37：等待器看见 `running={26752,31972,44620}`，回收却只有 `[26752]`。修法：**仅对可回收门**（`WW_LAUNCHER_RECYCLABLE_GATES`）在抛门处重新枚举并取并集；登录/条款等门不做任何额外探测（回归测试锁死）。生产验证（22:24/22:31）：回收带上全部 `[40484,46332,46920]`，旧空壳被真正清除。
+  - **缺陷③：安装事务没有可移动性预检，被外部工作目录挡住时留下半损坏装机**。LDPlayer 的**孤儿 `adb.exe` fork-server**（`C:\Game\LDPlayer9\adb.exe`）把 `app\desktop-host` 当作工作目录 ⇒ `Move-Item` 被拒、`Undo-` 撞**同一个**拒绝，600s 预算耗尽后装机停在半移动状态（**desktop host 丢失**），而发布只报一句超时。修法：事务前逐个 target 做「移开再移回」探测，失败即报出**持有者**（进程名/pid/工作目录）并中止，不进入事务。
+    - ⚠️ **第一版守卫本身有两个缺陷，都在生产暴露并修掉**：① probe 放在 `$path.install-probe-*`（被探测目录**内部**），使 `app` 既是 target 又是 probe 父目录 ⇒ 每次尝试产生一层**嵌套 probe**，失败后留下链式残留并**破坏了它本该保护的装机**（`app` 少 4 个子目录）。现已把 probe 移到系统临时目录并 `finally` 清理。② `$entry.Holders` 只有**一个**持有者时被 PowerShell 解包成标量，`.Count` 报「找不到属性 Count」⇒ 发布以该错误失败而非给出可用归因。**教训：给"探测+回滚"这类工具写守卫时，探测点绝不能落在被保护对象内部；PowerShell 单元素数组解包必须用 `@(...)` 显式包住。**
+    - 新测试 `scripts/Test-YeYuGamerInstallMovableGuard.ps1` 已挂入 `Test-YeYuGamerPlatform.ps1`（含「守卫必须先于事务打开」的来源断言）。三处修复**均做了双向验证**：停用即精确复现生产失败，恢复后通过，文件 md5 与实验前一致。
+  - **发布**：`releaseId 20260924131617-9b7ea71a`（修复①）与 `20260924140651-b77e9f25`（修复②③），均 `PUBLISH_EXIT=0`，装机核对 `installedAt`、全树 md5 `mismatched=0`、Manager `startedAt` 晚于装机；backend 全量 pytest `EXIT=0`、`undef_check2.py TOTAL=0`、`Test-YeYuGamerPlatform.ps1 EXIT=0`。
+  - ⚠️ **发布脚本用 PowerShell 7，不是 5.1**（本轮踩坑）：`Build-YeYuGamer.ps1` 传 `-Encoding utf8NoBOM`，该枚举值 **5.1 不存在** ⇒ 构建在第一步就失败。计划任务 driver 必须用 `C:\Users\Admin\AppData\Local\Microsoft\WindowsApps\pwsh.exe`（本机 pwsh 7.6.6），**不要**用 `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`。
+  - **维修操作（未改库，全部走 typed API）**：释放人工门 → `resume-requests`（HTTP 客户端会超时但**服务端继续**，不要据此判定失败，要权威读回）→ 因 WW 反复抛门且客户端层当天不可修，按 §5 既有口径 **临时 `patch-enabled WW false`**（原值 `True`，**待恢复**）→ `cancel-requests` 两个已终态批次 → supervisor 22:59 自动补批 `3f940a1f`（10 个游戏，不含 WW），**队列恢复真实推进**。
+  - ★ **顺带验证了两条既有修复仍在生产有效**：`game_day_key` 的补批预算重置（supervisor 正确打出 `game day changed to daily:manager:6410e05a95edbfa1; the start budget starts over`）；PGR 的互斥体家族（本次 `launch.ready elapsed=85.5s pids=[28676] readyWindowPid=28676 1280x720`，**客户端正常出窗口**，与 09-24 凌晨"秒退零写入"形成对照）。
+  - **当前残余（如实记录）**：WW 客户端层仍是**空壳**（`Wuthering Waves.exe` 8.5MB / `Client-Win64-Shipping.exe` 32.6MB、**0 窗口**、`bytesWrittenDelta` 恒 768），属客户端层缺陷，非编排问题；WW 的 run 如实保留为 `cancelled`（**未伪造成功**）。PGR 本次失败于**上游网络错误** `requests.exceptions.ChunkedExecutionError: Connection broken: IncompleteRead(...)`，其待办保持 `eligible`（可重试）。
+  - **下一轮待办**：① 队列跑完后**恢复 `WW enabled=true`**；② WW 客户端空壳按 §4/§5 排查（先查互斥体与客户端自身日志，**不要**再从图形层查起）。
+
 ## 8. 结束报告
 
 
