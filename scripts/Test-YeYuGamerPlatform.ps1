@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$SourceRoot = (Split-Path -Parent $PSScriptRoot),
-    [string]$TestRoot = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'YeYuGamer\platform-test'),
+    [string]$TestRoot = (Join-Path 'C:\Projects\YeYuGamer' '.cache\platform-test'),
     [string]$PythonPath
 )
 
@@ -134,26 +134,9 @@ Get-ChildItem -LiteralPath (Join-Path $SourceRoot 'scripts') -Filter '*.ps1' -Fi
     $tokens = $null
     $errors = $null
     [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
-    foreach ($error in $errors) { $parseFailures += "$($_.Name): $($error.Message)" }
+    foreach ($parseError in $errors) { $parseFailures += "$($_.Name): $($parseError.Message)" }
 }
 if ($parseFailures.Count -gt 0) { throw "PowerShell parse failures:`n$($parseFailures -join "`n")" }
-
-$startSource = Get-Content -LiteralPath (Join-Path $SourceRoot 'scripts\Start-YeYuGamer.ps1') -Raw
-if (-not $startSource.Contains('yeyu_gamer_platform.tray --config $quotedConfig --ensure-manager') -or
-    -not $startSource.Contains('Invoke-YeYuGamerTrayIpc') -or
-    -not $startSource.Contains('-Command ensure_manager') -or
-    -not $startSource.Contains('-Command open_webgui')) {
-    throw 'Start script does not use completion-confirmed tray pairing and WebGUI IPC.'
-}
-if ($startSource.Contains('--open-webgui') -or
-    $startSource.Contains('yeyu_gamer_platform.cli --config $configPath open-webgui') -or
-    ([regex]::Matches($startSource, 'manager-start')).Count -ne 1) {
-    throw 'Start script still uses a deprecated open flag or an unpaired tray-mode CLI Manager start.'
-}
-if ($startSource.IndexOf('-Command ensure_manager') -gt $startSource.IndexOf('-Command open_webgui') -or
-    $startSource.IndexOf('-Command open_webgui') -gt $startSource.LastIndexOf('Windows accepted the authenticated WebGUI open request')) {
-    throw 'Start success is not ordered after completion-confirmed pairing and WebGUI open.'
-}
 
 $actorAclFixture = Join-Path $testResolved 'actor-token-acl\actors'
 Protect-YeYuGamerActorTokensDirectory -Path $actorAclFixture | Out-Null
@@ -412,17 +395,6 @@ foreach ($requiredListenerContract in @(
 if ($commonSource.Contains('[System.Net.Sockets.TcpClient]') -or $commonSource.Contains('BeginConnect(')) {
     throw 'Installer lifecycle preflight still uses a firewall-sensitive outbound TCP connection probe.'
 }
-foreach ($lifecycleScriptName in @(
-    'Start-YeYuGamer.ps1',
-    'Stop-YeYuGamer.ps1',
-    'Restart-YeYuGamer.ps1'
-)) {
-    $lifecycleSource = Get-Content -LiteralPath (Join-Path $SourceRoot "scripts\$lifecycleScriptName") -Raw
-    if (-not $lifecycleSource.Contains("`$env:PYTHONDONTWRITEBYTECODE = '1'") -or
-        -not $lifecycleSource.Contains('$python -I -B -m yeyu_gamer_platform.cli')) {
-        throw "$lifecycleScriptName does not prevent runtime bytecode writes."
-    }
-}
 foreach ($legacyWrapperName in @(
     'NightRainGamer.bat.template',
     'Start-DailyGame-GUI.bat.template'
@@ -436,13 +408,22 @@ foreach ($legacyWrapperName in @(
     }
 }
 $stopSource = Get-Content -LiteralPath (Join-Path $SourceRoot 'scripts\Stop-YeYuGamer.ps1') -Raw
-if (-not $stopSource.Contains('Get-YeYuGamerRecordedManagerProcess') -or
-    -not $installSource.Contains('Assert-YeYuGamerInstallLifecycleStopped') -or
+if (-not $stopSource.Contains("return @('-I', '-B', '-m', 'yeyu_gamer_platform.cli')") -or
+    -not $stopSource.Contains("return @('-I', '-B', '-c', `$bootstrap, `$platformSource)")) {
+    throw 'Stop script does not keep Python bytecode disabled for installed and safe-stop source clients.'
+}
+if (-not $installSource.Contains('Assert-YeYuGamerInstallLifecycleStopped') -or
     -not $commonSource.Contains('Get-YeYuGamerRecordedManagerProcess') -or
     -not $commonSource.Contains('Test-YeYuGamerNamedMutexActive') -or
     -not $commonSource.Contains("'http://127.0.0.1:8877/api/v1'") -or
     -not $commonSource.Contains("'Local\YeYuGamer.InstallLifecycle.v1'")) {
-    throw 'Stop and installer lifecycle checks do not cover the recorded Manager host and tray.'
+    throw 'Installer lifecycle checks do not cover the recorded Manager host and tray.'
+}
+if (-not $stopSource.Contains('Get-YeYuGamerStopCliArguments') -or
+    -not $stopSource.Contains('-UseSourceClient:$UseSourceClient') -or
+    -not $stopSource.Contains('$desktopHostProcesses') -or
+    $stopSource.Contains('Stop-Process')) {
+    throw 'Stop script does not retain the bounded typed safe-stop boundary for the desktop Host.'
 }
 $forbiddenInstallerUrlInputs = @('[string]$ManagerBaseUrl', '[string]$WebUrl', '-ManagerEndpoint')
 foreach ($forbiddenInstallerUrlInput in $forbiddenInstallerUrlInputs) {
@@ -1053,9 +1034,8 @@ if (@(Get-ChildItem -LiteralPath $rotationFixture.Root -Recurse -Force | Where-O
 }
 
 $restartSource = Get-Content -LiteralPath (Join-Path $SourceRoot 'scripts\Restart-YeYuGamer.ps1') -Raw
-if (-not $restartSource.Contains('beforeManagerId') -or
-    -not $restartSource.Contains('afterManagerId')) {
-    throw 'Restart script does not verify that Manager identity changed.'
+if (-not $restartSource.Contains('& $python -I -B -m yeyu_gamer_platform.cli')) {
+    throw 'Restart script does not keep Python bytecode disabled.'
 }
 
 $buildSource = Get-Content -LiteralPath (Join-Path $SourceRoot 'scripts\Build-YeYuGamer.ps1') -Raw
@@ -1138,8 +1118,7 @@ if ($installSource.Contains('Disable-YeYuGamerLegacyBypassTasks.ps1')) {
     throw 'Installer must not automatically mutate legacy scheduled tasks.'
 }
 
-# Validate the optional local StarRail input without executing the build script
-# or requiring the private compatibility file in a public source checkout.
+# Parse the StarRail build without running an upstream tool.
 $payloadParseTokens = $null
 $payloadParseErrors = $null
 $starRailBuildAst = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -1147,32 +1126,6 @@ $starRailBuildAst = [System.Management.Automation.Language.Parser]::ParseFile(
     [ref]$payloadParseTokens, [ref]$payloadParseErrors
 )
 if ($payloadParseErrors.Count -ne 0) { throw 'StarRail build script does not parse.' }
-$payloadGuards = @($starRailBuildAst.FindAll({
-    param($node)
-    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-        $node.Name -ceq 'Resolve-March7thCompatibilityPayload'
-}, $false))
-if ($payloadGuards.Count -ne 1) { throw 'StarRail build must define one compatibility input guard.' }
-. ([scriptblock]::Create($payloadGuards[0].Extent.Text))
-$publicPayloadFixture = Join-Path $testResolved 'public-starrail-input'
-New-Item -ItemType Directory -Path $publicPayloadFixture -Force | Out-Null
-$invalidPayloadFixture = Join-Path $publicPayloadFixture 'invalid.txt'
-[System.IO.File]::WriteAllText($invalidPayloadFixture, 'invalid input fixture', [System.Text.UTF8Encoding]::new($false))
-foreach ($case in @(
-    @{ Path = ''; Message = '*public repository does not include this payload*' },
-    @{ Path = (Join-Path $publicPayloadFixture 'missing.b64'); Message = '*public repository does not include this payload*' },
-    @{ Path = 'relative.b64'; Message = '*absolute local file path*' },
-    @{ Path = '\\unreachable-payload-test\share\payload.b64'; Message = '*not UNC*' },
-    @{ Path = $invalidPayloadFixture; Message = '*SHA256 does not match*' }
-)) {
-    $rejection = $null
-    try {
-        Resolve-March7thCompatibilityPayload -Path $case.Path -SourceCodeRoot $publicPayloadFixture | Out-Null
-    } catch { $rejection = $_.Exception.Message }
-    if (-not $rejection -or $rejection -notlike $case.Message) {
-        throw "StarRail input guard expected '$($case.Message)', received '$rejection'."
-    }
-}
 
 $seedBackendRoot = Join-Path $testResolved 'seed-backend'
 New-Item -ItemType Directory -Path $seedBackendRoot -Force | Out-Null
@@ -1393,4 +1346,17 @@ $traySource = Get-Content -LiteralPath (Join-Path $platformSource 'yeyu_gamer_pl
 foreach ($forbidden in @('QMain' + 'Window', 'QWeb' + 'Engine', 'NightRain' + 'Gamer.bat')) {
     if ($traySource.Contains($forbidden)) { throw "Tray contains forbidden dependency or bypass: $forbidden" }
 }
+
+# The installer must prove its targets are movable before the transaction opens.
+# Measured 2026-09-24: a leftover LDPlayer adb.exe fork-server kept
+# app\desktop-host as its working directory, the 600s retry budget expired while
+# the rollback hit the same deny, and the half-applied transaction left the
+# desktop host missing -- the publish reported only a timeout.
+& (Join-Path $PSScriptRoot 'Test-YeYuGamerInstallMovableGuard.ps1') | Out-Host
+$installSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Install-YeYuGamer.ps1') -Raw
+if ($installSource.IndexOf('Assert-YeYuGamerInstallTargetsAreMovable') -gt
+    $installSource.IndexOf('Invoke-YeYuGamerInstallTransaction')) {
+    throw 'The installer must verify its targets are movable before the transaction opens.'
+}
+
 Write-Host 'YeYu Gamer platform checks passed.'

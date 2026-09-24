@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$SourceRoot = (Split-Path -Parent $PSScriptRoot),
-    [string]$BuildRoot = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'YeYuGamer\build'),
+    [string]$BuildRoot = (Join-Path 'C:\Projects\YeYuGamer' '.cache\build'),
     [string]$InstallRoot,
     [string]$RuntimeRoot,
     [string]$PythonPath,
@@ -527,6 +527,16 @@ $transactionFileTargets = @(
     $retiredTrayToken
 ) + $legacyStartupShortcuts + $existingDesktopShortcuts
 $autoStartRegistrySnapshot = @(Get-YeYuGamerAutoStartRegistrySnapshot)
+
+# Prove every target is movable before the transaction opens.  A holder (most
+# often a leftover third-party process whose working directory is inside the
+# install tree) otherwise surfaces only after the 600s retry budget, and the
+# rollback hits the same deny -- measured 2026-09-24: a leftover LDPlayer
+# adb.exe fork-server kept app\desktop-host as its working directory and the
+# failed publish left the desktop host missing.
+Assert-YeYuGamerInstallTargetsAreMovable `
+    -DirectoryTargets @($directoryTargets) `
+    -FileTargets $transactionFileTargets
 
 try {
 Invoke-YeYuGamerInstallTransaction `

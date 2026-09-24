@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import uuid
 from unittest import mock
@@ -21,6 +22,7 @@ from yeyu_gamer_manager.services.game_launcher import (
     GameLaunchService,
     _QueueProcessIdentity,
 )
+from yeyu_gamer_manager.services.window_capture import registered_game_process_names
 
 
 class GameLaunchServiceTests(unittest.TestCase):
@@ -49,6 +51,82 @@ class GameLaunchServiceTests(unittest.TestCase):
         self.assertEqual(receipt.baseline_process_ids, (222,))
         self.assertEqual(receipt.ready_window_pid, 222)
         popen.assert_not_called()
+
+    def test_nte_official_launcher_is_delegated_without_launch_or_ready_claim(self) -> None:
+        executable = Path(self.temporary.name) / "NTELauncher.exe"
+        executable.write_bytes(b"fixture")
+        observations = []
+        with mock.patch.object(self.launcher, "_list_running", return_value={222: "NTEGame.exe"}), mock.patch.object(
+            self.launcher, "_ensure_started"
+        ) as start:
+            receipt = self.launcher.ensure_started("NTE", str(executable), observer=observations.append)
+        start.assert_not_called()
+        self.assertEqual(receipt.state, "official-tool-pending")
+        self.assertEqual(receipt.baseline_process_ids, (222,))
+        self.assertIsNone(receipt.ready_window_pid)
+        self.assertFalse(receipt.as_result()["managerOwned"])
+        self.assertEqual([item.phase for item in observations], ["official-launch-pending"])
+
+    def test_nte_upgrade_prompt_is_cleared_by_a_bounded_watcher(self) -> None:
+        executable = Path(self.temporary.name) / "NTELauncher.exe"
+        executable.write_bytes(b"fixture")
+        invoked = threading.Event()
+        calls: list[tuple[Path, bool]] = []
+
+        def fake_probe(root, *, allow_invoke, cancel_requested):
+            calls.append((root, allow_invoke))
+            invoked.set()
+            return "invoked:nte-launcher-upgrade:removed"
+
+        with mock.patch.object(GameLaunchService, "_probe_nte_launcher_prompt", side_effect=fake_probe), mock.patch.object(
+            GameLaunchService, "NTE_LAUNCHER_UPGRADE_PROBE_SECONDS", 0.05
+        ), mock.patch.object(self.launcher, "_list_running", return_value={222: "NTEGame.exe"}), mock.patch.object(
+            self.launcher, "_ensure_started"
+        ) as start:
+            self.launcher.ensure_started("NTE", str(executable), observer=lambda _item: None)
+            self.assertTrue(invoked.wait(5.0))
+
+        # The official launcher stays with the tool: only the audited upgrade
+        # label is cleared, and the watcher is allowed to click it by default.
+        start.assert_not_called()
+        self.assertEqual(GameLaunchService.NTE_LAUNCHER_UPGRADE_LABEL, "立即体验")
+        self.assertEqual(calls[0], (executable.parent, True))
+
+    def test_nikke_wegame_bootstrap_gets_a_longer_start_budget(self) -> None:
+        # The WeGame bootstrap routinely needs more than the 45s default before
+        # the NIKKE client appears (observed 2026-09-18: game_start_failed at
+        # 46.2s with no registered process).
+        self.assertEqual(GameLaunchService.START_TIMEOUT_OVERRIDES.get("NIKKE"), 600.0)
+        self.assertGreater(
+            GameLaunchService.START_TIMEOUT_OVERRIDES["NIKKE"],
+            GameLaunchService.START_TIMEOUT_SECONDS,
+        )
+
+    def test_delegated_launch_cleanup_preserves_baseline_and_closes_new_client(self) -> None:
+        receipt = GameLaunchReceipt("official-tool-pending", None, "NTEGame.exe", (222,), ("ntegame.exe", "htgame.exe"))
+        with mock.patch.object(self.launcher, "_list_running", return_value={222: "NTEGame.exe", 333: "HTGame.exe"}), mock.patch.object(
+            self.launcher, "_list_zombies", return_value={}
+        ), mock.patch.object(self.launcher, "_list_enumerated", return_value={}), mock.patch.object(
+            self.launcher, "_request_graceful_close"
+        ) as close, mock.patch.object(self.launcher, "_wait_for_owned_exit", return_value=set()):
+            result = self.launcher.close_started(receipt)
+        close.assert_called_once_with({333})
+        self.assertEqual(result.requested_process_ids, (333,))
+
+    def test_zzz_launch_preserves_official_login_branch_without_starting_exe(self) -> None:
+        executable = Path(self.temporary.name) / "ZenlessZoneZero.exe"
+        executable.write_bytes(b"fixture")
+        observations = []
+        with mock.patch.object(self.launcher, "_list_running", return_value={}), mock.patch.object(
+            self.launcher, "_ensure_started"
+        ) as start:
+            receipt = self.launcher.ensure_started("ZZZ", str(executable), observer=observations.append)
+        start.assert_not_called()
+        self.assertEqual(receipt.state, "official-tool-pending")
+        self.assertIsNone(receipt.process_id)
+        self.assertIsNone(receipt.ready_window_pid)
+        self.assertEqual(observations[0].phase, "official-launch-pending")
+        self.assertEqual(observations[0].detail["operation"], "OpenAndEnterGame.execute")
 
     def test_waits_for_registered_game_before_returning(self) -> None:
         process = mock.Mock(pid=1234)
@@ -80,6 +158,35 @@ class GameLaunchServiceTests(unittest.TestCase):
         self.assertEqual(receipt.ready_window_width, 1920)
         self.assertEqual(popen.call_args.args[0], [str(self.executable)])
         self.assertIs(popen.call_args.kwargs["shell"], False)
+
+    def test_nikke_wegame_install_launches_formal_entry_and_waits_for_client(self) -> None:
+        client = Path(self.temporary.name) / "nikke.exe"
+        client.write_bytes(b"client")
+        entry = client.parent / "WeGameLauncher" / "launcher.exe"
+        entry.parent.mkdir()
+        entry.write_bytes(b"official launcher fixture")
+        with mock.patch("yeyu_gamer_manager.services.game_launcher.os.name", "nt"), mock.patch.object(
+            self.launcher, "_list_running", side_effect=[{}, {456: "nikke.exe"}],
+        ), mock.patch("yeyu_gamer_manager.services.game_launcher.subprocess.Popen", return_value=mock.Mock(pid=123)) as popen, mock.patch.object(
+            self.launcher, "_wait_until_ready", return_value=(456, "nikke.exe", 1920, 1080),
+        ) as ready:
+            receipt = self.launcher.ensure_started("NIKKE", str(client))
+        self.assertEqual(popen.call_args.args[0], [str(entry)])
+        self.assertEqual(popen.call_args.kwargs["cwd"], str(entry.parent))
+        self.assertEqual(receipt.ready_window_pid, 456)
+        self.assertNotIn("launcher.exe", receipt.expected_process_names)
+        self.assertEqual(ready.call_args.args[2], client.parent)
+
+    def test_nikke_incomplete_wegame_install_never_falls_back_to_bare_client(self) -> None:
+        client = Path(self.temporary.name) / "nikke.exe"
+        client.write_bytes(b"client")
+        (client.parent / "WeGameLauncher").mkdir()
+        with mock.patch("yeyu_gamer_manager.services.game_launcher.os.name", "nt"), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.subprocess.Popen"
+        ) as popen:
+            with self.assertRaisesRegex(GameLaunchError, "WeGame"):
+                self.launcher.ensure_started("NIKKE", str(client))
+        popen.assert_not_called()
 
     def test_ww_waits_for_real_client_window_not_launcher(self) -> None:
         with mock.patch.object(
@@ -152,6 +259,150 @@ class GameLaunchServiceTests(unittest.TestCase):
         self.assertEqual(receipt.ww_launcher_path, str(executable.resolve()))
         self.assertIn("launcher_main.exe", receipt.expected_process_names)
 
+    def test_launch_executable_reaps_the_spawned_process_handle(self) -> None:
+        """The Manager must stop holding the handle of every client it starts.
+
+        ``Popen.__del__`` keeps a still-running child alive in
+        ``subprocess._active``, and the launch path only reads ``.pid``, so the
+        Manager held the handle of every client it started for its whole
+        lifetime.  That is not what kept the dead entries enumerable (measured
+        2026-09-22: the holders were Windows' own ``RpcSs``/``Themes``/
+        ``Audiosrv`` services and the clients' own thread handles), but leaving
+        our own handles open is still wrong, so the launch path must wait on the
+        child instead of dropping the ``Popen``.
+        """
+
+        reaped = threading.Event()
+        process = mock.Mock(pid=4242)
+        process.wait.side_effect = lambda *args, **kwargs: reaped.set()
+
+        with mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.subprocess.Popen",
+            return_value=process,
+        ):
+            started = self.launcher._start_launch_executable(
+                "StarRail", self.executable, self.executable, None,
+            )
+
+        self.assertEqual(started.pid, 4242)
+        self.assertTrue(
+            reaped.wait(5.0),
+            "the spawned client handle must be released by waiting on the child",
+        )
+
+    def test_launch_is_refused_while_a_leftover_client_owns_the_guard_mutex(self) -> None:
+        """A leftover that still owns the single-instance mutex makes launch futile.
+
+        Measured 2026-09-22 with handle64: the enumerated-but-not-live
+        ``PGR.exe``/``GF2_Exilium.exe`` entries still held
+        ``comkurogameharukuro`` and
+        ``ilium-GF2-Game-GF2-Exilium-exe-SingleInstanceMutex-Default``, because
+        the kernel releases a mutex only when its owner is destroyed and those
+        clients never finished terminating.  Every later launch therefore died
+        instantly (PGR exit 0 with an untouched log directory) or said "Another
+        instance is already running" (GF2).  Burning the readiness timeout hides
+        the mechanism and leaves one more unreapable leftover, so the launch has
+        to be refused up front with the mutex and the process ids named.
+        """
+
+        with mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.named_mutex_is_held",
+            return_value=True,
+        ), mock.patch.object(
+            self.launcher, "_list_zombies", return_value={6392: "PGR.exe", 38192: "PGR.exe"},
+        ) as zombies, mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.subprocess.Popen"
+        ) as popen:
+            with self.assertRaises(GameLaunchError) as caught:
+                self.launcher._start_launch_executable(
+                    "PGR", self.executable, self.executable, None,
+                )
+
+        message = str(caught.exception)
+        self.assertIn("comkurogameharukuro", message)
+        self.assertIn("6392", message)
+        self.assertIn("38192", message)
+        self.assertNotIsInstance(caught.exception, GameLaunchHumanRequired)
+        self.assertEqual(zombies.call_args.args[0], set(registered_game_process_names("PGR")))
+        popen.assert_not_called()
+
+    def test_launch_proceeds_when_the_guard_mutex_is_free(self) -> None:
+        """Stale entries alone are not a reason to refuse: the mutex decides."""
+
+        process = mock.Mock(pid=4244)
+        with mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.named_mutex_is_held",
+            return_value=False,
+        ), mock.patch.object(
+            self.launcher, "_list_zombies", return_value={6392: "PGR.exe"},
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.subprocess.Popen",
+            return_value=process,
+        ) as popen:
+            started = self.launcher._start_launch_executable(
+                "PGR", self.executable, self.executable, None,
+            )
+
+        self.assertEqual(started.pid, 4244)
+        popen.assert_called_once()
+
+    def test_launch_proceeds_when_the_mutex_holder_is_not_a_leftover(self) -> None:
+        """A held mutex with no exited leftover is the already-running path."""
+
+        process = mock.Mock(pid=4245)
+        with mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.named_mutex_is_held",
+            return_value=True,
+        ), mock.patch.object(
+            self.launcher, "_list_zombies", return_value={},
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.subprocess.Popen",
+            return_value=process,
+        ) as popen:
+            started = self.launcher._start_launch_executable(
+                "GF2", self.executable, self.executable, None,
+            )
+
+        self.assertEqual(started.pid, 4245)
+        popen.assert_called_once()
+
+    def test_games_without_a_measured_guard_are_never_refused(self) -> None:
+        """The registry is evidence-based; unmeasured games keep launching."""
+
+        process = mock.Mock(pid=4246)
+        with mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.named_mutex_is_held",
+        ) as mutex, mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.subprocess.Popen",
+            return_value=process,
+        ) as popen:
+            started = self.launcher._start_launch_executable(
+                "StarRail", self.executable, self.executable, None,
+            )
+
+        self.assertEqual(started.pid, 4246)
+        mutex.assert_not_called()
+        popen.assert_called_once()
+
+    def test_endfield_launcher_reaps_the_spawned_process_handle(self) -> None:
+        """The Endfield activation dispatch must release its handle too."""
+
+        reaped = threading.Event()
+        process = mock.Mock(pid=4243)
+        process.wait.side_effect = lambda *args, **kwargs: reaped.set()
+
+        with mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.subprocess.Popen",
+            return_value=process,
+        ):
+            started = self.launcher._start_endfield_launcher(self.executable)
+
+        self.assertEqual(started.pid, 4243)
+        self.assertTrue(
+            reaped.wait(5.0),
+            "the spawned Endfield launcher handle must be released by waiting on it",
+        )
+
     def test_ww_untrusted_formal_launcher_is_not_started(self) -> None:
         executable = Path(self.temporary.name) / "launcher.exe"
         executable.write_bytes(b"fixture")
@@ -203,9 +454,9 @@ class GameLaunchServiceTests(unittest.TestCase):
         self.assertEqual(result, "ready:ww-enter-game")
         self.assertFalse(probe.call_args.kwargs["allow_invoke"])
         script = self.launcher._WW_LAUNCHER_UIA_SCRIPT
-        self.assertLess(script.index("$buttons.Count -ne 1"), script.index("Write-Output 'ready:ww-enter-game'"))
-        self.assertLess(script.index("TryGetCurrentPattern([Windows.Automation.InvokePattern]"), script.index("Write-Output 'ready:ww-enter-game'"))
-        self.assertLess(script.index("Write-Output 'ready:ww-enter-game'"), script.index("$pattern.Invoke()"))
+        self.assertLess(script.index("$actions.Count -ne 1"), script.index("Write-Output (@{ entry = 'ready:ww-enter-game'"))
+        self.assertLess(script.index("TryGetCurrentPattern([Windows.Automation.InvokePattern]"), script.index("Write-Output (@{ entry = 'ready:ww-enter-game'"))
+        self.assertLess(script.index("Write-Output (@{ entry = 'ready:ww-enter-game'"), script.index("$pattern.Invoke()"))
 
     @unittest.skipUnless(os.name == "nt", "Windows PowerShell rule fixtures")
     def test_ww_uia_rules_distinguish_toolbar_news_primary_update_and_modal(self) -> None:
@@ -215,9 +466,16 @@ class GameLaunchServiceTests(unittest.TestCase):
             ({"Name": "更新失败处理与登录失效说明", "Kind": "ControlType.Hyperlink"}, "ignore"),
             ({"Name": "正在更新的版本资讯", "Kind": "ControlType.Text"}, "ignore"),
             ({"Name": "进入游戏", "Kind": "ControlType.Button", "ClassName": primary}, "entry"),
-            ({"Name": "更新游戏", "Kind": "ControlType.Button", "ClassName": primary}, "human:update-or-error"),
-            ({"Name": "修复游戏", "Kind": "ControlType.Button", "ClassName": primary}, "human:update-or-error"),
-            ({"Name": "正在下载", "Kind": "ControlType.Button", "ClassName": primary}, "human:update-or-error"),
+            ({"Name": "进入中", "Kind": "ControlType.Button", "ClassName": primary}, "busy"),
+            ({"Name": "更新游戏", "Kind": "ControlType.Button", "ClassName": primary}, "update"),
+            ({"Name": "修复游戏", "Kind": "ControlType.Button", "ClassName": primary}, "update"),
+            ({"Name": "重试", "Kind": "ControlType.Button", "ClassName": primary}, "retry"),
+            ({"Name": "正在下载", "Kind": "ControlType.Button", "ClassName": primary}, "busy"),
+            ({"Name": "下载中…", "Kind": "ControlType.Button", "ClassName": primary}, "busy"),
+            ({"Name": "校验中", "Kind": "ControlType.Button", "ClassName": primary}, "busy"),
+            ({"Name": "更新中", "Kind": "ControlType.Button", "ClassName": primary}, "busy"),
+            ({"Name": "等待中", "Kind": "ControlType.Button", "ClassName": primary}, "busy"),
+            ({"Name": "神秘状态", "Kind": "ControlType.Button", "ClassName": primary}, "human:unrecognized-primary-action"),
             ({"Name": "确认", "Kind": "ControlType.Button"}, "human:modal-dialog"),
             ({"Name": "修复确认", "Kind": "ControlType.Pane", "IsModal": True}, "human:modal-dialog"),
             ({"Name": "通知", "Kind": "ControlType.Pane", "LocalizedKind": "对话框"}, "human:modal-dialog"),
@@ -279,20 +537,28 @@ ConvertTo-Json -InputObject $results -Compress
         error = GameLaunchHumanRequired("ww_launcher_login_or_consent", "needs login", process_ids=frozenset({222}))
         with mock.patch.object(self.launcher, "_verify_ww_launcher"), mock.patch.object(
             self.launcher, "_list_ww_running", side_effect=[{}, {222: "launcher_main.exe"}],
-        ), mock.patch.object(self.launcher, "_wait_until_ready", side_effect=error), mock.patch(
+        ) as list_ww, mock.patch.object(self.launcher, "_wait_until_ready", side_effect=error), mock.patch(
             "yeyu_gamer_manager.services.game_launcher.subprocess.Popen", return_value=mock.Mock(pid=111),
         ), mock.patch.object(self.launcher, "close_started") as close:
             with self.assertRaises(GameLaunchHumanRequired):
                 self.launcher.ensure_started("WW", str(executable), observations.append)
         close.assert_not_called()
-        self.assertEqual([item.phase for item in observations], ["launch-human-required"])
-        self.assertEqual(observations[0].process_ids, frozenset({222}))
+        self.assertEqual(
+            [item.phase for item in observations],
+            ["launcher-action", "launch-human-required"],
+        )
+        self.assertEqual(observations[0].detail["operation"], "launch-executable-started")
+        self.assertEqual(observations[0].detail["processId"], 111)
+        self.assertEqual(observations[1].process_ids, frozenset({222}))
+        # A gate that must stay human is never probed for recyclable debris: the
+        # re-enumeration belongs to the recyclable branch only, so a login gate
+        # touches nothing and simply preserves the scene.
+        self.assertEqual(list_ww.call_count, 2)
 
     def test_ww_formal_launcher_gates_login_update_and_unknown_ui(self) -> None:
         launcher = Path(self.temporary.name) / "launcher.exe"
         for outcome, reason in (
             ("human:login-or-consent", "ww_launcher_login_or_consent"),
-            ("human:update-or-error", "ww_launcher_update_or_error"),
             ("waiting:unrecognized-launcher-ui", "ww_launcher_ui_unknown"),
         ):
             clock = iter(range(1000))
@@ -307,6 +573,699 @@ ConvertTo-Json -InputObject $results -Compress
                     self.launcher._wait_until_ready("WW", {"client-win64-shipping.exe"}, launcher.parent, ww_launcher=launcher)
             self.assertEqual(caught.exception.reason_code, reason)
             self.assertEqual(caught.exception.process_ids, frozenset({22}))
+
+    def test_ww_formal_launcher_invokes_update_then_waits_for_ready_window(self) -> None:
+        launcher = Path(self.temporary.name) / "launcher.exe"
+        ready = (33, "client-win64-shipping.exe", 1280, 720)
+        outcomes = iter(["invoked:ww-update", "waiting:ww-busy", "invoked:ww-enter-game"])
+        frames = iter([None] * 20 + [ready, ready])
+        clock = iter(range(1000))
+        with mock.patch.object(self.launcher, "_list_ww_running", return_value={22: "launcher_main.exe", 33: ready[1]}), mock.patch.object(
+            self.launcher, "_find_ready_window", side_effect=lambda *args: next(frames, ready),
+        ), mock.patch.object(self.launcher, "_probe_ww_launcher", side_effect=lambda *args, **kwargs: next(outcomes, "waiting:game-window")) as action, mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.monotonic", side_effect=lambda: float(next(clock)),
+        ), mock.patch("yeyu_gamer_manager.services.game_launcher.time.sleep"), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher._LaunchProgressMonitor.observe", return_value=False,
+        ):
+            result = self.launcher._wait_until_ready("WW", {"launcher_main.exe", ready[1]}, launcher.parent, ww_launcher=launcher)
+        self.assertEqual(result, ready)
+        self.assertGreaterEqual(action.call_count, 2)
+
+    def test_ww_formal_launcher_retries_update_until_cap(self) -> None:
+        launcher = Path(self.temporary.name) / "launcher.exe"
+        clock = iter(range(1000))
+        with mock.patch.object(self.launcher, "_list_ww_running", return_value={22: "launcher_main.exe"}), mock.patch.object(
+            self.launcher, "_find_ready_window", return_value=None,
+        ), mock.patch.object(self.launcher, "_probe_ww_launcher", return_value="invoked:ww-retry"), mock.patch.object(
+            self.launcher, "WW_LAUNCHER_MAX_UPDATE_ACTIONS", 2,
+        ), mock.patch("yeyu_gamer_manager.services.game_launcher.time.monotonic", side_effect=lambda: float(next(clock))), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.sleep",
+        ), mock.patch("yeyu_gamer_manager.services.game_launcher._LaunchProgressMonitor.observe", return_value=False):
+            with self.assertRaises(GameLaunchError) as caught:
+                self.launcher._wait_until_ready("WW", {"client-win64-shipping.exe"}, launcher.parent, ww_launcher=launcher)
+        self.assertIn("update/retry was dispatched too many times", str(caught.exception))
+
+    def test_ww_recycle_reclaims_its_own_dead_client_shells(self) -> None:
+        """Debris the Manager started must not permanently wedge the launcher."""
+
+        running = {
+            1: "launcher_main.exe",
+            2: "Wuthering Waves.exe",
+            3: "Client-Win64-Shipping.exe",
+        }
+        with mock.patch.object(
+            GameLaunchService, "_find_window_handle", return_value=None,
+        ), mock.patch.object(
+            GameLaunchService, "_process_working_set_bytes", return_value=33 * 1024 * 1024,
+        ):
+            targets = GameLaunchService._ww_launcher_recycle_targets(running)
+        self.assertEqual(targets, {1, 2, 3})
+        self.assertIn(
+            "ww_launcher_game_window_missing",
+            GameLaunchService.WW_LAUNCHER_RECYCLABLE_GATES,
+        )
+
+    def test_ww_recycle_never_touches_a_live_client_window(self) -> None:
+        running = {1: "launcher_main.exe", 2: "Client-Win64-Shipping.exe"}
+        with mock.patch.object(
+            GameLaunchService, "_find_window_handle", return_value=4242,
+        ), mock.patch.object(
+            GameLaunchService, "_process_working_set_bytes", return_value=8 * 1024 * 1024,
+        ):
+            self.assertEqual(GameLaunchService._ww_launcher_recycle_targets(running), set())
+
+    def test_ww_recycle_never_touches_a_hung_live_client(self) -> None:
+        """A windowless but memory-heavy client is a live session, not debris."""
+
+        running = {1: "launcher_main.exe", 2: "Wuthering Waves.exe"}
+        with mock.patch.object(
+            GameLaunchService, "_find_window_handle", return_value=None,
+        ), mock.patch.object(
+            GameLaunchService, "_process_working_set_bytes", return_value=2 * 1024 ** 3,
+        ):
+            self.assertEqual(GameLaunchService._ww_launcher_recycle_targets(running), set())
+
+    def test_ww_recycle_stays_conservative_when_identity_is_unreadable(self) -> None:
+        running = {1: "launcher_main.exe", 2: "Wuthering Waves.exe"}
+        with mock.patch.object(
+            GameLaunchService, "_find_window_handle", return_value=None,
+        ), mock.patch.object(
+            GameLaunchService, "_process_working_set_bytes", return_value=None,
+        ):
+            self.assertEqual(GameLaunchService._ww_launcher_recycle_targets(running), set())
+
+    def test_ww_post_launch_gate_recycles_the_debris_this_attempt_started(self) -> None:
+        """A gate raised after our own launch must self-heal instead of failing.
+
+        Measured 2026-09-22 05:17 and 05:25 on this host: the post-launch handler
+        read an undefined ``running`` and raised ``NameError``, so a recyclable
+        WW gate was reported as ``adapter_start_failed`` while the launcher and
+        client debris that this very attempt had started stayed in place.  The
+        recycle candidates must come from the *post-launch* observation.
+        """
+
+        launcher = Path(self.temporary.name) / "launcher.exe"
+        launcher.write_bytes(b"fixture")
+        debris = {
+            22: "launcher_main.exe",
+            33: "Wuthering Waves.exe",
+            44: "Client-Win64-Shipping.exe",
+        }
+        ready = (55, "client-win64-shipping.exe", 1280, 720)
+        gate = GameLaunchHumanRequired(
+            "ww_launcher_game_window_missing",
+            "WW formal launcher did not yield a stable game window; "
+            "inspect the preserved scene before resuming.",
+        )
+        listing: list[int] = []
+
+        def list_ww(_launcher, _expected_names):
+            listing.append(1)
+            # The first call is the pre-launch baseline: nothing was running yet.
+            return {} if len(listing) == 1 else dict(debris)
+
+        outcomes = iter([gate, ready])
+
+        def wait(*_args, **_kwargs):
+            outcome = next(outcomes)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        clock = iter(range(100000))
+        with mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.os.name", "nt"
+        ), mock.patch.object(
+            GameLaunchService, "_verify_ww_launcher"
+        ), mock.patch.object(
+            self.launcher, "_list_ww_running", side_effect=list_ww
+        ), mock.patch.object(
+            self.launcher, "_wait_until_ready", side_effect=wait
+        ), mock.patch.object(
+            self.launcher, "_start_launch_executable",
+            return_value=mock.Mock(pid=9001),
+        ) as start, mock.patch.object(
+            self.launcher, "_recycle_ww_launcher", return_value=set()
+        ) as recycle, mock.patch.object(
+            GameLaunchService, "_find_window_handle", return_value=None
+        ), mock.patch.object(
+            GameLaunchService, "_process_working_set_bytes",
+            return_value=33 * 1024 * 1024,
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.monotonic",
+            side_effect=lambda: float(next(clock)),
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.sleep"
+        ):
+            receipt = self.launcher._ensure_started(
+                "WW", str(launcher), None, 0.0, None,
+            )
+
+        recycle.assert_called_once_with(set(debris))
+        self.assertEqual(start.call_count, 2)
+        self.assertEqual(receipt.state, "started")
+        self.assertEqual(receipt.ready_window_pid, 55)
+
+    def test_ww_post_launch_gate_keeps_a_live_client_at_the_human_gate(self) -> None:
+        """Recycling must never reach a live client that still holds a session.
+
+        Same post-launch path as above: the pre-launch baseline is empty, so the
+        gate is raised for a launch this attempt started, and only the
+        post-launch observation can decide whether recycling is allowed.
+        """
+
+        launcher = Path(self.temporary.name) / "launcher.exe"
+        launcher.write_bytes(b"fixture")
+        gate = GameLaunchHumanRequired(
+            "ww_launcher_game_window_missing",
+            "WW formal launcher did not yield a stable game window; "
+            "inspect the preserved scene before resuming.",
+        )
+        listing: list[int] = []
+
+        def list_ww(_launcher, _expected_names):
+            listing.append(1)
+            if len(listing) == 1:
+                return {}
+            return {22: "launcher_main.exe", 44: "Client-Win64-Shipping.exe"}
+
+        clock = iter(range(100000))
+        with mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.os.name", "nt"
+        ), mock.patch.object(
+            GameLaunchService, "_verify_ww_launcher"
+        ), mock.patch.object(
+            self.launcher, "_list_ww_running", side_effect=list_ww
+        ), mock.patch.object(
+            self.launcher, "_wait_until_ready", side_effect=gate
+        ), mock.patch.object(
+            self.launcher, "_start_launch_executable",
+            return_value=mock.Mock(pid=9001),
+        ), mock.patch.object(
+            self.launcher, "_recycle_ww_launcher", return_value=set()
+        ) as recycle, mock.patch.object(
+            GameLaunchService, "_find_window_handle", return_value=4242
+        ), mock.patch.object(
+            GameLaunchService, "_process_working_set_bytes",
+            return_value=8 * 1024 * 1024,
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.monotonic",
+            side_effect=lambda: float(next(clock)),
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.sleep"
+        ):
+            with self.assertRaises(GameLaunchHumanRequired) as caught:
+                self.launcher._ensure_started("WW", str(launcher), None, 0.0, None)
+
+        self.assertEqual(caught.exception.reason_code, "ww_launcher_game_window_missing")
+        recycle.assert_not_called()
+        self.assertGreater(len(listing), 1)
+
+    def test_ww_recycle_restart_gets_a_fresh_grace_window(self) -> None:
+        """A launcher restarted by the recycle branch must be able to become ready.
+
+        Measured 2026-09-24 on this host (attempt ``3ac5ba8f``, batch
+        ``7da2bded``): the post-launch gate fired at 370s, the recycle branch
+        replaced the wedged ``launcher_main.exe`` (pid 31120) and successfully
+        started a fresh ``launcher.exe`` (pid 2080, logged as
+        ``launch-executable-started``) -- and then the method raised
+        ``ww_launcher_process_not_observed`` with ``pids=[]`` one millisecond
+        later.  Cause: the blocking ``_wait_until_ready`` call consumes up to
+        ``READY_TIMEOUT_SECONDS`` *inside* the loop body while the loop
+        condition still uses the ``START_TIMEOUT_SECONDS`` deadline computed
+        before it, so the ``continue`` after a restart re-tests an already
+        expired deadline and exits the loop without ever observing the process
+        it just started.  The recovery branch could therefore never work, and
+        the human gate parked the whole game day for 16 hours.
+
+        The fix must give the restarted launcher its own grace window.  Time
+        here advances realistically: the wait call burns past the outer
+        deadline, exactly as the blocking wait does in production.
+        """
+
+        launcher = Path(self.temporary.name) / "launcher.exe"
+        launcher.write_bytes(b"fixture")
+        debris = {31120: "launcher_main.exe"}
+        ready = (55, "client-win64-shipping.exe", 1280, 720)
+        gate = GameLaunchHumanRequired(
+            "ww_launcher_game_window_missing",
+            "WW formal launcher did not yield a stable game window; "
+            "inspect the preserved scene before resuming.",
+        )
+        listing: list[int] = []
+
+        def list_ww(_launcher, _expected_names):
+            listing.append(1)
+            # 1st call: pre-launch baseline (nothing running).  Every later call
+            # is the post-launch observation of the wedged launcher.
+            return {} if len(listing) == 1 else dict(debris)
+
+        now = [1000.0]
+
+        def monotonic() -> float:
+            return now[0]
+
+        outcomes = iter([gate, ready])
+
+        def wait(*_args, **_kwargs):
+            # Mirrors the blocking ready-wait: it spends the full readiness
+            # budget inside one loop iteration, so wall time passes the outer
+            # start deadline before the recycle branch runs.
+            now[0] += float(GameLaunchService.START_TIMEOUT_SECONDS) + 300.0
+            outcome = next(outcomes)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        with mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.os.name", "nt"
+        ), mock.patch.object(
+            GameLaunchService, "_verify_ww_launcher"
+        ), mock.patch.object(
+            self.launcher, "_list_ww_running", side_effect=list_ww
+        ), mock.patch.object(
+            self.launcher, "_wait_until_ready", side_effect=wait
+        ), mock.patch.object(
+            self.launcher, "_start_launch_executable",
+            return_value=mock.Mock(pid=9001),
+        ) as start, mock.patch.object(
+            self.launcher, "_recycle_ww_launcher", return_value=set()
+        ) as recycle, mock.patch.object(
+            GameLaunchService, "_find_window_handle", return_value=None
+        ), mock.patch.object(
+            GameLaunchService, "_process_working_set_bytes",
+            return_value=33 * 1024 * 1024,
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.monotonic",
+            side_effect=monotonic,
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.sleep"
+        ):
+            receipt = self.launcher._ensure_started("WW", str(launcher), None, 0.0, None)
+
+        recycle.assert_called_once_with(set(debris))
+        self.assertEqual(start.call_count, 2)
+        self.assertEqual(receipt.state, "started")
+        self.assertEqual(receipt.ready_window_pid, 55)
+
+    def test_ww_gate_recycles_shells_that_appeared_during_the_blocking_wait(self) -> None:
+        """The recycle set must be re-read when the gate fires, not taken stale.
+
+        Measured 2026-09-24 21:37 (attempt ``a9f79fd1``): the blocking ready-wait
+        saw ``running={26752 launcher_main, 31972 Wuthering Waves.exe,
+        44620 Client-Win64-Shipping.exe}``, but the recycle branch ran with the
+        snapshot its loop iteration had taken *before* that wait, so only the
+        launcher was replaced.  The two surviving client shells (8.5MB and
+        32.5MB, no window -- exactly the recyclable debris
+        ``_is_proven_dead_ww_client`` matches) then made the freshly started
+        launcher fail at once with ``ww_launcher_existing_client_unready``, and
+        the game day stayed blocked.  The gate handler must enumerate again.
+        """
+
+        launcher = Path(self.temporary.name) / "launcher.exe"
+        launcher.write_bytes(b"fixture")
+        pre_wait = {26752: "launcher_main.exe"}
+        post_wait = {
+            26752: "launcher_main.exe",
+            31972: "Wuthering Waves.exe",
+            44620: "Client-Win64-Shipping.exe",
+        }
+        gate = GameLaunchHumanRequired(
+            "ww_launcher_game_window_missing",
+            "WW formal launcher did not yield a stable game window; "
+            "inspect the preserved scene before resuming.",
+        )
+        ready = (55, "client-win64-shipping.exe", 1280, 720)
+        listing: list[int] = []
+
+        def list_ww(_launcher, _expected_names):
+            listing.append(1)
+            # 1st: pre-launch baseline (empty).  Then the snapshot taken at the
+            # top of the running iteration, which predates the shells.  Every
+            # later call is the re-enumeration the gate handler performs.
+            if len(listing) == 1:
+                return {}
+            if len(listing) == 2:
+                return dict(pre_wait)
+            return dict(post_wait)
+
+        outcomes = iter([gate, ready])
+
+        def wait(*_args, **_kwargs):
+            outcome = next(outcomes)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        clock = iter(range(100000))
+        with mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.os.name", "nt"
+        ), mock.patch.object(
+            GameLaunchService, "_verify_ww_launcher"
+        ), mock.patch.object(
+            self.launcher, "_list_ww_running", side_effect=list_ww
+        ), mock.patch.object(
+            self.launcher, "_wait_until_ready", side_effect=wait
+        ), mock.patch.object(
+            self.launcher, "_start_launch_executable",
+            return_value=mock.Mock(pid=9001),
+        ), mock.patch.object(
+            self.launcher, "_recycle_ww_launcher", return_value=set()
+        ) as recycle, mock.patch.object(
+            GameLaunchService, "_find_window_handle", return_value=None
+        ), mock.patch.object(
+            GameLaunchService, "_process_working_set_bytes",
+            return_value=33 * 1024 * 1024,
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.monotonic",
+            side_effect=lambda: float(next(clock)),
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.sleep"
+        ):
+            receipt = self.launcher._ensure_started("WW", str(launcher), None, 0.0, None)
+
+        # Every shell the waiter could see must be replaced, not just the
+        # launcher from the stale snapshot.
+        recycle.assert_called_once_with(set(post_wait))
+        self.assertEqual(receipt.state, "started")
+        self.assertEqual(receipt.ready_window_pid, 55)
+
+    def test_exited_but_still_listed_entry_is_not_a_cleanup_residual(self) -> None:
+        """An exited process kept listed by another handle must not block the queue.
+
+        Measured 2026-09-21: PGR.exe stayed enumerable with exit code 0 and could
+        not be terminated, so queue cleanup reported an incomplete residual and
+        every following game stopped at queue_game_cleanup_incomplete.
+        """
+
+        with mock.patch.object(
+            self.launcher, "_list_enumerated", return_value={6392: "PGR.exe"},
+        ), mock.patch.object(
+            self.launcher, "_process_is_live", return_value=False,
+        ):
+            self.assertEqual(
+                self.launcher._listed_cleanup_residuals({"PGR.exe"}, set(), None), set(),
+            )
+
+    def test_live_process_is_still_a_cleanup_residual(self) -> None:
+        with mock.patch.object(
+            self.launcher, "_list_enumerated", return_value={6392: "PGR.exe"},
+        ), mock.patch.object(
+            self.launcher, "_process_is_live", return_value=True,
+        ):
+            self.assertEqual(
+                self.launcher._listed_cleanup_residuals({"PGR.exe"}, set(), None), {6392},
+            )
+
+    def test_queue_close_snapshot_ignores_already_exited_entries(self) -> None:
+        """An exited process must not block the queue-close snapshot.
+
+        Measured 2026-09-22: PGR.exe stayed enumerable with exit code 0 and could
+        not be closed, so the queue reported remainingProcessIds=[6392] and every
+        following game stopped at queue_game_cleanup_incomplete.
+        """
+
+        root = Path(self.temporary.name)
+        with mock.patch.object(
+            self.launcher, "_list_enumerated", return_value={6392: "PGR.exe"},
+        ), mock.patch.object(
+            self.launcher, "_process_is_live", return_value=False,
+        ), mock.patch.object(
+            self.launcher, "_queue_process_identity",
+        ) as identity:
+            verified, unknown = self.launcher._queue_close_snapshot(root, {"PGR.exe"})
+        self.assertEqual(verified, {})
+        self.assertEqual(unknown, set())
+        identity.assert_not_called()
+
+    def test_endfield_launcher_actions_are_capped_even_when_every_action_is_acted(self) -> None:
+        """`acted` must not loop forever.
+
+        Measured 2026-09-21: every action reported "acted" while the client was a
+        6MB shell with no window, so the no-effect counter kept resetting and the
+        launcher dispatched audited foreground clicks (stealing focus) for 23
+        minutes, which made the desktop unusable.
+        """
+
+        launcher = Path(self.temporary.name) / "launcher.exe"
+        clock = iter(range(6000))
+        with mock.patch.object(
+            self.launcher, "_list_running", return_value={22: "launcher.exe"},
+        ), mock.patch.object(
+            self.launcher, "_find_ready_window", return_value=None,
+        ), mock.patch.object(
+            self.launcher, "_drive_endfield_launcher", return_value="acted",
+        ) as action, mock.patch.object(
+            self.launcher, "LAUNCHER_UI_READY_TIMEOUT_SECONDS", 3600.0,
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.monotonic",
+            side_effect=lambda: float(next(clock)),
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.sleep",
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher._LaunchProgressMonitor.observe",
+            return_value=False,
+        ):
+            with self.assertRaises(GameLaunchError) as caught:
+                self.launcher._wait_until_ready("Endfield", {"launcher.exe"}, launcher.parent)
+        self.assertIn("audited actions", str(caught.exception))
+        self.assertLessEqual(
+            action.call_count, self.launcher.ENDFIELD_MAX_LAUNCHER_ACTIONS + 1
+        )
+
+    def test_ww_eight_megabyte_file_check_writes_are_not_human_required(self) -> None:
+        launcher = Path(self.temporary.name) / "launcher.exe"
+        ready = (33, "client-win64-shipping.exe", 1280, 720)
+        clock = iter(range(1000))
+        frames = iter([None] * 20 + [ready, ready])
+        with mock.patch.object(self.launcher, "_list_ww_running", return_value={22: "launcher_main.exe", 33: ready[1]}), mock.patch.object(
+            self.launcher, "_find_ready_window", side_effect=lambda *args: next(frames, ready),
+        ), mock.patch.object(self.launcher, "_probe_ww_launcher", return_value="waiting:ww-busy") as action, mock.patch(
+            "yeyu_gamer_manager.services.game_launcher._LaunchProgressMonitor.observe",
+            return_value=True,
+        ), mock.patch("yeyu_gamer_manager.services.game_launcher.time.monotonic", side_effect=lambda: float(next(clock))), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.sleep",
+        ):
+            result = self.launcher._wait_until_ready("WW", {"launcher_main.exe", ready[1]}, launcher.parent, ww_launcher=launcher)
+        self.assertEqual(result, ready)
+        self.assertTrue(action.called)
+        self.assertTrue(all(not call.kwargs["allow_invoke"] for call in action.call_args_list))
+
+    def test_nikke_wegame_surface_that_never_starts_the_client_gates_for_operator(self) -> None:
+        """A WeGame surface that waits for a decision must not burn the whole budget."""
+
+        with mock.patch.object(
+            self.launcher, "_list_running", return_value={},
+        ), mock.patch.object(
+            self.launcher, "_probe_nikke_wegame_primary_action",
+            return_value="waiting:wegame-primary-action-absent",
+        ), mock.patch.object(self.launcher, "NIKKE_WEGAME_UI_READY_SECONDS", 5), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.monotonic", return_value=100.0,
+        ):
+            with self.assertRaises(GameLaunchHumanRequired) as caught:
+                self.launcher._drive_nikke_wegame_surface(
+                    observer=None, game_id="NIKKE", started_at=0.0,
+                    expected_names={"nikke.exe"}, actions=0, wait_started_at=0.0,
+                    cancel_requested=None,
+                )
+        self.assertEqual(caught.exception.reason_code, "nikke_wegame_launch_required")
+
+    def test_nikke_wegame_clicked_action_counts_and_reports_the_surface(self) -> None:
+        """The surface that owns the start decision must be in the captured scene."""
+
+        with mock.patch.object(
+            self.launcher, "_list_running", return_value={77: "wegame.exe"},
+        ), mock.patch.object(
+            self.launcher, "_probe_nikke_wegame_primary_action",
+            return_value="clicked:wegame-primary:启动:game-started",
+        ) as probe, mock.patch.object(self.launcher, "_notify") as notify, mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.monotonic", return_value=100.0,
+        ):
+            actions, outcome = self.launcher._drive_nikke_wegame_surface(
+                observer=None, game_id="NIKKE", started_at=0.0,
+                expected_names={"nikke.exe"}, actions=0, wait_started_at=0.0,
+                cancel_requested=None,
+            )
+        self.assertEqual(actions, 1)
+        self.assertTrue(outcome.startswith("clicked:wegame-primary:"))
+        self.assertTrue(probe.call_args.kwargs["allow_action"])
+        action_call = [call for call in notify.call_args_list if call.args[2] == "launcher-action"]
+        self.assertTrue(action_call)
+        self.assertIn("wegame.exe", action_call[-1].args[4])
+        self.assertEqual(action_call[-1].kwargs["process_ids"], frozenset({77}))
+
+    def test_nikke_wegame_action_budget_stops_further_clicks(self) -> None:
+        with mock.patch.object(
+            self.launcher, "_list_running", return_value={77: "wegame.exe"},
+        ), mock.patch.object(
+            self.launcher, "_probe_nikke_wegame_primary_action",
+            return_value="no-effect:wegame-primary:audited-primary-action",
+        ) as probe, mock.patch.object(self.launcher, "_notify"), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.monotonic", return_value=100.0,
+        ):
+            self.launcher._drive_nikke_wegame_surface(
+                observer=None, game_id="NIKKE", started_at=0.0,
+                expected_names={"nikke.exe"}, actions=self.launcher.NIKKE_WEGAME_MAX_ACTION_ACTIONS,
+                wait_started_at=99.0, cancel_requested=None,
+            )
+        self.assertFalse(probe.call_args.kwargs["allow_action"])
+
+    def test_nikke_wegame_human_outcomes_map_to_dedicated_reason_codes(self) -> None:
+        with mock.patch.object(
+            self.launcher, "_list_running", return_value={77: "wegame.exe"},
+        ), mock.patch.object(
+            self.launcher, "_probe_nikke_wegame_primary_action",
+            return_value="human:ambiguous-wegame-window:2",
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.monotonic", return_value=100.0,
+        ):
+            with self.assertRaises(GameLaunchHumanRequired) as caught:
+                self.launcher._drive_nikke_wegame_surface(
+                    observer=None, game_id="NIKKE", started_at=0.0,
+                    expected_names={"nikke.exe"}, actions=0, wait_started_at=0.0,
+                    cancel_requested=None,
+                )
+        self.assertEqual(caught.exception.reason_code, "nikke_wegame_ambiguous_wegame_window")
+        self.assertEqual(caught.exception.process_ids, frozenset({77}))
+
+    def test_off_screen_game_window_is_restored_instead_of_reported_ready(self) -> None:
+        """A parked window must be re-placed before the official tool starts.
+
+        Measured 2026-09-22: the ZZZ client sat at (-32000,-32000) while
+        IsWindowVisible stayed true, and the official tool looped on "enter game"
+        for 35 minutes; restoring the window let it continue immediately.
+        """
+
+        ready = (55, "ZenlessZoneZero.exe", 1936, 1119)
+        clock = iter(range(4000))
+        frames = iter([None] * 12 + [ready, ready])
+        with mock.patch.object(
+            self.launcher, "_list_running", return_value={55: "ZenlessZoneZero.exe"},
+        ), mock.patch.object(
+            self.launcher, "_find_ready_window", side_effect=lambda *args: next(frames, ready),
+        ), mock.patch.object(
+            self.launcher, "_find_window_handle", return_value=999,
+        ), mock.patch.object(
+            self.launcher, "_window_is_proven_blank", return_value=False,
+        ), mock.patch.object(
+            self.launcher, "_window_is_off_screen", side_effect=[True, False],
+        ), mock.patch.object(
+            self.launcher, "_restore_window_on_screen", return_value=True,
+        ) as restore, mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.monotonic",
+            side_effect=lambda: float(next(clock)),
+        ), mock.patch("yeyu_gamer_manager.services.game_launcher.time.sleep"), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher._LaunchProgressMonitor.observe",
+            return_value=False,
+        ):
+            result = self.launcher._wait_until_ready(
+                "ZZZ", {"ZenlessZoneZero.exe"}, Path(self.temporary.name),
+            )
+        self.assertEqual(result, ready)
+        self.assertTrue(restore.called)
+
+    def test_blank_game_window_delays_readiness_and_gates_for_operator(self) -> None:
+        """A window that renders nothing must never be reported ready.
+
+        Measured 2026-09-21: NIKKE was declared ready on a black frame, the
+        official tool started 13s later and every behavior-tree node failed.
+        """
+
+        ready = (55, "nikke.exe", 1920, 1080)
+        clock = iter(range(4000))
+        with mock.patch.object(
+            self.launcher, "_list_running", return_value={55: "nikke.exe"},
+        ), mock.patch.object(
+            self.launcher, "_find_ready_window", return_value=ready,
+        ), mock.patch.object(
+            self.launcher, "_find_window_handle", return_value=4242,
+        ), mock.patch.object(
+            self.launcher, "_window_is_proven_blank", return_value=True,
+        ), mock.patch.object(
+            self.launcher, "READY_TIMEOUT_OVERRIDES", {"NIKKE": 30.0},
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.monotonic",
+            side_effect=lambda: float(next(clock)),
+        ), mock.patch("yeyu_gamer_manager.services.game_launcher.time.sleep"), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher._LaunchProgressMonitor.observe",
+            return_value=False,
+        ):
+            with self.assertRaises(GameLaunchHumanRequired) as caught:
+                self.launcher._wait_until_ready(
+                    "NIKKE", {"nikke.exe"}, Path(self.temporary.name),
+                )
+        self.assertEqual(caught.exception.reason_code, "game_window_blank")
+
+    def test_uncapturable_game_window_is_not_treated_as_blank(self) -> None:
+        """Fail-open: a frame we cannot capture must never block a launch."""
+
+        with mock.patch.object(
+            type(self.launcher), "_capture_window_frame", return_value=None,
+        ):
+            self.assertFalse(self.launcher._window_is_proven_blank(1234))
+        with mock.patch.object(
+            type(self.launcher), "_capture_window_frame", side_effect=OSError("no dc"),
+        ):
+            self.assertFalse(self.launcher._window_is_proven_blank(1234))
+
+
+    def test_ww_busy_status_does_not_human_gate_while_launcher_checks_files(self) -> None:
+        launcher = Path(self.temporary.name) / "launcher.exe"
+        ready = (33, "client-win64-shipping.exe", 1280, 720)
+        clock = iter(range(1000))
+        frames = iter([None] * 20 + [ready, ready])
+        with mock.patch.object(self.launcher, "_list_ww_running", return_value={22: "launcher_main.exe", 33: ready[1]}), mock.patch.object(
+            self.launcher, "_find_ready_window", side_effect=lambda *args: next(frames, ready),
+        ), mock.patch.object(self.launcher, "_probe_ww_launcher", return_value="waiting:ww-busy") as action, mock.patch.object(
+            self.launcher, "WW_LAUNCHER_UI_READY_SECONDS", 5,
+        ), mock.patch("yeyu_gamer_manager.services.game_launcher.time.monotonic", side_effect=lambda: float(next(clock))), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.sleep",
+        ), mock.patch("yeyu_gamer_manager.services.game_launcher._LaunchProgressMonitor.observe", return_value=False):
+            result = self.launcher._wait_until_ready("WW", {"launcher_main.exe", ready[1]}, launcher.parent, ww_launcher=launcher)
+        self.assertEqual(result, ready)
+        action.assert_called()
+
+    def test_ww_transient_uia_probe_fault_is_retried_within_ui_ready_window(self) -> None:
+        # A healthy launcher whose WebView tree is still rendering can raise a
+        # transient UIA/COM read fault.  That is a technical fault, not a human
+        # decision: it must be retried inside the UI-ready window instead of
+        # stopping the whole queue at a human gate.
+        launcher = Path(self.temporary.name) / "launcher.exe"
+        ready = (33, "client-win64-shipping.exe", 1280, 720)
+        clock = iter(range(1000))
+        frames = iter([None] * 6 + [ready, ready])
+        outcomes = iter(
+            ["human:uia-probe-failed", "human:invalid-probe-result", "waiting:ww-busy"]
+        )
+        with mock.patch.object(self.launcher, "_list_ww_running", return_value={22: "launcher_main.exe"}), mock.patch.object(
+            self.launcher, "_find_ready_window", side_effect=lambda *args: next(frames, ready),
+        ), mock.patch.object(
+            self.launcher, "_probe_ww_launcher",
+            side_effect=lambda *args, **kwargs: next(outcomes, "waiting:ww-busy"),
+        ) as probe, mock.patch.object(
+            self.launcher, "WW_LAUNCHER_POLL_SECONDS", 0,
+        ), mock.patch("yeyu_gamer_manager.services.game_launcher.time.monotonic", side_effect=lambda: float(next(clock))), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.sleep",
+        ), mock.patch("yeyu_gamer_manager.services.game_launcher._LaunchProgressMonitor.observe", return_value=False):
+            result = self.launcher._wait_until_ready("WW", {"launcher_main.exe", ready[1]}, launcher.parent, ww_launcher=launcher)
+        self.assertEqual(result, ready)
+        self.assertGreaterEqual(probe.call_count, 3)
+
+    def test_ww_persistent_probe_fault_still_reaches_bounded_human_gate(self) -> None:
+        # Retrying must stay bounded: a launcher that never settles still ends
+        # at the normal human gate rather than polling forever.
+        launcher = Path(self.temporary.name) / "launcher.exe"
+        clock = iter(range(100000))
+        with mock.patch.object(self.launcher, "_list_ww_running", return_value={22: "launcher_main.exe"}), mock.patch.object(
+            self.launcher, "_find_ready_window", return_value=None,
+        ), mock.patch.object(self.launcher, "_probe_ww_launcher", return_value="human:uia-probe-failed"), mock.patch.object(
+            self.launcher, "WW_LAUNCHER_UI_READY_SECONDS", 5,
+        ), mock.patch("yeyu_gamer_manager.services.game_launcher.time.monotonic", side_effect=lambda: float(next(clock))), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.sleep",
+        ), mock.patch("yeyu_gamer_manager.services.game_launcher._LaunchProgressMonitor.observe", return_value=False):
+            with self.assertRaises(GameLaunchHumanRequired) as caught:
+                self.launcher._wait_until_ready("WW", {"launcher_main.exe"}, launcher.parent, ww_launcher=launcher)
+        self.assertEqual(caught.exception.reason_code, "ww_launcher_uia_probe_failed")
 
     def test_ww_formal_launcher_dispatches_once_and_never_counts_launcher_as_ready(self) -> None:
         launcher = Path(self.temporary.name) / "launcher.exe"
@@ -327,17 +1286,24 @@ ConvertTo-Json -InputObject $results -Compress
         self.assertEqual(sum(call.kwargs["allow_invoke"] for call in action.call_args_list), 1)
         self.assertTrue(all(call.args[1] == {"client-win64-shipping.exe"} for call in find.call_args_list))
 
-    def test_ww_formal_launcher_active_update_preserves_scene_without_action(self) -> None:
+    def test_ww_formal_launcher_waits_for_update_then_returns_ready_without_input(self) -> None:
         launcher = Path(self.temporary.name) / "launcher.exe"
-        with mock.patch.object(self.launcher, "_list_ww_running", return_value={22: "launcher_updater.exe"}), mock.patch.object(
-            self.launcher, "_find_ready_window", return_value=None,
-        ), mock.patch.object(self.launcher, "_probe_ww_launcher") as action, mock.patch(
-            "yeyu_gamer_manager.services.game_launcher._LaunchProgressMonitor.observe", return_value=True,
+        ready = (33, "client-win64-shipping.exe", 1280, 720)
+        clock = iter(range(1000))
+        frames = iter([None])
+        updates = iter([True, True])
+        with mock.patch.object(self.launcher, "_list_ww_running", return_value={22: "launcher_updater.exe", 33: ready[1]}), mock.patch.object(
+            self.launcher, "_find_ready_window", side_effect=lambda *args: next(frames, ready),
+        ), mock.patch.object(self.launcher, "_probe_ww_launcher", return_value="waiting:ww-busy") as action, mock.patch(
+            "yeyu_gamer_manager.services.game_launcher._LaunchProgressMonitor.observe",
+            side_effect=lambda *args, **kwargs: next(updates, False),
+        ), mock.patch("yeyu_gamer_manager.services.game_launcher.time.monotonic", side_effect=lambda: float(next(clock))), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.sleep",
         ):
-            with self.assertRaises(GameLaunchHumanRequired) as caught:
-                self.launcher._wait_until_ready("WW", {"launcher_updater.exe"}, launcher.parent, ww_launcher=launcher)
-        self.assertEqual(caught.exception.reason_code, "ww_launcher_update_observed")
-        action.assert_not_called()
+            result = self.launcher._wait_until_ready("WW", {"launcher_updater.exe", ready[1]}, launcher.parent, ww_launcher=launcher)
+        self.assertEqual(result, ready)
+        self.assertTrue(action.called)
+        self.assertTrue(all(not call.kwargs["allow_invoke"] for call in action.call_args_list))
 
     def test_ww_formal_launcher_returns_only_after_shipping_window_is_stable(self) -> None:
         launcher = Path(self.temporary.name) / "launcher.exe"
@@ -413,176 +1379,6 @@ ConvertTo-Json -InputObject $results -Compress
         self.assertNotIn("_PYI_APPLICATION_HOME_DIR", environment)
         self.assertEqual(environment["YEYU_TEST_KEEP"], "kept")
 
-    def test_nte_waits_for_real_client_and_drives_only_fixed_launcher(self) -> None:
-        launcher_root = Path(self.temporary.name) / "NTELauncher"
-        launcher_root.mkdir()
-        with mock.patch.object(
-            self.launcher,
-            "_list_running",
-            return_value={10: "NTEGame.exe", 20: "HTGame.exe"},
-        ), mock.patch.object(
-            self.launcher,
-            "_find_ready_window",
-            side_effect=[None, (20, "htgame.exe", 1920, 1080), (20, "htgame.exe", 1920, 1080)],
-        ) as find_ready, mock.patch.object(
-            self.launcher, "_drive_nte_launcher", return_value="acted"
-        ) as drive, mock.patch(
-            "yeyu_gamer_manager.services.game_launcher.time.monotonic",
-            side_effect=[0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 3.1, 3.1],
-        ), mock.patch(
-            "yeyu_gamer_manager.services.game_launcher.time.sleep"
-        ):
-            ready = self.launcher._wait_until_ready(
-                "NTE", {"ntegame.exe", "htgame.exe"}, launcher_root
-            )
-
-        self.assertEqual(ready[0], 20)
-        drive.assert_called()
-        for call in find_ready.call_args_list:
-            self.assertEqual(
-                call.args[1],
-                {"htgame.exe", "nte.exe", "neverness to everness.exe"},
-            )
-            self.assertEqual(call.args[2], "NTE")
-        self.assertIn("InvokePattern", self.launcher._NTE_UIA_SCRIPT)
-        self.assertIn("AllowSetForegroundWindow", self.launcher._NTE_UIA_SCRIPT)
-        self.assertIn("AttachThreadInput", self.launcher._NTE_UIA_SCRIPT)
-        self.assertIn("SetForegroundWindow", self.launcher._NTE_UIA_SCRIPT)
-        self.assertIn("mouse_event", self.launcher._NTE_UIA_SCRIPT)
-        self.assertIn("keybd_event(0x20", self.launcher._NTE_UIA_SCRIPT)
-        self.assertNotIn("LegacyIAccessiblePattern", self.launcher._NTE_UIA_SCRIPT)
-        self.assertNotIn("1..2 | ForEach-Object", self.launcher._NTE_UIA_SCRIPT)
-        self.assertIn("no-effect:", self.launcher._NTE_UIA_SCRIPT)
-        self.assertIn("WindowFromPoint", self.launcher._NTE_UIA_SCRIPT)
-        self.assertIn("blocked-by-foreign-window:", self.launcher._NTE_UIA_SCRIPT)
-
-    def test_nte_fails_after_three_audited_actions_have_no_effect(self) -> None:
-        launcher_root = Path(self.temporary.name) / "NTELauncher"
-        launcher_root.mkdir()
-        with mock.patch.object(
-            self.launcher, "_list_running", return_value={10: "NTEGame.exe"}
-        ), mock.patch.object(
-            self.launcher, "_find_ready_window", return_value=None
-        ), mock.patch.object(
-            self.launcher, "_drive_nte_launcher", return_value="no-effect"
-        ) as drive, mock.patch(
-            "yeyu_gamer_manager.services.game_launcher.time.monotonic",
-            side_effect=[0.0, 0.0, 0.0, 0.0, 4.0, 4.0, 8.0, 8.0],
-        ), mock.patch(
-            "yeyu_gamer_manager.services.game_launcher.time.sleep"
-        ):
-            with self.assertRaisesRegex(GameLaunchError, "had no visible effect"):
-                self.launcher._wait_until_ready(
-                    "NTE", {"ntegame.exe", "htgame.exe"}, launcher_root
-                )
-
-        self.assertEqual(drive.call_count, 3)
-
-    def test_nte_launcher_still_loading_is_not_counted_as_no_effect(self) -> None:
-        launcher_root = Path(self.temporary.name) / "NTELauncher"
-        launcher_root.mkdir()
-        # Six "not-ready" probes (launcher still rendering) must not trip the
-        # no-effect breaker; the client then appears and the gate opens.
-        with mock.patch.object(
-            self.launcher,
-            "_list_running",
-            return_value={10: "NTEGame.exe", 20: "HTGame.exe"},
-        ), mock.patch.object(
-            self.launcher,
-            "_find_ready_window",
-            side_effect=[None] * 6 + [(20, "htgame.exe", 1920, 1080)] * 2,
-        ), mock.patch.object(
-            self.launcher, "_drive_nte_launcher", return_value="not-ready"
-        ) as drive, mock.patch(
-            "yeyu_gamer_manager.services.game_launcher.time.monotonic",
-            side_effect=[0.0, 0.0] + [float(3 * index) for index in range(1, 7) for _ in (0, 1)] + [21.0, 21.0, 40.0, 40.0],
-        ), mock.patch(
-            "yeyu_gamer_manager.services.game_launcher.time.sleep"
-        ):
-            ready = self.launcher._wait_until_ready(
-                "NTE", {"ntegame.exe", "htgame.exe"}, launcher_root
-            )
-
-        self.assertEqual(ready[0], 20)
-        self.assertGreaterEqual(drive.call_count, 4)
-
-    def test_nte_blank_launcher_fails_with_typed_message_after_ui_bound(self) -> None:
-        launcher_root = Path(self.temporary.name) / "NTELauncher"
-        launcher_root.mkdir()
-        bound = self.launcher.LAUNCHER_UI_READY_TIMEOUT_SECONDS
-        with mock.patch.object(
-            self.launcher, "_list_running", return_value={10: "NTEGame.exe"}
-        ), mock.patch.object(
-            self.launcher, "_find_ready_window", return_value=None
-        ), mock.patch.object(
-            self.launcher, "_drive_nte_launcher", return_value="not-ready"
-        ), mock.patch(
-            "yeyu_gamer_manager.services.game_launcher.time.monotonic",
-            side_effect=[0.0, 0.0, 0.0, 0.0, bound + 1.0, bound + 1.0],
-        ), mock.patch(
-            "yeyu_gamer_manager.services.game_launcher.time.sleep"
-        ):
-            with self.assertRaisesRegex(GameLaunchError, "never exposed its audited start action"):
-                self.launcher._wait_until_ready(
-                    "NTE", {"ntegame.exe", "htgame.exe"}, launcher_root
-                )
-
-    def test_nte_foreign_foreground_window_fails_immediately(self) -> None:
-        launcher_root = Path(self.temporary.name) / "NTELauncher"
-        launcher_root.mkdir()
-        with mock.patch.object(
-            self.launcher, "_list_running", return_value={10: "NTEGame.exe"}
-        ), mock.patch.object(
-            self.launcher, "_find_ready_window", return_value=None
-        ), mock.patch.object(
-            self.launcher, "_drive_nte_launcher", return_value="foreground-interference"
-        ), mock.patch(
-            "yeyu_gamer_manager.services.game_launcher.time.monotonic",
-            side_effect=[0.0, 0.0, 0.0, 0.0],
-        ), mock.patch(
-            "yeyu_gamer_manager.services.game_launcher.time.sleep"
-        ):
-            with self.assertRaisesRegex(GameLaunchError, "external-hotkey-or-foreground-interference"):
-                self.launcher._wait_until_ready(
-                    "NTE", {"ntegame.exe", "htgame.exe"}, launcher_root
-                )
-
-    def test_launcher_download_activity_suspends_no_effect_strikes(self) -> None:
-        launcher_root = Path(self.temporary.name) / "NTELauncher"
-        launcher_root.mkdir()
-        # While the launcher writes the update to disk the audited button is
-        # hidden; the gate must wait instead of counting no-effect strikes.
-        # Samples: 0s (baseline), 15s (+64MB -> updating), 30s (+64MB), 45s
-        # (no growth -> idle again), then the client window appears.
-        writes = iter([0, 64 << 20, 128 << 20, 128 << 20, 128 << 20])
-        clock = iter(
-            [0.0, 0.0]
-            + [t for t in (0.0, 15.0, 30.0, 45.0, 60.0, 63.0, 66.0) for _ in (0, 1)]
-        )
-        with mock.patch.object(
-            self.launcher, "_list_running", return_value={10: "NTEGame.exe"}
-        ), mock.patch.object(
-            self.launcher,
-            "_find_ready_window",
-            side_effect=[None] * 5 + [(10, "htgame.exe", 1920, 1080)] * 2,
-        ), mock.patch.object(
-            self.launcher, "_drive_nte_launcher", return_value="no-effect"
-        ) as drive, mock.patch(
-            "yeyu_gamer_manager.services.game_launcher._process_bytes_written",
-            side_effect=lambda pid: next(writes),
-        ), mock.patch(
-            "yeyu_gamer_manager.services.game_launcher.time.monotonic",
-            side_effect=clock,
-        ), mock.patch(
-            "yeyu_gamer_manager.services.game_launcher.time.sleep"
-        ):
-            ready = self.launcher._wait_until_ready(
-                "NTE", {"ntegame.exe", "htgame.exe"}, launcher_root
-            )
-        self.assertEqual(ready[0], 10)
-        # Driven at 0s, 45s and 60s; the two "updating" polls skipped it and
-        # reset the strike counter, so three no-effect results never accumulate.
-        self.assertEqual(drive.call_count, 3)
 
     def test_launcher_download_wait_stops_on_persisted_cancellation(self) -> None:
         launcher_root = Path(self.temporary.name) / "NTELauncher"
@@ -593,7 +1389,7 @@ ConvertTo-Json -InputObject $results -Compress
         ), mock.patch.object(
             self.launcher, "_find_ready_window", return_value=None
         ), mock.patch.object(
-            self.launcher, "_drive_nte_launcher"
+            self.launcher, "_run_launcher_probe"
         ) as drive, mock.patch(
             "yeyu_gamer_manager.services.game_launcher._LaunchProgressMonitor.observe",
             return_value=True,
@@ -642,9 +1438,13 @@ ConvertTo-Json -InputObject $results -Compress
                 )
 
         close_started.assert_not_called()
-        self.assertEqual([item.phase for item in observations], ["launch-cancelled"])
         self.assertEqual(
-            observations[0].detail["reasonCode"], "manager_cancel_requested"
+            [item.phase for item in observations], ["launcher-action", "launch-cancelled"]
+        )
+        self.assertEqual(observations[0].detail["operation"], "launch-executable-started")
+        self.assertEqual(observations[0].detail["processId"], 1234)
+        self.assertEqual(
+            observations[1].detail["reasonCode"], "manager_cancel_requested"
         )
 
     def test_cancellation_terminates_only_the_owned_launcher_probe(self) -> None:
@@ -715,6 +1515,7 @@ ConvertTo-Json -InputObject $results -Compress
         self.assertEqual(classify(4, "no-effect:开始游戏"), "no-effect")
         self.assertEqual(classify(5, "blocked-by-foreign-window:开始游戏"), "foreground-interference")
         self.assertEqual(classify(3, ""), "not-ready")
+        self.assertEqual(classify(3, "not-ready:launcher-restore-requested;pid=10;accepted=True"), "restore-requested")
         self.assertEqual(classify(1, "Add-Type : error"), "not-ready")
 
     def test_endfield_waits_for_real_client_and_drives_formal_launcher(self) -> None:
@@ -750,13 +1551,81 @@ ConvertTo-Json -InputObject $results -Compress
                 {"endfield.exe", "endfield-win64-shipping.exe"},
             )
             self.assertEqual(call.args[2], "Endfield")
-        self.assertIn("--game=Endfield", self.launcher._ENDFIELD_UIA_SCRIPT)
-        self.assertIn("--region=CN", self.launcher._ENDFIELD_UIA_SCRIPT)
+        self.assertIn("$selectors.Count -eq 1", self.launcher._ENDFIELD_UIA_SCRIPT)
+        self.assertIn("$regions.Count -eq 0", self.launcher._ENDFIELD_UIA_SCRIPT)
         self.assertIn("InvokePattern", self.launcher._ENDFIELD_UIA_SCRIPT)
         self.assertIn("no-effect:launcher-primary-action", self.launcher._ENDFIELD_UIA_SCRIPT)
         self.assertIn("WindowFromPoint", self.launcher._ENDFIELD_UIA_SCRIPT)
         self.assertIn("blocked-by-foreign-window:", self.launcher._ENDFIELD_UIA_SCRIPT)
         self.assertIn("keybd_event(0x12", self.launcher._ENDFIELD_UIA_SCRIPT)
+
+    def test_startup_delay_keeps_duration_and_honors_cancellation_without_input(self) -> None:
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                clock = [0.0]
+                def sleep(seconds):
+                    clock[0] += seconds
+                with mock.patch.object(self.launcher, "POLL_INTERVAL_SECONDS", 1), mock.patch.object(
+                    self.launcher, "_list_running", return_value={222: "PGR.exe"}
+                ), mock.patch(
+                    "yeyu_gamer_manager.services.game_launcher.time.monotonic", side_effect=lambda: clock[0]
+                ), mock.patch("yeyu_gamer_manager.services.game_launcher.time.sleep", side_effect=sleep), mock.patch(
+                    "yeyu_gamer_manager.services.game_launcher.ctypes.WinDLL"
+                ) as native:
+                    if cancel:
+                        with self.assertRaises(GameLaunchCancelled):
+                            self.launcher._handoff_started_game("PGR", 222, cancel_requested=lambda: clock[0] >= 3)
+                    else:
+                        self.launcher._handoff_started_game("PGR", 222)
+                self.assertEqual(clock[0], 3 if cancel else 75)
+                native.assert_not_called()
+
+    def test_endfield_observation_reports_the_start_action_deadline_that_actually_expires(self) -> None:
+        clock = [0.0]
+        observations = []
+        def sleep(seconds):
+            clock[0] += seconds
+        self.launcher.READY_TIMEOUT_OVERRIDES = {"Endfield": 20.0}
+        self.launcher.LAUNCHER_UI_READY_TIMEOUT_SECONDS = 5.0
+        self.launcher.LAUNCH_OBSERVATION_INTERVAL_SECONDS = 1.0
+        self.launcher.ENDFIELD_LAUNCHER_POLL_SECONDS = 1.0
+        self.launcher.POLL_INTERVAL_SECONDS = 1.0
+        with mock.patch.object(self.launcher, "_list_running", return_value={10: "Games.exe"}), mock.patch.object(
+            self.launcher, "_find_ready_window", return_value=None
+        ), mock.patch.object(self.launcher, "_drive_endfield_launcher", return_value="not-ready"), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.monotonic", side_effect=lambda: clock[0]
+        ), mock.patch("yeyu_gamer_manager.services.game_launcher.time.sleep", side_effect=sleep):
+            with self.assertRaisesRegex(GameLaunchError, "start-action wait expired"):
+                self.launcher._wait_until_ready(
+                    "Endfield", {"games.exe", "endfield.exe"}, self.executable.parent,
+                    observer=observations.append,
+                )
+        self.assertEqual(clock[0], 5.0)
+        self.assertEqual([item.detail["secondsUntilDeadline"] for item in observations], [4.0, 3.0, 2.0, 1.0])
+        self.assertTrue(all(item.detail["deadlineTrigger"] == "Endfield launcher start-action wait timeout"
+                            for item in observations))
+        self.assertTrue(all("start/update action" in item.detail["waitingFor"] for item in observations))
+
+    def test_endfield_disappeared_process_still_reports_wait_without_relaunch(self) -> None:
+        import itertools
+        observations = []
+        self.launcher.ENDFIELD_REACTIVATION_READY_SECONDS = 1
+        self.launcher.LAUNCH_OBSERVATION_INTERVAL_SECONDS = 0.1
+        with mock.patch.object(self.launcher, "_list_running", return_value={}), mock.patch.object(
+            self.launcher, "_find_ready_window", return_value=None
+        ), mock.patch.object(self.launcher, "_drive_endfield_launcher") as drive, mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.monotonic", side_effect=itertools.count(0, 0.05)
+        ), mock.patch("yeyu_gamer_manager.services.game_launcher.time.sleep"):
+            with self.assertRaises(GameLaunchHumanRequired):
+                self.launcher._wait_until_ready(
+                    "Endfield", {"games.exe", "endfield.exe"}, observer=observations.append,
+                    endfield_reactivation=(self.executable.parent, frozenset({10})),
+                )
+        self.assertTrue(observations)
+        self.assertTrue(all(item.phase == "launcher-waiting" for item in observations))
+        self.assertTrue(all(item.process_ids == frozenset() for item in observations))
+        self.assertIn("window", observations[-1].detail["waitingFor"])
+        drive.assert_not_called()
 
     def test_endfield_headless_official_instance_is_activated_once_and_observed_without_input(self) -> None:
         launcher = Path(self.temporary.name) / "Hypergryph Launcher" / "Launcher.exe"
@@ -886,22 +1755,25 @@ ConvertTo-Json -InputObject $results -Compress
         self.assertEqual(seen, [{10: "Games.exe", 20: "Endfield.exe"}] * 2)
         drive.assert_not_called()
 
-    def test_endfield_reactivation_no_effect_or_update_is_human_required_without_input(self) -> None:
-        for updating in (False, True):
-            with self.subTest(updating=updating), mock.patch.object(self.launcher, "_list_running", return_value={10: "Games.exe", 99: "Games.exe"}), mock.patch.object(
-                self.launcher, "_find_ready_window", return_value=None,
-            ), mock.patch.object(self.launcher, "_drive_endfield_launcher") as drive, mock.patch.object(self.launcher, "close_started") as close, mock.patch(
-                "yeyu_gamer_manager.services.game_launcher._LaunchProgressMonitor.observe", return_value=updating,
-            ), mock.patch("yeyu_gamer_manager.services.game_launcher.time.monotonic", side_effect=[0, 0, 0, 0, 91]), mock.patch(
-                "yeyu_gamer_manager.services.game_launcher.time.sleep",
-            ):
-                with self.assertRaises(GameLaunchHumanRequired) as caught:
-                    self.launcher._wait_until_ready("Endfield", {"games.exe", "endfield.exe"}, self.executable.parent,
-                        endfield_reactivation=(self.executable.parent, frozenset({10, 11})))
-                self.assertEqual(caught.exception.process_ids, frozenset({10}))
-                self.assertIn("update_observed" if updating else "game_window_missing", caught.exception.reason_code)
-                drive.assert_not_called()
-                close.assert_not_called()
+    def test_endfield_reactivation_waits_for_update_then_returns_ready_without_input(self) -> None:
+        ready = (20, "endfield.exe", 1920, 1080)
+        clock = iter(range(1000))
+        frames = iter([None])
+        updates = iter([True, True])
+        with mock.patch.object(self.launcher, "_list_running", return_value={10: "Games.exe", 20: "Endfield.exe"}), mock.patch.object(
+            self.launcher, "_process_executable_path", return_value=self.executable.parent / "Endfield.exe",
+        ), mock.patch.object(self.launcher, "_find_ready_window", side_effect=lambda *args: next(frames, ready)), mock.patch.object(
+            self.launcher, "_drive_endfield_launcher",
+        ) as drive, mock.patch(
+            "yeyu_gamer_manager.services.game_launcher._LaunchProgressMonitor.observe",
+            side_effect=lambda *args, **kwargs: next(updates, False),
+        ), mock.patch("yeyu_gamer_manager.services.game_launcher.time.monotonic", side_effect=lambda: float(next(clock))), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.time.sleep",
+        ):
+            result = self.launcher._wait_until_ready("Endfield", {"games.exe", "endfield.exe"}, self.executable.parent,
+                endfield_reactivation=(self.executable.parent, frozenset({10, 11})))
+        self.assertEqual(result, ready)
+        drive.assert_not_called()
 
     def test_endfield_reactivation_observation_error_is_a_preserved_human_gate(self) -> None:
         observations = []
@@ -1002,50 +1874,103 @@ ConvertTo-Json -InputObject $results -Compress
         )
         self.assertLess(script.index(guarded_empty_tree), script.index(fixed_fallback))
 
+    @unittest.skipUnless(os.name == "nt", "production identity predicate uses Windows PowerShell")
+    def test_endfield_identity_diagnostics_preserve_each_filter(self) -> None:
+        source = self.launcher._ENDFIELD_UIA_SCRIPT
+        predicate = source[source.index("$expected ="):source.index("$process = Get-Process")]
+        script = Path(self.temporary.name) / "identity-probe.ps1"
+        script.write_text(
+            "function Get-CimInstance { (ConvertFrom-Json $env:YEYU_TEST_PROCESSES) | ForEach-Object { $_ } }\n"
+            + predicate + "\nWrite-Output 'matched'; exit 0\n", encoding="utf-8-sig",
+        )
+        root = Path(self.temporary.name) / "Hypergryph Launcher"
+        valid = {"ExecutablePath": str(root / "1.5.0" / "Games.exe"),
+                 "CommandLine": 'Games.exe --game=Endfield --region=CN'}
+        cases = [
+            ([], 3, "observed=0;pathMatched=0;gameMatched=0;regionCompatible=0"),
+            ([{**valid, "ExecutablePath": ""}], 3, "observed=1;pathMatched=0;gameMatched=0;regionCompatible=0"),
+            ([{**valid, "CommandLine": "Games.exe --game=Other --region=CN"}], 3, "gameMatched=0;regionCompatible=0"),
+            ([{**valid, "CommandLine": "Games.exe --game=endfield --reason=4"}], 0, "matched"),
+            ([{**valid, "CommandLine": "Games.exe --game=Endfield --region=US"}], 3, "gameMatched=1;regionCompatible=0"),
+            ([{**valid, "CommandLine": "Games.exe --game=Endfield --region=CN --region=CN"}], 3, "regionCompatible=0"),
+            ([{**valid, "CommandLine": "Games.exe --game=Endfield --game=Other"}], 3, "gameMatched=0"),
+            ([valid, valid], 3, "games-exe-candidates=2"),
+            ([valid], 0, "matched"),
+        ]
+        powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        for processes, exit_code, expected in cases:
+            with self.subTest(expected=expected):
+                result = subprocess.run(
+                    [str(powershell), "-NoProfile", "-NonInteractive", "-Command", script.read_text(encoding="utf-8-sig")],
+                    env={**os.environ, "YEYU_ENDFIELD_LAUNCHER_ROOT": str(root),
+                         "YEYU_TEST_PROCESSES": json.dumps(processes)},
+                    capture_output=True, text=True, errors="replace", timeout=15,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                self.assertEqual(result.returncode, exit_code, result.stderr)
+                self.assertIn(expected, result.stdout)
+
+    @unittest.skipUnless(os.name == "nt", "production click result uses Windows PowerShell")
+    def test_endfield_uia_click_reports_whether_input_was_dispatched(self) -> None:
+        source = self.launcher._ENDFIELD_UIA_SCRIPT
+        start = source.index("    $clicked = Invoke-YeYuPhysicalClick", source.index("foreach ($button"))
+        end = source.index("\n}\nif ($env:YEYU_ENDFIELD_ALLOW_FALLBACK", start)
+        result_branch = source[start:end]
+        powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        for value, changed, code, expected in (
+            ("$null", False, 3, "not-ready:foreground-not-acquired;requester=fixture"),
+            ("$null", True, 3, "not-ready:foreground-not-acquired;requester=fixture"),
+            ("$false", False, 4, "no-effect:start"),
+            ("$true", False, 0, "clicked:start:game-started"),
+        ):
+            with self.subTest(value=value, changed=changed):
+                # Execute the production result branch without loading input APIs.
+                # An unrelated button change after foreground denial must not
+                # become a claim that this probe clicked the button.
+                script = (
+                    f"function Invoke-YeYuPhysicalClick {{ return {value} }}\n"
+                    "$script:lastForegroundProbe='requester=fixture'\n"
+                    "$window=0; $process=@{Id=1}; $x=0; $y=0; $name='start'; $initialEnabled=$true\n"
+                    f"$button=@{{Current=@{{Name='{('changed' if changed else 'start')}';IsEnabled=$true}}}}\n"
+                    + result_branch
+                )
+                result = subprocess.run(
+                    [str(powershell), "-NoProfile", "-NonInteractive", "-Command", script],
+                    capture_output=True, text=True, errors="replace", timeout=15,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
     def test_endfield_bridge_rejects_non_launcher_root(self) -> None:
         with self.assertRaises(GameLaunchError):
             self.launcher._drive_endfield_launcher(Path(self.temporary.name))
 
-    def test_endfield_retires_only_old_headless_orphan(self) -> None:
-        running = {10: "Endfield.exe"}
-        with mock.patch.object(
-            self.launcher, "_find_ready_window", return_value=None
-        ), mock.patch.object(
-            self.launcher, "_process_age_seconds", return_value=600.0
-        ), mock.patch.object(
-            self.launcher, "_request_graceful_close"
-        ) as close, mock.patch.object(
-            self.launcher, "_wait_for_owned_exit", return_value=set()
-        ):
-            retired = self.launcher._retire_stale_headless_endfield(running)
-
-        self.assertTrue(retired)
-        close.assert_called_once_with({10})
-
-    def test_endfield_preserves_young_headless_client(self) -> None:
-        running = {10: "Endfield.exe"}
-        with mock.patch.object(
-            self.launcher, "_find_ready_window", return_value=None
-        ), mock.patch.object(
-            self.launcher, "_process_age_seconds", return_value=30.0
-        ), mock.patch.object(self.launcher, "_request_graceful_close") as close:
-            retired = self.launcher._retire_stale_headless_endfield(running)
-
-        self.assertFalse(retired)
+    def test_existing_endfield_wait_cancellation_never_recycles_client(self) -> None:
+        with mock.patch.object(self.launcher, "_resolve_endfield_launcher", return_value=self.executable), mock.patch.object(
+            self.launcher, "_list_running", return_value={10: "Endfield.exe"},
+        ), mock.patch.object(self.launcher, "_wait_until_ready", side_effect=GameLaunchCancelled("test cancellation")), mock.patch.object(
+            self.launcher, "_request_graceful_close",
+        ) as close, mock.patch.object(self.launcher, "_terminate_owned") as terminate, mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.subprocess.Popen",
+        ) as start:
+            with self.assertRaises(GameLaunchCancelled):
+                self.launcher.ensure_started("Endfield", str(self.executable))
         close.assert_not_called()
+        terminate.assert_not_called()
+        start.assert_not_called()
 
-    def test_endfield_preserves_headless_client_while_launcher_is_live(self) -> None:
-        running = {10: "Endfield.exe", 20: "Games.exe"}
-        with mock.patch.object(self.launcher, "_request_graceful_close") as close:
-            retired = self.launcher._retire_stale_headless_endfield(running)
 
-        self.assertFalse(retired)
-        close.assert_not_called()
-
-    def test_new_pgr_gets_one_audited_title_handoff_before_adapter(self) -> None:
+    def test_new_pgr_reports_configured_startup_wait_before_adapter(self) -> None:
+        observations = []
         process = mock.Mock(pid=1234)
         with mock.patch(
             "yeyu_gamer_manager.services.game_launcher.os.name", "nt"
+        ), mock.patch(
+            # The leftover-instance guard reads real machine state; this test is
+            # about the startup-wait reporting, so keep it hermetic.
+            "yeyu_gamer_manager.services.game_launcher.named_mutex_is_held",
+            return_value=False,
         ), mock.patch.object(
             self.launcher,
             "_list_running",
@@ -1060,41 +1985,22 @@ ConvertTo-Json -InputObject $results -Compress
         ), mock.patch.object(
             self.launcher, "_handoff_started_game"
         ) as handoff:
-            receipt = self.launcher.ensure_started("PGR", str(self.executable))
+            receipt = self.launcher.ensure_started("PGR", str(self.executable), observer=observations.append)
 
         self.assertEqual(receipt.state, "started")
         handoff.assert_called_once_with("PGR", 1234)
+        self.assertEqual(
+            [item.phase for item in observations],
+            ["launcher-action", "client-startup-wait", "ready"],
+        )
+        self.assertEqual(observations[0].detail["operation"], "launch-executable-started")
+        self.assertEqual(observations[0].detail["processId"], 1234)
+        self.assertEqual(observations[1].process_ids, frozenset({1234}))
+        self.assertEqual(observations[1].detail["requiredWaitSeconds"], 75)
+        self.assertIn("official Adapter dispatch", observations[1].detail["waitingFor"])
 
-    def test_pgr_launch_pins_unity_window_preferences(self) -> None:
-        import winreg
-
-        test_key = r"Software\YeYuGamerTests\pgr-prefs-" + uuid.uuid4().hex
-        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, test_key)
-        try:
-            winreg.SetValueEx(key, "Screenmanager Fullscreen mode_h3630240806", 0, winreg.REG_DWORD, 1)
-            winreg.SetValueEx(key, "Screenmanager Fullscreen mode Default_h401710285", 0, winreg.REG_DWORD, 1)
-            winreg.SetValueEx(key, "Screenmanager Resolution Width_h182942802", 0, winreg.REG_DWORD, 1024)
-            winreg.SetValueEx(key, "Screenmanager Resolution Height_h2627697771", 0, winreg.REG_DWORD, 768)
-            winreg.SetValueEx(key, "Screenmanager Resolution Use Native_h1405027254", 0, winreg.REG_DWORD, 1)
-            winreg.SetValueEx(key, "LastResolution_h1893709025", 0, winreg.REG_BINARY, b"2560,1440\x00")
-            winreg.CloseKey(key)
-            with mock.patch.object(type(self.launcher), "PGR_PLAYER_PREFS_KEY", test_key):
-                applied = self.launcher._prepare_pgr_window_preferences()
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, test_key)
-            self.assertEqual(winreg.QueryValueEx(key, "Screenmanager Fullscreen mode_h3630240806")[0], 3)
-            # The "Default" twin is a different Unity preference and stays untouched.
-            self.assertEqual(winreg.QueryValueEx(key, "Screenmanager Fullscreen mode Default_h401710285")[0], 1)
-            self.assertEqual(winreg.QueryValueEx(key, "Screenmanager Resolution Width_h182942802")[0], 1280)
-            self.assertEqual(winreg.QueryValueEx(key, "Screenmanager Resolution Height_h2627697771")[0], 720)
-            self.assertEqual(winreg.QueryValueEx(key, "Screenmanager Resolution Use Native_h1405027254")[0], 0)
-            self.assertEqual(winreg.QueryValueEx(key, "LastResolution_h1893709025")[0], b"1280,720\x00")
-            self.assertEqual(len(applied), 5)
-        finally:
-            try:
-                winreg.CloseKey(key)
-            except OSError:
-                pass
-            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, test_key)
+    def test_pgr_launch_does_not_rewrite_unity_window_preferences(self) -> None:
+        self.assertEqual(self.launcher._prepare_pgr_window_preferences(), {})
 
     def test_pgr_launch_without_preferences_key_is_a_noop(self) -> None:
         with mock.patch.object(
@@ -1102,9 +2008,51 @@ ConvertTo-Json -InputObject $results -Compress
         ):
             self.assertEqual(self.launcher._prepare_pgr_window_preferences(), {})
 
-    def test_nte_bridge_rejects_non_launcher_root(self) -> None:
-        with self.assertRaises(GameLaunchError):
-            self.launcher._drive_nte_launcher(Path(self.temporary.name))
+
+    def test_spawned_process_is_recorded_even_when_it_dies_before_any_window(self) -> None:
+        """The spawn must be attributable from the run log alone.
+
+        Measured 2026-09-22: `PGR.exe` was spawned by `YeYuGamer.exe` at
+        08:20:24 and exited within the same second, while every following
+        ``launch.launcher-waiting`` sample reported ``pids=[]`` for the whole
+        300s window.  Proving a process had been started at all needed
+        enumeration outside the Manager, so a client that dies before it can
+        write a single log line must still leave a spawn record with its pid.
+        """
+
+        process = mock.Mock(pid=36880)
+        observations = []
+        with mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.os.name", "nt"
+        ), mock.patch(
+            # Same as above: the leftover-instance guard would read the real
+            # (occupied) PGR mutex; this test only asserts the spawn record.
+            "yeyu_gamer_manager.services.game_launcher.named_mutex_is_held",
+            return_value=False,
+        ), mock.patch.object(
+            self.launcher, "_list_running", return_value={},
+        ), mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.subprocess.Popen",
+            return_value=process,
+        ), mock.patch.object(
+            self.launcher,
+            "_wait_until_ready",
+            side_effect=GameLaunchError("fixture: client window never appeared"),
+        ), mock.patch.object(self.launcher, "close_started"):
+            with self.assertRaises(GameLaunchError):
+                self.launcher.ensure_started(
+                    "PGR", str(self.executable), observer=observations.append
+                )
+
+        spawns = [
+            item for item in observations
+            if item.detail.get("operation") == "launch-executable-started"
+        ]
+        self.assertEqual(len(spawns), 1, [item.phase for item in observations])
+        self.assertEqual(spawns[0].phase, "launcher-action")
+        self.assertEqual(spawns[0].detail["processId"], 36880)
+        self.assertEqual(spawns[0].detail["executable"], self.executable.name)
+        self.assertEqual(spawns[0].process_ids, frozenset({36880}))
 
     def test_rejects_missing_executable_before_launch(self) -> None:
         with mock.patch(
@@ -1189,40 +2137,6 @@ ConvertTo-Json -InputObject $results -Compress
         self.assertEqual(graceful.call_args_list, [mock.call({1234}), mock.call({1234})])
         terminate.assert_called_once_with({1234}, force=False)
 
-    def test_legacy_reap_reports_enumeration_without_diagnosing_cause(self) -> None:
-        # The retry is followed by one absent entry and one still-listed entry.
-        # Thread/handle counts do not establish why the second entry remains.
-        with mock.patch.object(
-            GameLaunchService,
-            "list_zombies",
-            side_effect=[{10: "PGR.exe", 20: "StarRail.exe"}, {20: "StarRail.exe"}],
-        ), mock.patch.object(
-            GameLaunchService, "_terminate_process_handle", return_value=True
-        ) as terminate, mock.patch.object(
-            GameLaunchService,
-            "_process_diagnostics",
-            return_value={"threadCount": 1, "parentPid": 4, "handleCount": 0},
-        ), mock.patch(
-            "yeyu_gamer_manager.services.game_launcher.subprocess.run"
-        ) as run, mock.patch(
-            "yeyu_gamer_manager.services.game_launcher.time.sleep"
-        ):
-            report = self.launcher.reap_zombies(["PGR", "StarRail"], settle_seconds=0)
-        self.assertEqual(report["attempted"], {"10": "PGR.exe", "20": "StarRail.exe"})
-        self.assertEqual(report["released"], [10])
-        self.assertEqual(report["stuck"]["20"]["name"], "StarRail.exe")
-        self.assertEqual(report["stuck"]["20"]["threadCount"], 1)
-        self.assertEqual(terminate.call_count, 2)
-        self.assertIn("/F", run.call_args.args[0])
-
-    def test_reap_zombies_is_a_no_op_without_zombies(self) -> None:
-        with mock.patch.object(GameLaunchService, "list_zombies", return_value={}), mock.patch(
-            "yeyu_gamer_manager.services.game_launcher.subprocess.run"
-        ) as run:
-            report = self.launcher.reap_zombies(["PGR"])
-        self.assertEqual(report, {"attempted": {}, "released": [], "stuck": {}})
-        run.assert_not_called()
-
     def test_close_cannot_report_already_closed_for_an_enumerated_residual(self) -> None:
         receipt = GameLaunchReceipt(
             "started", 1234, "StarRail.exe", (), ("starrail.exe",)
@@ -1267,7 +2181,7 @@ class QueueGameCloseTests(unittest.TestCase):
         self.assertEqual(result.state, "closed")
         self.assertEqual(result.requested_process_ids, (42,))
         self.assertEqual(result.remaining_process_ids, ())
-        close.assert_called_once_with({42: self.identity}, force=False, cancel_requested=None)
+        close.assert_called_once_with({42: self.identity}, force=False, cancel_requested=None, on_close=None)
         self.assertEqual(result.as_result()["memoryBefore"], before)
         self.assertEqual(result.as_result()["memoryAfter"], after)
         self.assertNotIn("releasedBytes", result.as_result())
@@ -1275,7 +2189,7 @@ class QueueGameCloseTests(unittest.TestCase):
     def test_escalation_is_bounded_and_rechecks_actual_enumeration(self) -> None:
         closed = False
         stages: list[bool] = []
-        def close(_targets, *, force, cancel_requested):
+        def close(_targets, *, force, cancel_requested, on_close=None):
             nonlocal closed
             stages.append(force)
             closed = force
@@ -1360,15 +2274,35 @@ class QueueGameCloseTests(unittest.TestCase):
         api.OpenProcess.return_value = 99
         api.TerminateProcess.return_value = 1
         api.WaitForSingleObject.return_value = 258
+        audit = []
+        def record(item):
+            audit.append(item)
+            self.assertEqual(api.TerminateProcess.called, item["auditPhase"] == "result")
         with mock.patch.object(self.launcher, "_queue_process_api", return_value=api), mock.patch.object(
             self.launcher, "_queue_identity_from_handle", return_value=self.identity,
         ), mock.patch("yeyu_gamer_manager.services.game_launcher.subprocess.run") as run:
-            self.launcher._close_verified_queue_processes({42: self.identity}, force=True, cancel_requested=None)
+            self.launcher._close_verified_queue_processes({42: self.identity}, force=True, cancel_requested=None, on_close=record)
         api.TerminateProcess.assert_called_once_with(99, 1)
         api.OpenProcess.assert_called_once_with(0x101001, False, 42)
         self.assertEqual(api.WaitForSingleObject.call_args_list, [mock.call(99, 0), mock.call(99, 0)])
         api.CloseHandle.assert_called_once_with(99)
         run.assert_not_called()
+        self.assertEqual([item["auditPhase"] for item in audit], ["requested", "result"])
+        self.assertEqual(audit[0]["processId"], 42)
+        self.assertEqual(audit[-1]["waitAfter"]["state"], "not-signaled")
+
+    def test_failed_close_audit_prevents_action_and_releases_handle(self) -> None:
+        api = mock.Mock()
+        api.OpenProcess.return_value = 99
+        with mock.patch.object(self.launcher, "_queue_process_api", return_value=api), mock.patch.object(
+            self.launcher, "_queue_identity_from_handle", return_value=self.identity,
+        ), self.assertRaisesRegex(RuntimeError, "audit unavailable"):
+            self.launcher._close_verified_queue_processes(
+                {42: self.identity}, force=True, cancel_requested=None,
+                on_close=mock.Mock(side_effect=RuntimeError("audit unavailable")),
+            )
+        api.TerminateProcess.assert_not_called()
+        api.CloseHandle.assert_called_once_with(99)
 
     def test_native_termination_result_and_wait_cannot_hide_enumerated_residual(self) -> None:
         for returned, wait_value in ((0, 258), (1, 258), (1, 0)):

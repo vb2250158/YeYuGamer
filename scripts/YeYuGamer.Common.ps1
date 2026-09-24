@@ -20,7 +20,7 @@ function Get-YeYuGamerCurrentProgramData {
 }
 
 function Get-YeYuGamerDefaultProductWorkRoot {
-    return Join-Path (Get-YeYuGamerCurrentLocalAppData) 'YeYuGamer'
+    return 'C:\Projects\YeYuGamer\.cache'
 }
 
 function Get-YeYuGamerDefaultBuildRoot {
@@ -760,6 +760,282 @@ function Exit-YeYuGamerInstallLifecycleLock {
     }
 }
 
+function Get-YeYuGamerProcessWorkingDirectory {
+    <#
+    .SYNOPSIS
+    Read one process's current working directory without external tools.
+
+    .DESCRIPTION
+    A directory cannot be moved while any process keeps it as its current
+    working directory, and Windows reports that only as a generic
+    "used by another process" error.  Reading the working directory out of the
+    target's PEB (via NtQueryInformationProcess + ReadProcessMemory) names the
+    actual holder so a failed install transaction can explain itself.
+
+    Returns $null when the query is not permitted (for example a process owned by
+    another user), which callers must treat as "unknown", never as "free".
+    #>
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return $null }
+
+    $signature = @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class YeYuWorkingDirectory
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct UNICODE_STRING
+    {
+        public ushort Length;
+        public ushort MaximumLength;
+        public IntPtr Buffer;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_BASIC_INFORMATION
+    {
+        public IntPtr Reserved1;
+        public IntPtr PebBaseAddress;
+        public IntPtr Reserved2a;
+        public IntPtr Reserved2b;
+        public IntPtr UniqueProcessId;
+        public IntPtr Reserved3;
+    }
+
+    [DllImport("ntdll.dll")]
+    private static extern int NtQueryInformationProcess(
+        IntPtr processHandle, int processInformationClass,
+        ref PROCESS_BASIC_INFORMATION processInformation,
+        int processInformationLength, out int returnLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(int access, bool inherit, int processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool ReadProcessMemory(
+        IntPtr process, IntPtr baseAddress, byte[] buffer, int size, out IntPtr read);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public static string Read(int processId)
+    {
+        const int PROCESS_QUERY_INFORMATION = 0x0400;
+        const int PROCESS_VM_READ = 0x0010;
+        IntPtr handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, processId);
+        if (handle == IntPtr.Zero) { return null; }
+        try
+        {
+            PROCESS_BASIC_INFORMATION pbi = new PROCESS_BASIC_INFORMATION();
+            int returned;
+            if (NtQueryInformationProcess(handle, 0, ref pbi,
+                    Marshal.SizeOf(typeof(PROCESS_BASIC_INFORMATION)), out returned) != 0)
+            { return null; }
+
+            // PEB->ProcessParameters sits at offset 0x20 on x64.
+            byte[] pointer = new byte[IntPtr.Size];
+            IntPtr read;
+            if (!ReadProcessMemory(handle, IntPtr.Add(pbi.PebBaseAddress, 0x20),
+                    pointer, pointer.Length, out read))
+            { return null; }
+            IntPtr parameters = (IntPtr)BitConverter.ToInt64(pointer, 0);
+            if (parameters == IntPtr.Zero) { return null; }
+
+            // RTL_USER_PROCESS_PARAMETERS::CurrentDirectory.DosPath is at 0x38.
+            byte[] unicodeString = new byte[16];
+            if (!ReadProcessMemory(handle, IntPtr.Add(parameters, 0x38),
+                    unicodeString, unicodeString.Length, out read))
+            { return null; }
+            ushort length = BitConverter.ToUInt16(unicodeString, 0);
+            IntPtr buffer = (IntPtr)BitConverter.ToInt64(unicodeString, 8);
+            if (length == 0 || buffer == IntPtr.Zero) { return null; }
+
+            byte[] text = new byte[length];
+            if (!ReadProcessMemory(handle, buffer, text, length, out read)) { return null; }
+            return System.Text.Encoding.Unicode.GetString(text);
+        }
+        catch { return null; }
+        finally { CloseHandle(handle); }
+    }
+}
+'@
+
+    if (-not ('YeYuWorkingDirectory' -as [type])) {
+        try {
+            Add-Type -TypeDefinition $signature -Language CSharp -ErrorAction Stop | Out-Null
+        } catch {
+            return $null
+        }
+    }
+    try {
+        return [YeYuWorkingDirectory]::Read($ProcessId)
+    } catch {
+        return $null
+    }
+}
+
+function Get-YeYuGamerPathHolder {
+    <#
+    .SYNOPSIS
+    Name the processes that would block a move of one directory.
+
+    .DESCRIPTION
+    Moves inside the install transaction fail with a bare "used by another
+    process".  A directory held as some process's current working directory is
+    the one holder that survives a restart of the app itself and is easy to miss:
+    measured 2026-09-24 a leftover ``adb.exe`` fork-server from LDPlayer kept
+    ``app\desktop-host`` as its working directory, so the install transaction
+    could move neither the target nor its own backup back, and the half-finished
+    install left the desktop host missing while the publish reported only a
+    timeout.  Naming the holder turns that into an actionable failure.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int[]]$ExcludeProcessId = @()
+    )
+
+    $resolved = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $holders = [System.Collections.Generic.List[object]]::new()
+    foreach ($process in Get-Process -ErrorAction SilentlyContinue) {
+        if ($ExcludeProcessId -contains $process.Id) { continue }
+        $workingDirectory = Get-YeYuGamerProcessWorkingDirectory -ProcessId $process.Id
+        if (-not $workingDirectory) { continue }
+        $candidate = $workingDirectory.TrimEnd('\')
+        if ($candidate -eq $resolved -or $candidate.StartsWith($resolved + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $holders.Add([pscustomobject]@{
+                ProcessId = $process.Id
+                Name = $process.ProcessName
+                WorkingDirectory = $candidate
+            })
+        }
+    }
+    return @($holders)
+}
+
+function Assert-YeYuGamerInstallTargetsAreMovable {
+    <#
+    .SYNOPSIS
+    Fail early, with the holder named, when an install target cannot be moved.
+
+    .DESCRIPTION
+    Probe each existing target by moving it aside and straight back.  This runs
+    before the transaction opens, so a blocked install aborts with nothing
+    half-moved; the previous behaviour only surfaced after the 600s retry budget
+    and left the installation unusable.
+
+    The probe destination is a scratch directory outside the installation.  An
+    earlier revision parked the probe next to the target (``$path.install-probe-
+    <guid>``), which made ``app`` a target *and* the probe parent at the same
+    time: the probe swallowed a nested probe per attempt, the retry left the
+    chain behind, and ``app`` ended up missing four subdirectories -- all of
+    which the guard was supposed to prevent.  A move only needs the same volume,
+    which the system temp directory already shares on a single-disk install.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][object[]]$DirectoryTargets,
+        [string[]]$FileTargets = @()
+    )
+
+    $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ("yeyu-install-probe-" + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $scratch -Force | Out-Null
+
+    $blocked = [System.Collections.Generic.List[object]]::new()
+    try {
+        $existingDirectories = @()
+        foreach ($targetSpec in $DirectoryTargets) {
+            $path = [string]$targetSpec.Path
+            if (Test-Path -LiteralPath $path -PathType Container) { $existingDirectories += $path }
+        }
+        foreach ($path in $existingDirectories) {
+            $probe = Join-Path $scratch ([Guid]::NewGuid().ToString('N'))
+            try {
+                Move-Item -LiteralPath $path -Destination $probe -ErrorAction Stop
+                Move-Item -LiteralPath $probe -Destination $path -ErrorAction Stop
+            } catch {
+                if (Test-Path -LiteralPath $probe) {
+                    try { Move-Item -LiteralPath $probe -Destination $path -ErrorAction Stop } catch { }
+                }
+                $holders = @(Get-YeYuGamerPathHolder -Path $path -ExcludeProcessId @($PID))
+                $blocked.Add([pscustomobject]@{ Path = $path; Holders = $holders })
+            }
+        }
+        foreach ($path in $FileTargets) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+            $probe = Join-Path $scratch ([Guid]::NewGuid().ToString('N'))
+            try {
+                Move-Item -LiteralPath $path -Destination $probe -ErrorAction Stop
+                Move-Item -LiteralPath $probe -Destination $path -ErrorAction Stop
+            } catch {
+                if (Test-Path -LiteralPath $probe) {
+                    try { Move-Item -LiteralPath $probe -Destination $path -ErrorAction Stop } catch { }
+                }
+                $holders = @(Get-YeYuGamerPathHolder -Path (Split-Path -Parent $path) -ExcludeProcessId @($PID))
+                $blocked.Add([pscustomobject]@{ Path = $path; Holders = $holders })
+            }
+        }
+    } finally {
+        # The scratch root is ours, so it is always removed; anything still in it
+        # is a target this probe failed to put back, which is reported below
+        # instead of being silently relocated.
+        if (Test-Path -LiteralPath $scratch) {
+            Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if ($blocked.Count -eq 0) { return }
+
+    $lines = foreach ($entry in $blocked) {
+        $holders = @($entry.Holders)
+        if ($holders.Count -eq 0) {
+            "  {0} (no process working directory matched; the holder is unidentified)" -f $entry.Path
+        } else {
+            foreach ($holder in $holders) {
+                "  {0} <- {1} (pid {2}) working directory {3}" -f `
+                    $entry.Path, $holder.Name, $holder.ProcessId, $holder.WorkingDirectory
+            }
+        }
+    }
+    throw ("The installation cannot start because these targets cannot be moved:`n" +
+        ($lines -join "`n") +
+        "`nClose the holder (or stop it and retry) before publishing.")
+}
+
+function Move-YeYuGamerPathWithRetry {
+    param(
+        [Parameter(Mandatory = $true)][string]$LiteralPath,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [int]$TimeoutSeconds = 600
+    )
+
+    # A path move inside the install transaction can be refused transiently even
+    # though no process holds the target: antivirus behavior monitoring and the
+    # Windows shell can deny writes to shortcut files for minutes at a time.
+    # Wait out that window instead of failing the whole install on return code 5.
+    $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSeconds))
+    $attempt = 0
+    $warned = $false
+    while ($true) {
+        $attempt++
+        try {
+            Move-Item -LiteralPath $LiteralPath -Destination $Destination -ErrorAction Stop
+            if ($warned) {
+                Write-Warning "Install transaction move succeeded after $attempt attempts: $LiteralPath"
+            }
+            return
+        } catch {
+            if ((Get-Date) -ge $deadline) { throw }
+            if (-not $warned) {
+                $warned = $true
+                Write-Warning ("Install transaction move is waiting for a transient deny to clear: " +
+                    "$LiteralPath -> $Destination :: $($_.Exception.Message)")
+            }
+            Start-Sleep -Milliseconds ([Math]::Min(5000, 250 * $attempt))
+        }
+    }
+}
+
 function New-YeYuGamerInstallTransaction {
     param(
         [Parameter(Mandatory = $true)][object[]]$DirectoryTargets,
@@ -781,7 +1057,7 @@ function New-YeYuGamerInstallTransaction {
             $existed = Test-Path -LiteralPath $target -PathType Container
             if ($existed) {
                 Assert-YeYuGamerNoReparseTree -Path $target -Purpose 'install transaction directory' | Out-Null
-                Move-Item -LiteralPath $target -Destination $backup
+                Move-YeYuGamerPathWithRetry -LiteralPath $target -Destination $backup
             } elseif (Test-Path -LiteralPath $target) {
                 throw "Install transaction directory target is not a directory: $target"
             }
@@ -805,7 +1081,7 @@ function New-YeYuGamerInstallTransaction {
                 if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
                     throw "Install transaction file is a reparse point: $target"
                 }
-                Move-Item -LiteralPath $target -Destination $backup
+                Move-YeYuGamerPathWithRetry -LiteralPath $target -Destination $backup
             } elseif (Test-Path -LiteralPath $target) {
                 throw "Install transaction file target is not a regular file: $target"
             }
@@ -821,7 +1097,7 @@ function New-YeYuGamerInstallTransaction {
     } catch {
         foreach ($entry in $entries) {
             if ($entry.Existed -and (Test-Path -LiteralPath $entry.Backup)) {
-                Move-Item -LiteralPath $entry.Backup -Destination $entry.Target
+                Move-YeYuGamerPathWithRetry -LiteralPath $entry.Backup -Destination $entry.Target
             }
         }
         throw
@@ -842,7 +1118,7 @@ function Undo-YeYuGamerInstallTransaction {
             }
         }
         if ($entry.Existed -and (Test-Path -LiteralPath $entry.RestoreSource)) {
-            Move-Item -LiteralPath $entry.RestoreSource -Destination $entry.Target
+            Move-YeYuGamerPathWithRetry -LiteralPath $entry.RestoreSource -Destination $entry.Target
         }
     }
 }
