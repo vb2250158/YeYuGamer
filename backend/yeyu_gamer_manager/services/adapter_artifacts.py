@@ -391,6 +391,7 @@ class AdapterArtifactImporter:
                 "relativePath": file_name,
                 "source": "manager-adapter-v1.1",
                 "verdict": "unreviewed",
+                "diagnosticOnly": artifact_kind == "game-ui-native-step-raw",
                 # A watermarked derivative must never impersonate the original
                 # capture. Its kind is fixed by the promoted Adapter manifest;
                 # both files remain run-scoped immutable evidence.

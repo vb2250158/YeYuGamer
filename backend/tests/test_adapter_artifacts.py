@@ -302,6 +302,16 @@ class AdapterArtifactImporterTests(unittest.TestCase):
         self.assertIs(document["raw"], False)
         self.assertEqual(document["kind"], "game-ui-daily-reward-watermarked")
 
+    def test_native_step_image_keeps_attempt_scope_but_is_diagnostic_only(self) -> None:
+        event = self.event(kind="game-ui-native-step-raw")
+        self.stage(event)
+        artifact_id = self.import_staged(event)
+        document = self.store.get_resource("artifact", artifact_id)["document"]
+        self.assertEqual(document["runAttemptId"], RUN_ATTEMPT_ID)
+        self.assertEqual(document["todoAttemptId"], TODO_ATTEMPT_ID)
+        self.assertTrue(document["raw"])
+        self.assertTrue(document["diagnosticOnly"])
+
     def test_twenty_first_artifact_is_rejected_from_rebuilt_ledger_quota(self) -> None:
         for _ in range(MAX_ARTIFACTS_PER_TODO):
             self.seed_ledger_artifact(todo_instance_id=TODO_ID, size_bytes=1)

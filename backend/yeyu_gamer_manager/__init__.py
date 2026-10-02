@@ -1,6 +1,6 @@
 """YeYu Gamer Manager backend."""
 
-__version__ = "0.3.11"
+__version__ = "0.3.12"
 
 from .app import create_app
 
