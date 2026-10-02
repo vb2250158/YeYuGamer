@@ -13,6 +13,82 @@ from .manager_errors import ManagerValidation
 DEFAULT_ACCOUNT_ID = "default"
 
 
+def account_execution_availability(targets: list[dict[str, Any]], *,
+                                   ww_account_selector_supported: bool = False) -> list[dict[str, Any]]:
+    """Project whether each frozen target can be honoured by its upstream tool.
+
+    A default WW target without a binding means the currently active client.
+    A specified target requires the promoted account-aware upstream bridge.
+    Only requested targets are considered, so disabled history and
+    accounts with an empty daily selection do not block the current client.
+    """
+    named_ww_targets = {
+        str(target.get("targetId") or account_target_id(
+            str(target["gameId"]), str(target.get("accountId", DEFAULT_ACCOUNT_ID))
+        ))
+        for target in targets
+        if target.get("gameId") == "WW"
+        and str(target.get("accountId", DEFAULT_ACCOUNT_ID)) != DEFAULT_ACCOUNT_ID
+    }
+    projected: list[dict[str, Any]] = []
+    for target in targets:
+        target_id = str(target.get("targetId") or account_target_id(
+            str(target["gameId"]), str(target.get("accountId", DEFAULT_ACCOUNT_ID))
+        ))
+        game_id = str(target["gameId"])
+        account_id = str(target.get("accountId", DEFAULT_ACCOUNT_ID))
+        item: dict[str, Any] = {
+            "targetId": target_id, "gameId": game_id, "accountId": account_id,
+            "executable": True,
+            "mode": "current_client" if game_id in {"WW", "Genshin"} and account_id == DEFAULT_ACCOUNT_ID else "unscoped",
+        }
+        if game_id == "Genshin":
+            profiles = (target.get("accountSnapshot") or {}).get("daily_tool_profiles") or {}
+            profile = profiles.get("better_gi") or {}
+            uid = profile.get("expected_uid") or profile.get("expectedUid")
+            item["mode"] = "verified_current_client" if uid else "bind_current_client"
+            if sum(target.get("gameId") == "Genshin" for target in targets) > 1:
+                item.update({"executable": False, "reasonCode": "bettergi_account_switch_unsupported",
+                    "reason": "BetterGI 官方一条龙没有账号切换入口；本轮只能执行一个与客户端 UID 匹配的原神账号，不会用当前账号代替其他账号。"})
+            elif account_id != DEFAULT_ACCOUNT_ID and not uid:
+                item.update({"executable": False, "reasonCode": "bettergi_account_uid_missing",
+                    "reason": "指定原神账号须填写 UID；官方识别匹配后才执行。"})
+        selector = str((target.get("accountSnapshot") or {}).get("saved_account_label") or "")
+        if game_id == "WW" and ww_account_selector_supported and selector:
+            item["mode"] = "specified_account"
+            projected.append(item)
+            continue
+        if game_id == "WW" and account_id != DEFAULT_ACCOUNT_ID and not selector:
+            item.update({
+                "executable": False, "mode": "specified_account",
+                "reasonCode": "ww_account_label_missing",
+                "reason": "鸣潮指定账号尚未绑定登录页已记住的账号标签，请在 YeYuGamer 账号配置中填写。",
+            })
+            projected.append(item)
+            continue
+        if game_id == "WW" and account_id != DEFAULT_ACCOUNT_ID:
+            item.update({
+                "executable": False, "mode": "specified_account",
+                "reasonCode": "ww_account_switch_unsupported",
+                "reason": "当前已安装适配器尚未接入官方账号切换方法；不会启动当前客户端来代替指定账号。",
+            })
+        elif game_id == "WW" and account_id == DEFAULT_ACCOUNT_ID and target.get("accountSnapshot", {}).get("saved_account_label"):
+            item.update({
+                "executable": False,
+                "mode": "specified_account",
+                "reasonCode": "ww_account_switch_unsupported",
+                "reason": "当前已安装适配器尚未接入官方账号切换方法；不会启动当前客户端来代替该绑定账号。",
+            })
+        elif game_id == "WW" and named_ww_targets:
+            item.update({
+                "executable": False,
+                "reasonCode": "ww_account_scope_mixed_unsupported",
+                "reason": "本次鸣潮范围同时包含未绑定的当前客户端和指定账号，请为每个启用账号填写标签，避免重复执行同一账号。",
+            })
+        projected.append(item)
+    return projected
+
+
 def game_accounts(config_values: dict[str, Any], game_id: str) -> list[dict[str, Any]]:
     configured = config_values.get("game_accounts", {}).get(game_id)
     if configured is None:

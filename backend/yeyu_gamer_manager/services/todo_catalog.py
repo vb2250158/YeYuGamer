@@ -307,3 +307,6 @@ def catalog() -> list[dict[str, Any]]:
         }
         for item in TODO_DEFINITIONS
     ]
+
+
+RETIRED_DAILY_TODO_IDS = frozenset({"todo.v1.starrail.daily.verify-daily-task-list", "todo.v1.ww.daily.gacha"})

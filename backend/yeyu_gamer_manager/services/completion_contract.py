@@ -50,6 +50,8 @@ STARRAIL_POINTS_OBSERVATION = "starrail.daily_training.points"
 STARRAIL_REWARD_TIERS_OBSERVATION = "starrail.daily_training.reward_tiers"
 COMPLETION_REVIEW_CONTRACT_SCHEMA = "completion-review-contract/v2"
 COMPLETION_POLICY_VERSION = "2"
+UPSTREAM_RESULT_POLICY_ID = "upstream-task-result/v1"
+UPSTREAM_RESULT_CODES = frozenset({"upstream_task_succeeded", "upstream_task_skipped"})
 COMPLETION_EVIDENCE_CONTENT_TYPES = frozenset(
     {"image/png", "image/jpeg", "text/plain"}
 )
@@ -1306,4 +1308,29 @@ def adjudicate_completion(
             else None
         ),
         message=message,
+    )
+
+
+def has_upstream_task_results(snapshot: CompletionContractSnapshot) -> bool:
+    """Only new explicit upstream terminal events opt into tool authority.
+
+    Historical completed rows, process exits, screenshots and heuristic Adapter
+    markers do not acquire this authority during migration.
+    """
+    selected = snapshot.todos
+    attempt = snapshot.current_attempt
+    scoped_attempt_runs = {
+        item.run_attempt_id: item.run_id
+        for item in _attempt_lineage(snapshot)
+        if _attempt_is_in_scope(snapshot, item)
+    }
+    return bool(selected) and attempt is not None and _attempt_is_in_scope(snapshot, attempt) and all(
+        item.reason_code in UPSTREAM_RESULT_CODES
+        and item.status == CompletionTodoState.COMPLETED
+        and item.game_id == snapshot.game_id
+        and item.account_id == snapshot.account_id
+        and item.run_attempt_id in scoped_attempt_runs
+        and item.run_id == scoped_attempt_runs[item.run_attempt_id]
+        and item.game_day_key == snapshot.game_day.period_key
+        for item in selected
     )

@@ -36,3 +36,9 @@ def is_reward_capture(frame: Mapping[str, Any], game_id: str,
         and frame.get("artifactId") in item.get("evidenceRefs", [])
         for item in instances
     )
+
+
+def has_declared_daily_reward(game_id: str, instances: Sequence[Mapping[str, Any]]) -> bool:
+    """Whether this selected game scope has an independently registered claim step."""
+    reward_operations = DAILY_REWARD_OPERATIONS.get(game_id, frozenset())
+    return any(item.get("operation") in reward_operations for item in instances)

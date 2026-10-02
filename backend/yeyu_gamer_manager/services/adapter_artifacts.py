@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import stat
@@ -369,11 +370,19 @@ class AdapterArtifactImporter:
                 "event_scope_mismatch",
                 "artifact Todo lacks a frozen game-day key",
             )
+        recognition = self._genshin_recognition_metadata(plan, event, game_day_key)
         final_path, file_name = self._write_atomic(
             data, extension=_MIME_EXTENSIONS[content_type]
         )
         try:
             artifact_kind = str(event["kind"])
+            # The fenced run supplies the configured account, not evidence
+            # that the official recognizer observed that account. Only the
+            # validated identity sidecar can establish the latter.
+            unconfirmed_recognition = (
+                artifact_kind.startswith("game-ui-recognition-")
+                and recognition is None
+            )
             document = {
                 "schemaVersion": 1,
                 "kind": artifact_kind,
@@ -382,7 +391,7 @@ class AdapterArtifactImporter:
                 "accountId": plan.account_id,
                 "runId": plan.run_id,
                 "runAttemptId": plan.run_attempt_id,
-                "todoAttemptId": str(event["todoAttemptId"]),
+                "todoAttemptId": event.get("todoAttemptId"),
                 "todoInstanceId": str(event["todoInstanceId"]),
                 "gameDayKey": game_day_key,
                 "capturedAt": str(event["capturedAt"]),
@@ -391,13 +400,25 @@ class AdapterArtifactImporter:
                 "relativePath": file_name,
                 "source": "manager-adapter-v1.1",
                 "verdict": "unreviewed",
-                "diagnosticOnly": artifact_kind == "game-ui-native-step-raw",
+                "diagnosticOnly": (
+                    event["eventType"] == "run_artifact_staged"
+                    or artifact_kind == "game-ui-native-step-raw"
+                    or unconfirmed_recognition
+                ),
                 # A watermarked derivative must never impersonate the original
                 # capture. Its kind is fixed by the promoted Adapter manifest;
                 # both files remain run-scoped immutable evidence.
                 "raw": not artifact_kind.endswith("-watermarked"),
                 "fileName": file_name,
             }
+            if unconfirmed_recognition:
+                document["accountIdentityConfirmed"] = False
+            if recognition is not None:
+                document.update({"captureMetadata": recognition, "observedAt": recognition["observedAt"],
+                    "frameCapturedAt": recognition["frameCapturedAt"], "frameCaptureTimeKnown": recognition["frameCaptureTimeKnown"],
+                    "accountIdentityConfirmed": recognition["accountIdentityConfirmed"],
+                    "capturedAtMeaning": "official-recognition-input-observed",
+                    "diagnosticOnly": document["diagnosticOnly"] or recognition["accountIdentityConfirmed"] is not True})
             created = self.store.create_resource(
                 "artifact",
                 resource_id=artifact_id,
@@ -415,6 +436,50 @@ class AdapterArtifactImporter:
                 "artifact ledger insert failed",
             ) from None
         return artifact_id, final_path
+
+    def _genshin_recognition_metadata(self, plan: AdapterExecutionPlan, event: dict[str, Any], game_day_key: str) -> dict[str, Any] | None:
+        """Import the official input sidecar through the same immutable file boundary."""
+        kinds = {"game-ui-recognition-raw", "game-ui-step-decision-raw", "game-ui-step-judgment-raw", "game-ui-reward-verification-raw", "game-ui-key-step-verification-raw"}
+        if plan.game_id != "Genshin" or event["kind"] not in kinds:
+            return None
+        try:
+            source = self._source_path(plan, str(event["fileName"]) + ".recognition.json")
+            size = os.lstat(source).st_size
+            if not 0 < size <= 64 * 1024:
+                raise _fail("recognition_metadata_invalid", "recognition metadata size is invalid")
+            metadata = json.loads(self._read_verified_source(source, expected_size=size).decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise _fail("recognition_metadata_invalid", "recognition metadata is unavailable or invalid") from error
+        fields = {"schemaVersion", "gameId", "accountId", "runId", "runAttemptId", "todoInstanceId", "todoAttemptId", "gameDay", "recognitionId", "observedAt", "frameCapturedAt", "frameCaptureTimeKnown", "accountIdentityConfirmed", "observedUid", "kind", "phase", "source", "coordinateSpace", "result", "sha256"}
+        if not isinstance(metadata, dict) or set(metadata) != fields or metadata["schemaVersion"] != 2:
+            raise _fail("recognition_metadata_invalid", "recognition metadata schema differs")
+        expected = {"gameId": plan.game_id, "accountId": plan.account_id, "runId": plan.run_id, "runAttemptId": plan.run_attempt_id,
+                    "todoInstanceId": event["todoInstanceId"], "todoAttemptId": event.get("todoAttemptId"), "gameDay": game_day_key,
+                    "kind": event["kind"], "sha256": event["sha256"]}
+        if any(metadata[key] != value for key, value in expected.items()):
+            raise _fail("recognition_scope_mismatch", "recognition metadata does not belong to its image and frozen scope")
+        for field in ("recognitionId", "source", "coordinateSpace", "phase"):
+            if not isinstance(metadata[field], str) or not metadata[field] or len(metadata[field]) > 160 or any(ord(char) < 32 for char in metadata[field]):
+                raise _fail("recognition_metadata_invalid", "recognition text fields are invalid")
+        if type(metadata["frameCaptureTimeKnown"]) is not bool or type(metadata["accountIdentityConfirmed"]) is not bool:
+            raise _fail("recognition_metadata_invalid", "recognition identity or frame timing flag is invalid")
+        _, observed = _aware_timestamp(metadata["observedAt"], field="observedAt")
+        _, captured = _aware_timestamp(event["capturedAt"], field="capturedAt")
+        _, issued = _aware_timestamp(plan.issued_at, field="issuedAt")
+        _, expires = _aware_timestamp(plan.expires_at, field="expiresAt")
+        if observed != captured or not issued <= observed <= expires:
+            raise _fail("recognition_time_out_of_scope", "recognition observed time differs from its staged input time")
+        if metadata["frameCaptureTimeKnown"]:
+            _, frame = _aware_timestamp(metadata["frameCapturedAt"], field="frameCapturedAt")
+            if not issued <= frame <= observed:
+                raise _fail("recognition_time_out_of_scope", "official frame timestamp is outside the observation")
+        elif metadata["frameCapturedAt"] is not None:
+            raise _fail("recognition_metadata_invalid", "unknown official frame time must be null")
+        if metadata["accountIdentityConfirmed"]:
+            confirmed = (self.store.get_run_attempt(plan.run_attempt_id).get("result") or {}).get("bettergiOfficialAccount") or {}
+            if not re.fullmatch(r"[1-9][0-9]{8,9}", str(metadata["observedUid"] or "")) or confirmed.get("observedUid") != metadata["observedUid"] or confirmed.get("accountId") != plan.account_id:
+                raise _fail("recognition_account_unconfirmed", "recognition UID has not been confirmed for this fenced attempt")
+        return metadata
 
     def _validate_quota(
         self,
@@ -460,12 +525,14 @@ class AdapterArtifactImporter:
         if not isinstance(event_document, Mapping):
             raise _fail("invalid_artifact_event", "artifact event must be an object")
         event = dict(event_document)
-        if set(event) != _EVENT_FIELDS:
+        run_scoped = event.get("eventType") == "run_artifact_staged"
+        expected_fields = _EVENT_FIELDS - {"todoAttemptId"} if run_scoped else _EVENT_FIELDS
+        if set(event) != expected_fields:
             raise _fail("invalid_artifact_event", "artifact event fields differ")
         if (
             event["schemaVersion"] != SCHEMA_VERSION
             or event["protocolVersion"] != PROTOCOL_VERSION
-            or event["eventType"] != "artifact_staged"
+            or event["eventType"] not in {"artifact_staged", "run_artifact_staged"}
         ):
             raise _fail("invalid_artifact_event", "artifact event version or type differs")
         sequence = event["sequence"]
@@ -508,11 +575,12 @@ class AdapterArtifactImporter:
         if target is None:
             raise _fail("event_scope_mismatch", "artifact Todo is not in the plan")
 
-        todo_attempt_id = _canonical_uuid(
+        todo_attempt_id = None if run_scoped else _canonical_uuid(
             event["todoAttemptId"], field="todoAttemptId"
         )
         artifact_id = _canonical_uuid(event["artifactId"], field="artifactId")
-        event["todoAttemptId"] = todo_attempt_id
+        if not run_scoped:
+            event["todoAttemptId"] = todo_attempt_id
         event["artifactId"] = artifact_id
         kind = event["kind"]
         if not isinstance(kind, str) or not _IDENTIFIER.fullmatch(kind):
@@ -521,10 +589,15 @@ class AdapterArtifactImporter:
         if event["mimeType"] not in allowed_mime_types:
             raise _fail("artifact_mime_denied", "artifact MIME type is not allowed")
         size = event["sizeBytes"]
+        # Symmetric with AdapterEventStream._consume_artifact: a 0-byte
+        # non-image artifact is legitimate (the official tools create their
+        # lifecycle log on first use, so a run that fails before any upstream
+        # output stages an empty log). Images still need content.
+        minimum_size = 1 if str(event["mimeType"]).startswith("image/") else 0
         if (
             isinstance(size, bool)
             or not isinstance(size, int)
-            or size < 1
+            or size < minimum_size
             or size > max_artifact_bytes
         ):
             raise _fail("artifact_size_rejected", "artifact size is outside its limit")
@@ -534,7 +607,7 @@ class AdapterArtifactImporter:
 
         try:
             run_attempt = self.store.get_run_attempt(plan.run_attempt_id)
-            todo_attempt = self.store.get_todo_attempt(todo_attempt_id)
+            todo_attempt = None if run_scoped else self.store.get_todo_attempt(todo_attempt_id)
         except RecordNotFound as error:
             raise _fail("event_scope_mismatch", "artifact attempt is not registered") from error
         expected_digest = hashlib.sha256(
@@ -556,7 +629,7 @@ class AdapterArtifactImporter:
             or run_attempt.get("state") not in {"starting", "running", "cancelling"}
         ):
             raise _fail("event_scope_mismatch", "artifact RunAttempt is not active")
-        if (
+        if not run_scoped and (
             todo_attempt.get("run_attempt_id") != plan.run_attempt_id
             or todo_attempt.get("todo_instance_id") != todo_instance_id
             or todo_attempt.get("operation") != target.operation

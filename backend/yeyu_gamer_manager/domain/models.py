@@ -418,6 +418,13 @@ class EvidenceArtifactRecord(ApiModel):
     content_hash: str = Field(default="", alias="hash")
     size_bytes: int = 0
     file_name: str = ""
+    diagnostic_only: bool = False
+    capture_metadata: dict[str, Any] | None = None
+    observed_at: datetime | None = None
+    frame_captured_at: datetime | None = None
+    frame_capture_time_known: bool | None = None
+    account_identity_confirmed: bool | None = None
+    captured_at_meaning: str | None = None
 
 
 class NotificationDeliveryRecord(ApiModel):

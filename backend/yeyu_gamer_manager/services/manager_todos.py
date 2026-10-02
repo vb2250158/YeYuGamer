@@ -873,13 +873,23 @@ class ManagerTodosService:
             ],
         }
 
-    def todo_overview(self) -> dict[str, Any]:
-        games = self.store.list_games()
+    def todo_overview(
+        self,
+        *,
+        games: list[dict[str, Any]] | None = None,
+        current_items_by_game: dict[str, list[TodoInstanceRecord]] | None = None,
+    ) -> dict[str, Any]:
+        if games is None:
+            games = self.store.list_games()
         per_game: dict[str, dict[str, Any]] = {}
         for game in games:
             game_id = str(game["game_id"])
-            current_items = self.list_todo_instances(
-                game_id=game_id, cadence="daily", current=True, limit=1000
+            current_items = (
+                current_items_by_game[game_id]
+                if current_items_by_game is not None
+                else self.list_todo_instances(
+                    game_id=game_id, cadence="daily", current=True, limit=1000
+                )
             )
             # Today is an execution projection, not a catalog inventory.  Use
             # the same selected completion scope as game cards and Batch

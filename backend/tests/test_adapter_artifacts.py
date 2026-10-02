@@ -22,6 +22,7 @@ from yeyu_gamer_manager.services.adapter_protocol import (
     AdapterExecutionPlan,
     run_artifact_byte_limit,
 )
+from yeyu_gamer_manager.services.manager import ManagerService
 from yeyu_gamer_manager.store.sqlite_store import SqliteStore
 
 
@@ -292,6 +293,25 @@ class AdapterArtifactImporterTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), PNG_1X1)
         self.assertTrue(source.exists(), "the importer must not erase runner staging")
 
+    def test_startup_diagnostic_import_does_not_require_or_create_a_todo_attempt(self) -> None:
+        event = self.event(eventType="run_artifact_staged", kind="game-ui-account-unconfirmed-before-raw")
+        del event["todoAttemptId"]
+        source = self.stage(event)
+        with mock.patch.object(self.store, "get_todo_attempt", side_effect=AssertionError("no official step has started")):
+            artifact_id = self.import_staged(event)
+        document = self.store.get_resource("artifact", artifact_id)["document"]
+        self.assertTrue(document["diagnosticOnly"])
+        self.assertIsNone(document["todoAttemptId"])
+        self.assertEqual(document["todoInstanceId"], TODO_ID)
+        self.assertEqual(document["runAttemptId"], RUN_ATTEMPT_ID)
+        self.assertEqual(document["gameDayKey"], "2026-08-28")
+        self.assertRegex(document["fileName"], r"^artifact-[0-9a-f]{32}\.png$")
+        self.assertEqual(document["relativePath"], document["fileName"])
+        self.assertNotEqual(document["fileName"], source.name)
+        target = self.artifact_root / document["relativePath"]
+        self.assertEqual(target.read_bytes(), PNG_1X1)
+        self.assertTrue(source.exists(), "the importer must not erase runner staging")
+
     def test_watermarked_kind_is_registered_as_derivative(self) -> None:
         event = self.event(kind="game-ui-daily-reward-watermarked")
         self.stage(event)
@@ -311,6 +331,32 @@ class AdapterArtifactImporterTests(unittest.TestCase):
         self.assertEqual(document["todoAttemptId"], TODO_ATTEMPT_ID)
         self.assertTrue(document["raw"])
         self.assertTrue(document["diagnosticOnly"])
+
+    def test_unconfirmed_recognition_images_remain_diagnostic(self) -> None:
+        for kind in (
+            "game-ui-recognition-raw",
+            "game-ui-recognition-ocr-raw",
+            "game-ui-recognition-template-raw",
+            "game-ui-recognition-bbox-raw",
+            "game-ui-recognition-replay-raw",
+        ):
+            with self.subTest(kind=kind):
+                event = self.event(kind=kind)
+                self.stage(event)
+                artifact_id = self.import_staged(event)
+                document = self.store.get_resource("artifact", artifact_id)["document"]
+                self.assertTrue(document["diagnosticOnly"])
+                self.assertIs(document["accountIdentityConfirmed"], False)
+                self.assertEqual(document["todoAttemptId"], TODO_ATTEMPT_ID)
+                self.assertEqual(document["runAttemptId"], RUN_ATTEMPT_ID)
+                self.assertTrue(document["raw"])
+                target = self.artifact_root / document["relativePath"]
+                self.assertEqual(target.read_bytes(), PNG_1X1)
+                api_record = ManagerService._artifact_record(
+                    self.store.get_resource("artifact", artifact_id)
+                )
+                self.assertTrue(api_record.diagnostic_only)
+                self.assertIs(api_record.account_identity_confirmed, False)
 
     def test_twenty_first_artifact_is_rejected_from_rebuilt_ledger_quota(self) -> None:
         for _ in range(MAX_ARTIFACTS_PER_TODO):
@@ -482,6 +528,42 @@ class AdapterArtifactImporterTests(unittest.TestCase):
             self.run_staging.mkdir()
             self.skipTest(f"directory symlink creation is unavailable: {error}")
         self.assert_import_error("artifact_path_reparse", event)
+
+    def test_empty_text_artifact_imports_but_empty_image_is_rejected(self) -> None:
+        """2026-09-23 ZZZ: the driver stages a 0-byte upstream lifecycle log.
+
+        The official tools create that log on first use, so a run that ends
+        before any upstream output stages it empty.  Rejecting it aborted the
+        whole stream with ``artifact_size_rejected`` and destroyed the
+        driver's own ``review_required`` terminal.  An empty image stays a
+        failed capture.
+        """
+        empty = b""
+        text_event = self.event(
+            empty,
+            kind="upstream-tool-log",
+            fileName="lifecycle.log",
+            mimeType="text/plain",
+            sizeBytes=0,
+            sha256=hashlib.sha256(empty).hexdigest(),
+        )
+        self.stage(text_event, empty)
+        artifact_id = self.import_staged(text_event)
+        self.assertEqual(artifact_id, text_event["artifactId"])
+        document = self.store.get_resource("artifact", artifact_id)["document"]
+        self.assertEqual(document["sizeBytes"], 0)
+        self.assertEqual((self.artifact_root / document["relativePath"]).read_bytes(), b"")
+
+    def test_empty_image_artifact_is_rejected(self) -> None:
+        empty = b""
+        image_event = self.event(
+            empty,
+            fileName="empty.png",
+            mimeType="image/png",
+            sizeBytes=0,
+            sha256=hashlib.sha256(empty).hexdigest(),
+        )
+        self.assert_import_error("artifact_size_rejected", image_event)
 
     def test_size_limit_hash_and_magic_fail_closed(self) -> None:
         self.assert_import_error(

@@ -246,7 +246,7 @@ def _dump(model: Any) -> dict[str, Any]:
 
 
 class ManagerService:
-    VERSION = "0.3.12"
+    VERSION = "0.3.14"
     # A pending Agent completion review may delay the batch seal (and the round
     # mail) for at most this long.  After that the machine adjudication seals
     # the batch; unreviewed runs stay review_required.
@@ -3576,6 +3576,13 @@ class ManagerService:
             content_hash=document.get("hash", ""),
             size_bytes=int(document.get("sizeBytes", 0)),
             file_name=document.get("fileName", ""),
+            diagnostic_only=bool(document.get("diagnosticOnly", False)),
+            capture_metadata=document.get("captureMetadata"),
+            observed_at=document.get("observedAt"),
+            frame_captured_at=document.get("frameCapturedAt"),
+            frame_capture_time_known=document.get("frameCaptureTimeKnown"),
+            account_identity_confirmed=document.get("accountIdentityConfirmed"),
+            captured_at_meaning=document.get("capturedAtMeaning"),
         )
 
     def _completion_artifact_integrity(

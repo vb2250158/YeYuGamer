@@ -724,6 +724,8 @@ public static class YeYuEndfieldLauncherInput {
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern int GetWindowLongW(IntPtr hWnd, int index);
+    [DllImport("user32.dll", SetLastError=true)] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int width, int height, uint flags);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
     [DllImport("user32.dll")] public static extern void keybd_event(byte virtualKey, byte scanCode, uint flags, UIntPtr extra);
@@ -767,20 +769,43 @@ function Test-YeYuEndfieldStarted {
 function Invoke-YeYuPhysicalClick {
     param([IntPtr]$Handle, [int]$ProcessId, [int]$X, [int]$Y, [string]$Label)
     if (-not (Set-YeYuLauncherForeground -Handle $Handle)) { return $null }
-    if (-not (Test-YeYuPointOwnedBy -X $X -Y $Y -ProcessId $ProcessId)) {
-        Write-Output ('blocked-by-foreign-window:' + $Label)
-        exit 5
+    $restoreTopmost = $false
+    try {
+        if (-not (Test-YeYuPointOwnedBy -X $X -Y $Y -ProcessId $ProcessId)) {
+            # A foreground window can still sit below another app's topmost
+            # surface. Raise only this already verified launcher for the
+            # bounded action; never change or close the covering application.
+            $wasTopmost = ([YeYuEndfieldLauncherInput]::GetWindowLongW($Handle, -20) -band 8) -ne 0
+            $restoreTopmost = -not $wasTopmost
+            $raised = [YeYuEndfieldLauncherInput]::SetWindowPos($Handle, [IntPtr](-1), 0, 0, 0, 0, 0x13)
+            Start-Sleep -Milliseconds 150
+            if (-not $raised -or [YeYuEndfieldLauncherInput]::GetForegroundWindow() -ne $Handle -or
+                -not (Test-YeYuPointOwnedBy -X $X -Y $Y -ProcessId $ProcessId)) {
+                Write-Output ('blocked-by-foreign-window:' + $Label)
+                exit 5
+            }
+        }
+        [YeYuEndfieldLauncherInput]::SetCursorPos($X, $Y) | Out-Null
+        Start-Sleep -Milliseconds 150
+        if ([YeYuEndfieldLauncherInput]::GetForegroundWindow() -ne $Handle -or
+            -not (Test-YeYuPointOwnedBy -X $X -Y $Y -ProcessId $ProcessId)) {
+            Write-Output ('blocked-by-foreign-window:' + $Label)
+            exit 5
+        }
+        [YeYuEndfieldLauncherInput]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+        [YeYuEndfieldLauncherInput]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+        $deadline = [DateTime]::UtcNow.AddSeconds(12)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if (Test-YeYuEndfieldStarted) { return $true }
+            Start-Sleep -Milliseconds 500
+        }
+        return $false
+    } finally {
+        if ($restoreTopmost -and -not [YeYuEndfieldLauncherInput]::SetWindowPos($Handle, [IntPtr](-2), 0, 0, 0, 0, 0x13)) {
+            Write-Output 'blocked-by-foreign-window:launcher-z-order-restore-failed'
+            exit 5
+        }
     }
-    [YeYuEndfieldLauncherInput]::SetCursorPos($X, $Y) | Out-Null
-    Start-Sleep -Milliseconds 150
-    [YeYuEndfieldLauncherInput]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
-    [YeYuEndfieldLauncherInput]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
-    $deadline = [DateTime]::UtcNow.AddSeconds(12)
-    while ([DateTime]::UtcNow -lt $deadline) {
-        if (Test-YeYuEndfieldStarted) { return $true }
-        Start-Sleep -Milliseconds 500
-    }
-    return $false
 }
 $expected = [IO.Path]::GetFullPath($env:YEYU_ENDFIELD_LAUNCHER_ROOT).TrimEnd('\') + '\'
 $observedProcesses = @(Get-CimInstance Win32_Process -Filter "Name='Games.exe'" -ErrorAction SilentlyContinue)
