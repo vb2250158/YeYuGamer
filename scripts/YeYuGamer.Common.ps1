@@ -3,6 +3,47 @@ Set-StrictMode -Version Latest
 $script:YeYuGamerCanonicalManagerBaseUrl = 'http://127.0.0.1:8877/api/v1'
 $script:YeYuGamerInstallLifecycleMutexName = 'Local\YeYuGamer.InstallLifecycle.v1'
 
+function Invoke-YeYuGamerReleaseSafeStop {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][scriptblock]$ReadSnapshot,
+        [Parameter(Mandatory)][scriptblock]$Stop,
+        [ValidateRange(0, 14400)][int]$WaitForIdleSeconds = 0,
+        [ValidateRange(1, 60000)][int]$PollMilliseconds = 10000
+    )
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds($WaitForIdleSeconds)
+    while ($true) {
+        try { $snapshot = & $ReadSnapshot }
+        catch {
+            if ([DateTimeOffset]::UtcNow -ge $deadline) { throw }
+            Write-Host 'Manager idle state is not confirmed; leaving execution running and retrying.'
+            Start-Sleep -Milliseconds $PollMilliseconds
+            continue
+        }
+        if ($snapshot.activeBatch -or [int]$snapshot.executionControl.activeControllerLeaseCount -gt 0) {
+            if ([DateTimeOffset]::UtcNow -ge $deadline) {
+                throw 'Release idle wait expired; the current batch has been left running.'
+            }
+            Write-Host 'Prepared release is waiting for the current batch to finish.'
+            Start-Sleep -Milliseconds $PollMilliseconds
+            continue
+        }
+        try { & $Stop; return }
+        catch {
+            $stopFailure = $_
+            if ([DateTimeOffset]::UtcNow -ge $deadline) { throw }
+            # Manager remains authoritative if new work won the idle window.
+            # Only a confirmed active batch/controller allows this retry.
+            try { $confirmed = & $ReadSnapshot } catch { throw $stopFailure }
+            if (-not $confirmed.activeBatch -and [int]$confirmed.executionControl.activeControllerLeaseCount -eq 0) {
+                throw $stopFailure
+            }
+            Write-Host 'New work started before safe stop; leaving it running and waiting again.'
+            Start-Sleep -Milliseconds $PollMilliseconds
+        }
+    }
+}
+
 function Get-YeYuGamerCurrentLocalAppData {
     $localAppData = [Environment]::GetFolderPath(
         [Environment+SpecialFolder]::LocalApplicationData

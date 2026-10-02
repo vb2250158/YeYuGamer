@@ -383,7 +383,9 @@ $installedConfig = Join-Path $runtimeRoot 'config\platform.json'
 if ((Test-Path -LiteralPath $installedStop -PathType Leaf) -and (Test-Path -LiteralPath $installedConfig -PathType Leaf)) {
     # Bootstrap lifecycle fixes from the tested snapshot before replacing the
     # old installation; all stop requests still use the installed Manager API.
-    & (Join-Path $localScripts 'Stop-YeYuGamer.ps1') -InstallRoot $installRoot -RuntimeRoot $runtimeRoot -UseSourceClient
+    Invoke-YeYuGamerReleaseSafeStop -WaitForIdleSeconds $WaitForIdleSeconds `
+        -ReadSnapshot { Invoke-ManagerGet -RuntimeRoot $runtimeRoot -RelativePath 'snapshot' } `
+        -Stop { & (Join-Path $localScripts 'Stop-YeYuGamer.ps1') -InstallRoot $installRoot -RuntimeRoot $runtimeRoot -UseSourceClient }
 } else {
     Assert-YeYuGamerInstallLifecycleStopped -RuntimeRoot $runtimeRoot
 }

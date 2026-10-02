@@ -20,6 +20,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+# The installed CLI emits UTF-8. Windows PowerShell 5 otherwise decodes native
+# stdout using its legacy console encoding and can corrupt valid Chinese JSON.
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 if ($PSBoundParameters.ContainsKey('SkipOnStuckZombies') -or $PSBoundParameters.ContainsKey('RebootOnStuckZombies')) {
     throw 'SkipOnStuckZombies and RebootOnStuckZombies are no longer supported. Remove these switches: the Manager owns queue cleanup and residual-process gates; the scheduled entry never restarts Windows.'
 }
