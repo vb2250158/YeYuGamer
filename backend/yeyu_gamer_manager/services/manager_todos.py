@@ -1023,34 +1023,6 @@ class ManagerTodosService:
             deferred_reasons: dict[str, dict[str, str]] = {}
             executable_bindings: dict[str, dict[str, Any]] = {}
             session_reentry: list[TodoInstanceRecord] = []
-            # A completed session Todo is a durable GameDay fact, but it is
-            # also the per-process prerequisite that establishes the newly
-            # launched client's usable home/world state.  Re-enter it only
-            # when this game still has selected work to do; an otherwise
-            # completed game must remain skipped by a fresh batch.
-            if pending:
-                for item in completed:
-                    if item.todo_instance_id in recovery_replay_ids:
-                        continue
-                    binding = bindings.get(item.operation)
-                    if (
-                        binding is not None
-                        and str(binding.get("actionClass")) == "session"
-                        and item.risk in {"routine_action", "observe_only"}
-                        and item.adapter_capability_ref is not None
-                    ):
-                        session_reentry.append(item)
-                        executable_bindings[item.todo_instance_id] = {
-                            "operation": item.operation,
-                            "timeoutSeconds": int(binding.get("timeoutSeconds", 1)),
-                            "requiredEvidenceKinds": list(
-                                binding.get("requiredEvidenceKinds", [])
-                            ),
-                            "supportsResume": bool(binding.get("supportsResume")),
-                            "resume": False,
-                            "sessionReentry": True,
-                        }
-            executable.extend(session_reentry)
             for item in unresolved:
                 completion_replay = item.todo_instance_id in recovery_replay_ids
                 if completion_replay and (
@@ -1094,6 +1066,34 @@ class ManagerTodosService:
                         else {}
                     ),
                 }
+            # A completed session Todo is a durable GameDay fact, but it is
+            # also the per-process prerequisite that establishes the newly
+            # launched client's usable home/world state.  Re-enter it only
+            # when this game has executable selected work; an otherwise
+            # completed game must remain skipped by a fresh batch.
+            if executable:
+                for item in completed:
+                    if item.todo_instance_id in recovery_replay_ids:
+                        continue
+                    binding = bindings.get(item.operation)
+                    if (
+                        binding is not None
+                        and str(binding.get("actionClass")) == "session"
+                        and item.risk in {"routine_action", "observe_only"}
+                        and item.adapter_capability_ref is not None
+                    ):
+                        session_reentry.append(item)
+                        executable_bindings[item.todo_instance_id] = {
+                            "operation": item.operation,
+                            "timeoutSeconds": int(binding.get("timeoutSeconds", 1)),
+                            "requiredEvidenceKinds": list(
+                                binding.get("requiredEvidenceKinds", [])
+                            ),
+                            "supportsResume": bool(binding.get("supportsResume")),
+                            "resume": False,
+                            "sessionReentry": True,
+                        }
+            executable = session_reentry + executable
             executable_ids = {
                 candidate.todo_instance_id for candidate in executable
             }

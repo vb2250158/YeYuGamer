@@ -497,6 +497,31 @@ class ManagerAdapterExecutionTests(unittest.TestCase):
             "2026.08.30.3",
         )
 
+    def test_completed_session_does_not_launch_when_remaining_work_is_deferred(self) -> None:
+        alpha_id = self._todo_id(EXECUTE_ALPHA)
+        deferred_id = self._todo_id(DEFERRED)
+        self.store.update_config(
+            {"daily_todo_selection": {GAME_ID: [EXECUTE_ALPHA, DEFERRED]}}
+        )
+        for status in ("in_progress", "completed"):
+            self.store.transition_todo_instance(
+                alpha_id, status=status, reason="fixture session completed",
+                evidence_refs=["fixture-original-session-evidence"], run_id=None, increment_attempt=False,
+                requested_by="session-reentry-test",
+            )
+        original = self.store.get_todo_instance(alpha_id)
+        runtime = json.loads(json.dumps(self.manager.adapter_host.execution_bindings(GAME_ID)))
+        next(binding for binding in runtime["bindings"]
+             if binding["operation"] == "e2e-observe-alpha")["actionClass"] = "session"
+        with mock.patch.object(self.manager.adapter_host, "execution_bindings", return_value=runtime):
+            plan = self.manager._todo_plans_for_games([GAME_ID], "daily")[GAME_ID]
+        self.assertEqual(plan["unresolvedRequiredTodoIds"], [deferred_id])
+        self.assertEqual(plan["deferredTodoInstanceIds"], [deferred_id])
+        self.assertEqual(plan["sessionReentryTodoInstanceIds"], [])
+        self.assertEqual(plan["executableTodoInstanceIds"], [])
+        self.assertEqual(plan["skippedCompletedCount"], 1)
+        self.assertEqual(self.store.get_todo_instance(alpha_id), original)
+
     def test_completed_session_reenters_fresh_run_without_rewriting_completion(self) -> None:
         alpha_id = self._todo_id(EXECUTE_ALPHA)
         beta_id = self._todo_id(EXECUTE_BETA)

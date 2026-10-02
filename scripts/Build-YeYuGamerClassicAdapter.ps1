@@ -11,7 +11,7 @@ param(
     [string]$NikkeToolRoot = 'C:\Game\ok-NIKKE',
     [string]$NikkeGamePath = 'C:\Game\胜利女神：新的希望(2002017)\WeGameLauncher\launcher.exe',
     [string]$NikkePython = 'C:\Game\ok-nte-src\.venv\Scripts\python.exe',
-    [string]$PackageVersion = '0.3.0-classic-upstream.36',
+    [string]$PackageVersion = '0.3.0-classic-upstream.37',
     [string]$CSharpCompilerPath = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 )
 
