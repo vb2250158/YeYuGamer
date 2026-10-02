@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -67,14 +68,20 @@ def _process_lineage_pids(
     return lineage
 
 
+_stage_writer = None
+
+
 def _emit(stage_file: Path, operation: str, state: str, detail: str) -> None:
+    global _stage_writer
+    if _stage_writer is None:
+        spec = importlib.util.spec_from_file_location("_yeyu_classic_stage_journal", Path(__file__).with_name("StageJournal.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _stage_writer = module.append_record
     record = {"operation": operation, "state": state, "detail": detail}
-    line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
     for attempt in range(40):
         try:
-            with stage_file.open("a", encoding="utf-8", newline="\n") as stream:
-                stream.write(line)
-                stream.flush()
+            _stage_writer(stage_file, record)
             return
         except PermissionError:
             if attempt == 39:

@@ -11,7 +11,7 @@ param(
     [string]$NikkeToolRoot = 'C:\Game\ok-NIKKE',
     [string]$NikkeGamePath = 'C:\Game\胜利女神：新的希望(2002017)\WeGameLauncher\launcher.exe',
     [string]$NikkePython = 'C:\Game\ok-nte-src\.venv\Scripts\python.exe',
-    [string]$PackageVersion = '0.3.0-classic-selected.17',
+    [string]$PackageVersion = '0.3.0-classic-upstream.35',
     [string]$CSharpCompilerPath = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 )
 
@@ -75,6 +75,8 @@ $runner = Join-Path $candidate 'runner.exe'
 if ($LASTEXITCODE -ne 0) { throw 'Classic selected-daily runner compilation failed.' }
 $driver = Join-Path $candidate 'classic_tool_driver.py'
 Copy-Item -LiteralPath $driverSource -Destination $driver
+$stageJournal = Join-Path $candidate 'StageJournal.py'
+Copy-Item -LiteralPath (Join-Path $source 'adapter-host\classic-runner\StageJournal.py') -Destination $stageJournal
 
 $binding = [ordered]@{
     schemaVersion = 1
@@ -107,6 +109,7 @@ $manifest = [ordered]@{
     files=@(
         [ordered]@{path='runner.exe';sha256=(Hash $runner);sizeBytes=(Get-Item -LiteralPath $runner).Length},
         [ordered]@{path='classic_tool_driver.py';sha256=(Hash $driver);sizeBytes=(Get-Item -LiteralPath $driver).Length},
+        [ordered]@{path='StageJournal.py';sha256=(Hash $stageJournal);sizeBytes=(Get-Item -LiteralPath $stageJournal).Length},
         [ordered]@{path='tool-binding.json';sha256=(Hash $bindingPath);sizeBytes=(Get-Item -LiteralPath $bindingPath).Length}
     )
     supportedGameIds=@('PGR','ZZZ','NIKKE')
