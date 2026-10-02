@@ -35,6 +35,18 @@ class SafeStopConcurrencyTests(unittest.TestCase):
             self.assertEqual(call.kwargs["idempotency_key"], "same-stop-key")
             self.assertEqual(call.kwargs["body"], {"requestedBy": "cli", "reason": "operator-request"})
 
+    def test_stop_precondition_has_bounded_maintenance_budget(self) -> None:
+        with patch.object(self.client, "_request", side_effect=[
+            {"stateVersion": 41}, self.receipt,
+        ]) as request:
+            self.client.request_safe_stop(idempotency_key="artifact-import-stop")
+        self.assertEqual(request.call_args_list[0].kwargs["timeout_seconds"], 45.0)
+        self.assertEqual(request.call_args_list[1].kwargs["expected_state_version"], 41)
+        self.assertEqual(self.client.config.request_timeout_seconds, 1)
+        with patch.object(self.client, "_request", return_value={"stateVersion": 44}) as request:
+            self.client.snapshot()
+        self.assertEqual(request.call_args.kwargs["timeout_seconds"], self.client.SNAPSHOT_TIMEOUT_SECONDS)
+
     def test_repeated_conflicts_stop_after_three_posts_with_original_error(self) -> None:
         conflict = ManagerApiError("state changed", status_code=412, response_body="fixture-conflict")
         with patch.object(self.client, "_request", side_effect=[{"stateVersion": 41}, conflict] * 3) as request:

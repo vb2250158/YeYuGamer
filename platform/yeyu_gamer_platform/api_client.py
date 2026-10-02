@@ -756,20 +756,21 @@ class ManagerApiClient:
     # the config's short request timeout.
     SNAPSHOT_TIMEOUT_SECONDS = 20.0
 
-    def snapshot(self) -> JsonObject:
+    def snapshot(self, *, timeout_seconds: float | None = None) -> JsonObject:
         return self._object(
             self._request(
                 "GET",
                 "snapshot",
                 timeout_seconds=max(
-                    self.SNAPSHOT_TIMEOUT_SECONDS, self.config.request_timeout_seconds
+                    self.SNAPSHOT_TIMEOUT_SECONDS, self.config.request_timeout_seconds,
+                    timeout_seconds or 0.0,
                 ),
             ),
             resource="snapshot",
         )
 
     def _resolve_expected_state_version(
-        self, expected_state_version: int | None
+        self, expected_state_version: int | None, *, snapshot_timeout_seconds: float | None = None
     ) -> int:
         """Return an explicit CAS version, reading the current snapshot if omitted.
 
@@ -780,7 +781,8 @@ class ManagerApiClient:
 
         supplied = expected_state_version is not None
         if expected_state_version is None:
-            snapshot = self.snapshot()
+            snapshot = (self.snapshot(timeout_seconds=snapshot_timeout_seconds)
+                        if snapshot_timeout_seconds is not None else self.snapshot())
             expected_state_version = snapshot.get("stateVersion")
             if expected_state_version is None:
                 expected_state_version = snapshot.get("state_version")
@@ -1211,7 +1213,12 @@ class ManagerApiClient:
         # explicit caller-supplied version remains pinned, including on 412.
         attempts = 3 if expected_state_version is None else 1
         for attempt in range(attempts):
-            version = self._resolve_expected_state_version(expected_state_version)
+            # Publication can follow a large artifact import. Keep the stop
+            # precondition read within a bounded maintenance budget, rather
+            # than failing at the ordinary interactive snapshot deadline.
+            version = self._resolve_expected_state_version(
+                expected_state_version, snapshot_timeout_seconds=45.0
+            )
             try:
                 payload = self._request(
                     "POST",
