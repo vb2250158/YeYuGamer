@@ -104,11 +104,11 @@ Copy-Item -LiteralPath (Join-Path $source 'adapter-host\classic-runner\StageJour
 $binding = [ordered]@{
     schemaVersion = 1
     bindings = [ordered]@{
-        PGR = [ordered]@{ toolRoot=$pgrTool; gamePath=$pgrGame; python=$pgrPythonPath; verifiedFiles=@(
-            [ordered]@{path=$pgrEntry;sha256=(Hash $pgrEntry)}, [ordered]@{path=$pgrConfig;sha256=(Hash $pgrConfig)}, [ordered]@{path=$pgrPythonPath;sha256=(Hash $pgrPythonPath)}
+        PGR = [ordered]@{ toolRoot=$pgrTool; gamePath=$pgrGame; python=$pgrPythonPath; configurationFiles=@($pgrConfig); verifiedFiles=@(
+            [ordered]@{path=$pgrEntry;sha256=(Hash $pgrEntry)}, [ordered]@{path=$pgrPythonPath;sha256=(Hash $pgrPythonPath)}
         ) }
-        ZZZ = [ordered]@{ toolRoot=$zzzTool; gamePath=$zzzGame; python=$zzzPythonPath; verifiedFiles=@(
-            [ordered]@{path=$zzzLauncher;sha256=(Hash $zzzLauncher)}, [ordered]@{path=$zzzGroup;sha256=(Hash $zzzGroup)}, [ordered]@{path=$zzzCoffee;sha256=(Hash $zzzCoffee)}, [ordered]@{path=$zzzPythonPath;sha256=(Hash $zzzPythonPath)}
+        ZZZ = [ordered]@{ toolRoot=$zzzTool; gamePath=$zzzGame; python=$zzzPythonPath; configurationFiles=@($zzzGroup,$zzzCoffee); verifiedFiles=@(
+            [ordered]@{path=$zzzLauncher;sha256=(Hash $zzzLauncher)}, [ordered]@{path=$zzzPythonPath;sha256=(Hash $zzzPythonPath)}
         ) }
         NIKKE = [ordered]@{ toolRoot=$nikkeTool; gamePath=$nikkeGame; python=$nikkePythonPath; verifiedFiles=@(
             [ordered]@{path=$nikkeConfig;sha256=(Hash $nikkeConfig)}, [ordered]@{path=$nikkeGui;sha256=(Hash $nikkeGui)},

@@ -81,6 +81,8 @@ New-Item -ItemType Directory -Path $evidenceRoot -Force | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Classic driver self-test failed.' }
 & $pythonPath $validator | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Classic static validation failed.' }
+& $pythonPath -X utf8 (Join-Path $source 'backend\tests\test_classic_configuration_binding.py')
+if ($LASTEXITCODE -ne 0) { throw 'Classic mutable configuration binding replay failed.' }
 
 $testRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) ('YeYuGamer\adapter-test\classic-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $testRoot -Force | Out-Null

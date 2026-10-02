@@ -53,6 +53,16 @@ function Verify-Candidate([string]$Root) {
             $path = Resolve-Local ([string]$verified.path) "$gameId verified file"
             if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Hash $path) -cne [string]$verified.sha256) { throw "$gameId upstream tool changed after candidate build: $path" }
         }
+        if ($null -ne $entry.PSObject.Properties['configurationFiles']) {
+            $toolPrefix = ([IO.Path]::GetFullPath([string]$entry.toolRoot)).TrimEnd('\') + '\'
+            foreach ($configuration in @($entry.configurationFiles)) {
+                $path = Resolve-Local ([string]$configuration) "$gameId runtime configuration"
+                if (-not $path.StartsWith($toolPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+                    -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                    throw "$gameId runtime configuration is missing or outside its bound tool root: $path"
+                }
+            }
+        }
     }
     return @{Root=$root;Manifest=$manifest}
 }
