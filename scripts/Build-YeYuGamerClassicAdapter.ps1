@@ -11,7 +11,7 @@ param(
     [string]$NikkeToolRoot = 'C:\Game\ok-NIKKE',
     [string]$NikkeGamePath = 'C:\Game\胜利女神：新的希望(2002017)\WeGameLauncher\launcher.exe',
     [string]$NikkePython = 'C:\Game\ok-nte-src\.venv\Scripts\python.exe',
-    [string]$PackageVersion = '0.3.0-classic-upstream.35',
+    [string]$PackageVersion = '0.3.0-classic-upstream.36',
     [string]$CSharpCompilerPath = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 )
 
@@ -32,6 +32,26 @@ function Assert-LocalDirectory([string]$Path, [string]$Purpose) {
 }
 function Hash([string]$Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
 
+function Get-PgrBuildProfileRegistry([string]$RegistryPath) {
+    $registry = Get-Content -LiteralPath $RegistryPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $journalPath = Join-Path (Split-Path -Parent $RegistryPath) '.yeyu-profile-restore.json'
+    if (Test-Path -LiteralPath $journalPath -PathType Leaf) {
+        $journal = Get-Content -LiteralPath $journalPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($journal.schemaVersion -ne 1 -or $journal.configId -cnotmatch '^c_yeyu_[A-Za-z0-9_-]{1,96}$') {
+            throw 'PGR build profile recovery journal is invalid.'
+        }
+        $original = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$journal.originalRegistry)).TrimStart([char]0xFEFF) | ConvertFrom-Json
+        if ($registry.curr_config_id -cne $journal.configId -and $registry.curr_config_id -cne $original.curr_config_id) {
+            throw 'PGR build profile selection changed outside the owned recovery journal.'
+        }
+        $registry = $original
+    }
+    if ([string]$registry.curr_config_id -cnotmatch '^[A-Za-z0-9_-]{1,128}$' -or $registry.curr_config_id -notin $registry.config_list) {
+        throw 'PGR current profile must be a registered local profile.'
+    }
+    return $registry
+}
+
 $source = [IO.Path]::GetFullPath($SourceRoot)
 . (Join-Path $source 'adapter-host\YeYuGamerPromotionContract.ps1')
 $runnerSource = Assert-LocalFile (Join-Path $source 'adapter-host\classic-runner\Program.cs') 'classic runner source'
@@ -40,7 +60,10 @@ $compiler = Assert-LocalFile $CSharpCompilerPath 'C# compiler'
 
 $pgrTool = Assert-LocalDirectory $PgrToolRoot 'PGR tool root'
 $pgrEntry = if (Test-Path -LiteralPath (Join-Path $pgrTool 'FOS.exe') -PathType Leaf) { Assert-LocalFile (Join-Path $pgrTool 'FOS.exe') 'PGR tool entry' } else { Assert-LocalFile (Join-Path $pgrTool 'MFW.exe') 'PGR tool entry' }
-$pgrConfig = Assert-LocalFile (Join-Path $pgrTool 'config\configs\c_d300db28e6bd482b947ce83c5521c567.json') 'PGR base task profile'
+$pgrRegistryPath = Assert-LocalFile (Join-Path $pgrTool 'config\multi_config.json') 'PGR profile registry'
+$pgrRegistry = Get-PgrBuildProfileRegistry $pgrRegistryPath
+$pgrProfileId = [string]$pgrRegistry.curr_config_id
+$pgrConfig = Assert-LocalFile (Join-Path $pgrTool ('config\configs\' + $pgrProfileId + '.json')) 'PGR current task profile'
 $pgrGame = Assert-LocalFile $PgrGamePath 'PGR game executable'
 $pgrPythonPath = Assert-LocalFile $PgrPython 'PGR Python runtime'
 
