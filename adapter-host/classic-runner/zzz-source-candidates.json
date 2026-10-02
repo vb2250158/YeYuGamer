@@ -1,0 +1,92 @@
+{
+  "schemaVersion": 1,
+  "candidates": [
+    {
+      "candidateId": "owned-foreground-click-d83fec4",
+      "kind": "isolated-local-source-patch-with-formal-runtime-binding",
+      "officialRepository": "https://github.com/OneDragon-Anything/ZenlessZoneZero-OneDragon.git",
+      "officialBaseCommit": "f468456c832f0228a15c2e567713031142a5b2dc",
+      "sourceCommit": "d83fec4ab17a16c0bcd02120bb1419df990a603c",
+      "verifiedFiles": [
+        {
+          "path": "src/one_dragon/base/controller/owned_foreground_click.py",
+          "sha256": "4cd7ab58648cf0375c54c9806bf80b1d2eb81b4f1bdee5e7c199d115d4da9c35"
+        },
+        {
+          "path": "src/one_dragon/base/controller/pc_controller_base.py",
+          "sha256": "654407abcff57bdddae4ecdfa9abc486695e9471f6f541f46dc7bd9332529c54"
+        },
+        {
+          "path": "src/one_dragon/base/controller/pc_game_window.py",
+          "sha256": "4532776e8b728bd815a097c983f9df85e6d0ec1572c8f95402d4eae889220d39"
+        },
+        {
+          "path": "src/one_dragon/launcher/runtime_launcher.py",
+          "sha256": "299fafc9ebd8aa4c94bede6581db1b02e6d74a51c9ce6814ccaa4fdaccef6cfe"
+        },
+        {
+          "path": "src/zzz_od/application/zzz_application_launcher.py",
+          "sha256": "e0d4e6eca592d43abca039284bdae0c5615bf71c4f9dd8ba9009a211333ca194"
+        }
+      ]
+    },
+    {
+      "candidateId": "owned-foreground-input-a6373fd",
+      "kind": "isolated-local-source-patch-with-formal-runtime-binding",
+      "officialRepository": "https://github.com/OneDragon-Anything/ZenlessZoneZero-OneDragon.git",
+      "officialBaseCommit": "f468456c832f0228a15c2e567713031142a5b2dc",
+      "sourceCommit": "a6373fdecfe5d7991f4ce15ae7deabd302275375",
+      "verifiedFiles": [
+        {
+          "path": "src/one_dragon/base/controller/owned_foreground_click.py",
+          "sha256": "d1acb3ac34c39bfd76a95424cc66da8dc8c184d9cd3cfad9220577f8cda69c90"
+        },
+        {
+          "path": "src/one_dragon/base/controller/pc_controller_base.py",
+          "sha256": "68449bf730daae0c59d2d33e7d29bf561ce13b504cfdbff83c45c56f9ac8081a"
+        },
+        {
+          "path": "src/one_dragon/base/controller/pc_game_window.py",
+          "sha256": "4532776e8b728bd815a097c983f9df85e6d0ec1572c8f95402d4eae889220d39"
+        },
+        {
+          "path": "src/one_dragon/launcher/runtime_launcher.py",
+          "sha256": "299fafc9ebd8aa4c94bede6581db1b02e6d74a51c9ce6814ccaa4fdaccef6cfe"
+        },
+        {
+          "path": "src/zzz_od/application/zzz_application_launcher.py",
+          "sha256": "e0d4e6eca592d43abca039284bdae0c5615bf71c4f9dd8ba9009a211333ca194"
+        }
+      ]
+    },
+    {
+      "candidateId": "owned-foreground-drag-e8f19ad",
+      "kind": "isolated-local-source-patch-with-formal-runtime-binding",
+      "officialRepository": "https://github.com/OneDragon-Anything/ZenlessZoneZero-OneDragon.git",
+      "officialBaseCommit": "f468456c832f0228a15c2e567713031142a5b2dc",
+      "sourceCommit": "e8f19ad6478456a7da37aaa8008ca0435f0d7ae0",
+      "verifiedFiles": [
+        {
+          "path": "src/one_dragon/base/controller/owned_foreground_click.py",
+          "sha256": "d1acb3ac34c39bfd76a95424cc66da8dc8c184d9cd3cfad9220577f8cda69c90"
+        },
+        {
+          "path": "src/one_dragon/base/controller/pc_controller_base.py",
+          "sha256": "dd47b8a55d8a4a5e79fe80d43bf002c162d1231d98c41ff768b2d2224513a4e8"
+        },
+        {
+          "path": "src/one_dragon/base/controller/pc_game_window.py",
+          "sha256": "4532776e8b728bd815a097c983f9df85e6d0ec1572c8f95402d4eae889220d39"
+        },
+        {
+          "path": "src/one_dragon/launcher/runtime_launcher.py",
+          "sha256": "299fafc9ebd8aa4c94bede6581db1b02e6d74a51c9ce6814ccaa4fdaccef6cfe"
+        },
+        {
+          "path": "src/zzz_od/application/zzz_application_launcher.py",
+          "sha256": "e0d4e6eca592d43abca039284bdae0c5615bf71c4f9dd8ba9009a211333ca194"
+        }
+      ]
+    }
+  ]
+}

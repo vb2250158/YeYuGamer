@@ -11,7 +11,7 @@ param(
     [string]$NikkeToolRoot = 'C:\Game\ok-NIKKE',
     [string]$NikkeGamePath = 'C:\Game\胜利女神：新的希望(2002017)\WeGameLauncher\launcher.exe',
     [string]$NikkePython = 'C:\Game\ok-nte-src\.venv\Scripts\python.exe',
-    [string]$PackageVersion = '0.3.0-classic-upstream.37',
+    [string]$PackageVersion = '0.3.0-classic-upstream.46',
     [string]$CSharpCompilerPath = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 )
 
@@ -70,9 +70,16 @@ $pgrPythonPath = Assert-LocalFile $PgrPython 'PGR Python runtime'
 $zzzTool = Assert-LocalDirectory $ZzzToolRoot 'ZZZ tool root'
 $zzzLauncher = Assert-LocalFile (Join-Path $zzzTool 'OneDragon-Launcher.exe') 'ZZZ formal GUI/update entry'
 $zzzGroup = Assert-LocalFile (Join-Path $zzzTool 'config\01\one_dragon\_group.yml') 'ZZZ selected application group'
-$zzzCoffee = Assert-LocalFile (Join-Path $zzzTool 'config\01\one_dragon\coffee.yml') 'ZZZ coffee configuration'
+# Official application defaults allow the coffee settings file to be absent.
 $zzzGame = Assert-LocalFile $ZzzGamePath 'ZZZ game executable'
 $zzzPythonPath = Assert-LocalFile $ZzzPython 'ZZZ Python runtime'
+
+$zzzSource = $null
+if (Test-Path -LiteralPath (Join-Path $zzzTool 'src\one_dragon\base\controller\owned_foreground_click.py') -PathType Leaf) {
+    $zzzSource = & $zzzPythonPath -X utf8 (Join-Path $source 'scripts\verify_zzz_source_candidate.py') --root $zzzTool --catalog (Join-Path $source 'adapter-host\classic-runner\zzz-source-candidates.json')
+    if ($LASTEXITCODE -ne 0) { throw 'ZZZ isolated source patch is not verified.' }
+    $zzzSource = ($zzzSource -join "`n") | ConvertFrom-Json -ErrorAction Stop
+}
 
 $nikkeTool = Assert-LocalDirectory $NikkeToolRoot 'NIKKE tool root'
 $nikkeConfig = Assert-LocalFile (Join-Path $nikkeTool 'run_nikke_behavior_tree.py') 'NIKKE behavior-tree config'
@@ -107,7 +114,7 @@ $binding = [ordered]@{
         PGR = [ordered]@{ toolRoot=$pgrTool; gamePath=$pgrGame; python=$pgrPythonPath; configurationFiles=@($pgrConfig); verifiedFiles=@(
             [ordered]@{path=$pgrEntry;sha256=(Hash $pgrEntry)}, [ordered]@{path=$pgrPythonPath;sha256=(Hash $pgrPythonPath)}
         ) }
-        ZZZ = [ordered]@{ toolRoot=$zzzTool; gamePath=$zzzGame; python=$zzzPythonPath; configurationFiles=@($zzzGroup,$zzzCoffee); verifiedFiles=@(
+        ZZZ = [ordered]@{ toolRoot=$zzzTool; gamePath=$zzzGame; python=$zzzPythonPath; configurationFiles=@($zzzGroup); verifiedFiles=@(
             [ordered]@{path=$zzzLauncher;sha256=(Hash $zzzLauncher)}, [ordered]@{path=$zzzPythonPath;sha256=(Hash $zzzPythonPath)}
         ) }
         NIKKE = [ordered]@{ toolRoot=$nikkeTool; gamePath=$nikkeGame; python=$nikkePythonPath; verifiedFiles=@(
@@ -117,6 +124,13 @@ $binding = [ordered]@{
             [ordered]@{path=$nikkePythonPath;sha256=(Hash $nikkePythonPath)}
         ) }
     }
+}
+if ($zzzSource) {
+    $binding.bindings.ZZZ.sourceCandidateId = [string]$zzzSource.candidateId
+    $binding.bindings.ZZZ.sourceCommit = [string]$zzzSource.sourceCommit
+    $binding.bindings.ZZZ.officialBaseCommit = [string]$zzzSource.officialBaseCommit
+    $binding.bindings.ZZZ.sourceCandidateKind = [string]$zzzSource.kind
+    $binding.bindings.ZZZ.verifiedFiles += @($zzzSource.verifiedFiles)
 }
 $bindingPath = Join-Path $candidate 'tool-binding.json'
 [IO.File]::WriteAllText($bindingPath, ($binding | ConvertTo-Json -Depth 10 -Compress), [Text.UTF8Encoding]::new($false))
