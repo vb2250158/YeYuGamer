@@ -390,6 +390,7 @@ if ((Test-Path -LiteralPath $installedStop -PathType Leaf) -and (Test-Path -Lite
     Assert-YeYuGamerInstallLifecycleStopped -RuntimeRoot $runtimeRoot
 }
 
+Invoke-YeYuGamerStoppedReleaseInstallation -Install {
 & (Join-Path $localScripts 'Install-YeYuGamer.ps1') `
     -SourceRoot $localSourceRoot `
     -BuildRoot $buildRoot `
@@ -420,6 +421,11 @@ Invoke-YeYuGamerCandidateInstallation -Install {
     if ('BD2' -in $AdapterGroups) {
         & (Join-Path $localScripts 'Install-YeYuGamerBd2Adapter.ps1') -SourceRoot $localSourceRoot -CandidateRoot (Join-Path $adapterBuildRoot 'bd2-candidate') -RuntimeRoot $runtimeRoot -CandidateTestEvidencePath (Join-Path $evidenceRoot 'bd2.json')
     }
+}
+
+} -Recover {
+    $recoveryStart = Join-Path $installRoot 'app\scripts\Start-YeYuGamer.ps1'
+    & $recoveryStart -InstallRoot $installRoot -RuntimeRoot $runtimeRoot -NoOpenWebGui -TimeoutSeconds $ManagerStartupTimeoutSeconds
 }
 
 $installedStart = Join-Path $installRoot 'app\scripts\Start-YeYuGamer.ps1'

@@ -44,6 +44,24 @@ function Invoke-YeYuGamerReleaseSafeStop {
     }
 }
 
+function Invoke-YeYuGamerStoppedReleaseInstallation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][scriptblock]$Install,
+        [Parameter(Mandatory)][scriptblock]$Recover
+    )
+    try { & $Install }
+    catch {
+        $installationFailure = $_
+        # The installed launcher validates its own package and starts only the
+        # managed host. Do not leave a previously healthy service down merely
+        # because a candidate failed after safe stop.
+        try { & $Recover }
+        catch { Write-Warning ('Installed Manager recovery failed: ' + $_.Exception.Message) }
+        $PSCmdlet.ThrowTerminatingError($installationFailure)
+    }
+}
+
 function Get-YeYuGamerCurrentLocalAppData {
     $localAppData = [Environment]::GetFolderPath(
         [Environment+SpecialFolder]::LocalApplicationData
