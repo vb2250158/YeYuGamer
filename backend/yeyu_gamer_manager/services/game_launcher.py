@@ -721,6 +721,7 @@ using System.Runtime.InteropServices;
 public static class YeYuEndfieldLauncherInput {
     [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -781,7 +782,7 @@ function Invoke-YeYuPhysicalClick {
             Start-Sleep -Milliseconds 150
             if (-not $raised -or [YeYuEndfieldLauncherInput]::GetForegroundWindow() -ne $Handle -or
                 -not (Test-YeYuPointOwnedBy -X $X -Y $Y -ProcessId $ProcessId)) {
-                Write-Output ('blocked-by-foreign-window:' + $Label)
+                [Console]::Out.WriteLine('blocked-by-foreign-window:' + $Label)
                 exit 5
             }
         }
@@ -789,7 +790,7 @@ function Invoke-YeYuPhysicalClick {
         Start-Sleep -Milliseconds 150
         if ([YeYuEndfieldLauncherInput]::GetForegroundWindow() -ne $Handle -or
             -not (Test-YeYuPointOwnedBy -X $X -Y $Y -ProcessId $ProcessId)) {
-            Write-Output ('blocked-by-foreign-window:' + $Label)
+            [Console]::Out.WriteLine('blocked-by-foreign-window:' + $Label)
             exit 5
         }
         [YeYuEndfieldLauncherInput]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
@@ -801,8 +802,10 @@ function Invoke-YeYuPhysicalClick {
         }
         return $false
     } finally {
-        if ($restoreTopmost -and -not [YeYuEndfieldLauncherInput]::SetWindowPos($Handle, [IntPtr](-2), 0, 0, 0, 0, 0x13)) {
-            Write-Output 'blocked-by-foreign-window:launcher-z-order-restore-failed'
+        if ($restoreTopmost -and [YeYuEndfieldLauncherInput]::IsWindow($Handle) -and
+            -not [YeYuEndfieldLauncherInput]::SetWindowPos($Handle, [IntPtr](-2), 0, 0, 0, 0, 0x13) -and
+            [YeYuEndfieldLauncherInput]::IsWindow($Handle)) {
+            [Console]::Out.WriteLine('blocked-by-foreign-window:launcher-z-order-restore-failed')
             exit 5
         }
     }
@@ -1499,6 +1502,7 @@ using System.Runtime.InteropServices;
 public static class YeYuWeGameSurfaceInput {
     [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -1564,7 +1568,7 @@ function Invoke-YeYuWeGamePhysicalClick {
             Start-Sleep -Milliseconds 150
             if (-not $raised -or [YeYuWeGameSurfaceInput]::GetForegroundWindow() -ne $Handle -or
                 -not (Test-YeYuWeGamePointOwnedBy -X $X -Y $Y -ProcessId $ProcessId)) {
-                Write-Output ('blocked:wegame-foreign-window')
+                [Console]::Out.WriteLine('blocked:wegame-foreign-window')
                 exit 5
             }
         }
@@ -1572,7 +1576,7 @@ function Invoke-YeYuWeGamePhysicalClick {
         Start-Sleep -Milliseconds 150
         if ([YeYuWeGameSurfaceInput]::GetForegroundWindow() -ne $Handle -or
             -not (Test-YeYuWeGamePointOwnedBy -X $X -Y $Y -ProcessId $ProcessId)) {
-            Write-Output ('blocked:wegame-foreign-window')
+            [Console]::Out.WriteLine('blocked:wegame-foreign-window')
             exit 5
         }
         [YeYuWeGameSurfaceInput]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
@@ -1584,8 +1588,10 @@ function Invoke-YeYuWeGamePhysicalClick {
         }
         return $false
     } finally {
-        if ($restoreTopmost -and -not [YeYuWeGameSurfaceInput]::SetWindowPos($Handle, [IntPtr](-2), 0, 0, 0, 0, 0x13)) {
-            Write-Output 'blocked:wegame-z-order-restore-failed'
+        if ($restoreTopmost -and [YeYuWeGameSurfaceInput]::IsWindow($Handle) -and
+            -not [YeYuWeGameSurfaceInput]::SetWindowPos($Handle, [IntPtr](-2), 0, 0, 0, 0, 0x13) -and
+            [YeYuWeGameSurfaceInput]::IsWindow($Handle)) {
+            [Console]::Out.WriteLine('blocked:wegame-z-order-restore-failed')
             exit 5
         }
     }

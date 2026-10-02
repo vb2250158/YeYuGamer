@@ -13,7 +13,7 @@ class EndfieldLauncherOcclusionTests(unittest.TestCase):
     function_name = "Invoke-YeYuPhysicalClick"
     function_end = "$expected ="
 
-    def replay(self, *, covered=True, reveal=True, topmost=False, foreground=True, click_error=False, lose_after_cursor=False, raise_success=True, restore_success=True):
+    def replay(self, *, covered=True, reveal=True, topmost=False, foreground=True, click_error=False, lose_after_cursor=False, raise_success=True, restore_success=True, close_after_click=False):
         source = getattr(GameLaunchService, self.script_attribute)
         declaration = "function " + self.function_name + " {"
         function = declaration + source.split(declaration, 1)[1].split(self.function_end, 1)[0]
@@ -27,6 +27,9 @@ public static class YeYuEndfieldLauncherInput {
     public static bool ThrowInput = CLICK_ERROR;
     public static bool RaiseSuccess = RAISE_SUCCESS;
     public static bool RestoreSuccess = RESTORE_SUCCESS;
+    public static bool WindowExists = true;
+    public static bool CloseAfterClick = CLOSE_AFTER_CLICK;
+    public static bool IsWindow(IntPtr h) { return WindowExists; }
     public static int GetWindowLongW(IntPtr h, int index) { return INITIAL_STYLE; }
     public static bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int z, uint flags) {
         Console.WriteLine("position:" + h.ToInt64() + ":" + after.ToInt64() + ":" + flags);
@@ -38,6 +41,7 @@ public static class YeYuEndfieldLauncherInput {
     public static void mouse_event(uint flags, uint x, uint y, uint data, UIntPtr extra) {
         if (ThrowInput) throw new Exception("simulated input error");
         Console.WriteLine("mouse:" + flags);
+        if (CloseAfterClick && flags == 4) WindowExists = false;
     }
 }
 '@
@@ -53,6 +57,7 @@ function Test-YeYuEndfieldStarted { return $true }
                 .replace("CLICK_ERROR", str(click_error).lower())
                 .replace("RAISE_SUCCESS", str(raise_success).lower())
                 .replace("RESTORE_SUCCESS", str(restore_success).lower())
+                .replace("CLOSE_AFTER_CLICK", str(close_after_click).lower())
                 .replace("LOSE_AFTER_CURSOR", "$true" if lose_after_cursor else "$false")
                 .replace("FOREGROUND", "$true" if foreground else "$false")
                 .replace("COVERED", "$true" if covered else "$false")
@@ -65,7 +70,7 @@ function Test-YeYuEndfieldStarted { return $true }
         shell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
         return subprocess.run(
             [str(shell), "-NoProfile", "-NonInteractive", "-Command", stub + function
-             + self.function_name + " -Handle ([IntPtr]123) -ProcessId 456 -X 100 -Y 200 -Label 'start'"],
+             + "$result = " + self.function_name + " -Handle ([IntPtr]123) -ProcessId 456 -X 100 -Y 200 -Label 'start'; if ($null -ne $result) { [Console]::Out.WriteLine($result) }"],
             capture_output=True, text=True, timeout=20, creationflags=subprocess.CREATE_NO_WINDOW,
         )
 
@@ -123,6 +128,19 @@ function Test-YeYuEndfieldStarted { return $true }
         result = self.replay(restore_success=False)
         self.assertEqual(result.returncode, 5, result.stderr)
         self.assertIn("z-order-restore-failed", result.stdout)
+
+    def test_launcher_closed_by_successful_game_start_needs_no_restore(self):
+        result = self.replay(close_after_click=True, restore_success=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("True", result.stdout)
+        self.assertNotIn("position:123:-2", result.stdout)
+        self.assertNotIn("restore-failed", result.stdout)
+
+    def test_failure_protocol_survives_real_assignment_call_site(self):
+        result = self.replay(reveal=False)
+        self.assertEqual(result.returncode, 5, result.stderr)
+        self.assertIn("foreign-window", result.stdout)
+        self.assertNotIn("mouse:", result.stdout)
 
 
 class WeGameLauncherOcclusionTests(EndfieldLauncherOcclusionTests):
