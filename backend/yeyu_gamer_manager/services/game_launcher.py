@@ -1502,6 +1502,8 @@ public static class YeYuWeGameSurfaceInput {
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern int GetWindowLongW(IntPtr hWnd, int index);
+    [DllImport("user32.dll", SetLastError=true)] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int width, int height, uint flags);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
     [DllImport("user32.dll")] public static extern void keybd_event(byte virtualKey, byte scanCode, uint flags, UIntPtr extra);
@@ -1527,6 +1529,66 @@ function Get-YeYuWeGameOwnerPid {
         [void][YeYuWeGameSurfaceInput]::GetWindowThreadProcessId($Handle, $ptr)
         return [uint32][Runtime.InteropServices.Marshal]::ReadInt32($ptr)
     } finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($ptr) }
+}
+function Test-YeYuWeGamePointOwnedBy {
+    param([int]$X, [int]$Y, [int]$ProcessId)
+    $point = New-Object YeYuWeGamePoint
+    $point.X = $X; $point.Y = $Y
+    $hit = [YeYuWeGameSurfaceInput]::WindowFromPoint($point)
+    return ($hit -ne [IntPtr]::Zero -and (Get-YeYuWeGameOwnerPid -Handle $hit) -eq [uint32]$ProcessId)
+}
+function Set-YeYuWeGameForeground {
+    param([IntPtr]$Handle)
+    [YeYuWeGameSurfaceInput]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+    [YeYuWeGameSurfaceInput]::keybd_event(0x12, 0, 0x0002, [UIntPtr]::Zero)
+    [void][YeYuWeGameSurfaceInput]::BringWindowToTop($Handle)
+    [void][YeYuWeGameSurfaceInput]::SetForegroundWindow($Handle)
+    Start-Sleep -Milliseconds 400
+    return ([YeYuWeGameSurfaceInput]::GetForegroundWindow() -eq $Handle)
+}
+function Test-YeYuNikkeStarted {
+    return [bool](Get-Process -Name 'nikke' -ErrorAction SilentlyContinue)
+}
+function Invoke-YeYuWeGamePhysicalClick {
+    param([IntPtr]$Handle, [int]$ProcessId, [int]$X, [int]$Y, [string]$Label)
+    if (-not (Set-YeYuWeGameForeground -Handle $Handle)) { return $null }
+    $restoreTopmost = $false
+    try {
+        if (-not (Test-YeYuWeGamePointOwnedBy -X $X -Y $Y -ProcessId $ProcessId)) {
+            # A foreground window can still sit below another app's topmost
+            # surface. Raise only this already verified launcher for the
+            # bounded action; never change or close the covering application.
+            $wasTopmost = ([YeYuWeGameSurfaceInput]::GetWindowLongW($Handle, -20) -band 8) -ne 0
+            $restoreTopmost = -not $wasTopmost
+            $raised = [YeYuWeGameSurfaceInput]::SetWindowPos($Handle, [IntPtr](-1), 0, 0, 0, 0, 0x13)
+            Start-Sleep -Milliseconds 150
+            if (-not $raised -or [YeYuWeGameSurfaceInput]::GetForegroundWindow() -ne $Handle -or
+                -not (Test-YeYuWeGamePointOwnedBy -X $X -Y $Y -ProcessId $ProcessId)) {
+                Write-Output ('blocked:wegame-foreign-window')
+                exit 5
+            }
+        }
+        [YeYuWeGameSurfaceInput]::SetCursorPos($X, $Y) | Out-Null
+        Start-Sleep -Milliseconds 150
+        if ([YeYuWeGameSurfaceInput]::GetForegroundWindow() -ne $Handle -or
+            -not (Test-YeYuWeGamePointOwnedBy -X $X -Y $Y -ProcessId $ProcessId)) {
+            Write-Output ('blocked:wegame-foreign-window')
+            exit 5
+        }
+        [YeYuWeGameSurfaceInput]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+        [YeYuWeGameSurfaceInput]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+        $deadline = [DateTime]::UtcNow.AddSeconds(12)
+        while ([DateTime]::UtcNow -lt $deadline) {
+            if (Test-YeYuNikkeStarted) { return $true }
+            Start-Sleep -Milliseconds 500
+        }
+        return $false
+    } finally {
+        if ($restoreTopmost -and -not [YeYuWeGameSurfaceInput]::SetWindowPos($Handle, [IntPtr](-2), 0, 0, 0, 0, 0x13)) {
+            Write-Output 'blocked:wegame-z-order-restore-failed'
+            exit 5
+        }
+    }
 }
 $roots = @()
 foreach ($process in @(Get-Process -ErrorAction SilentlyContinue)) {
@@ -1595,6 +1657,10 @@ foreach ($button in @($window.FindAll([Windows.Automation.TreeScope]::Descendant
 }
 if ($null -eq $match) {
     if ([YeYuWeGameSurfaceInput]::IsIconic($target.Handle)) {
+        if ($env:YEYU_NIKKE_WEGAME_ALLOW_ACTION -ne '1') {
+            Write-Output 'waiting:wegame-window-minimized'; exit 3
+        }
+        [void][YeYuWeGameSurfaceInput]::ShowWindowAsync($target.Handle, 9)
         Write-Output 'waiting:wegame-restore-requested'; exit 3
     }
     $frame = New-Object YeYuWeGameRect
@@ -1616,36 +1682,9 @@ if ([YeYuWeGameSurfaceInput]::IsIconic($handle)) {
     [void][YeYuWeGameSurfaceInput]::ShowWindowAsync($handle, 9)
     Write-Output 'waiting:wegame-restore-requested'; exit 3
 }
-[YeYuWeGameSurfaceInput]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
-[YeYuWeGameSurfaceInput]::keybd_event(0x12, 0, 0x0002, [UIntPtr]::Zero)
-[void][YeYuWeGameSurfaceInput]::BringWindowToTop($handle)
-[void][YeYuWeGameSurfaceInput]::SetForegroundWindow($handle)
-Start-Sleep -Milliseconds 400
-if ([YeYuWeGameSurfaceInput]::GetForegroundWindow() -ne $handle) {
-    Write-Output 'blocked:wegame-foreground-not-acquired'; exit 5
-}
-$x = [int]$match.X
-$y = [int]$match.Y
-$point = New-Object YeYuWeGamePoint
-$point.X = $x; $point.Y = $y
-$hit = [YeYuWeGameSurfaceInput]::WindowFromPoint($point)
-if ($hit -eq [IntPtr]::Zero) { Write-Output 'blocked:wegame-point-unowned'; exit 5 }
-if ((Get-YeYuWeGameOwnerPid -Handle $hit) -ne [uint32]$target.ProcessId) {
-    Write-Output 'blocked:wegame-foreign-window'; exit 5
-}
-[void][YeYuWeGameSurfaceInput]::SetCursorPos($x, $y)
-Start-Sleep -Milliseconds 150
-# WeGame is Chromium: InvokePattern is a no-op there, so dispatch one real
-# foreground click on the audited action instead.
-[YeYuWeGameSurfaceInput]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
-[YeYuWeGameSurfaceInput]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
-$verifyDeadline = [DateTime]::UtcNow.AddSeconds(12)
-while ([DateTime]::UtcNow -lt $verifyDeadline) {
-    if (Get-Process -Name 'nikke' -ErrorAction SilentlyContinue) {
-        Write-Output ('clicked:wegame-primary:' + $match.Name + ':game-started'); exit 0
-    }
-    Start-Sleep -Milliseconds 400
-}
+$launched = Invoke-YeYuWeGamePhysicalClick -Handle $handle -ProcessId $target.ProcessId -X ([int]$match.X) -Y ([int]$match.Y) -Label $match.Name
+if ($null -eq $launched) { Write-Output 'blocked:wegame-foreground-not-acquired'; exit 5 }
+if ($launched) { Write-Output ('clicked:wegame-primary:' + $match.Name + ':game-started'); exit 0 }
 Write-Output ('no-effect:wegame-primary:' + $match.Name)
 exit 4
 """

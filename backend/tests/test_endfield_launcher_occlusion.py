@@ -9,11 +9,14 @@ from yeyu_gamer_manager.services.game_launcher import GameLaunchService
 
 @unittest.skipUnless(os.name == "nt", "PowerShell replay is Windows-only")
 class EndfieldLauncherOcclusionTests(unittest.TestCase):
+    script_attribute = "_ENDFIELD_UIA_SCRIPT"
+    function_name = "Invoke-YeYuPhysicalClick"
+    function_end = "$expected ="
+
     def replay(self, *, covered=True, reveal=True, topmost=False, foreground=True, click_error=False, lose_after_cursor=False, raise_success=True, restore_success=True):
-        source = GameLaunchService._ENDFIELD_UIA_SCRIPT
-        function = "function Invoke-YeYuPhysicalClick {" + source.split(
-            "function Invoke-YeYuPhysicalClick {", 1
-        )[1].split("$expected =", 1)[0]
+        source = getattr(GameLaunchService, self.script_attribute)
+        declaration = "function " + self.function_name + " {"
+        function = declaration + source.split(declaration, 1)[1].split(self.function_end, 1)[0]
         stub = r'''
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @'
@@ -54,10 +57,15 @@ function Test-YeYuEndfieldStarted { return $true }
                 .replace("FOREGROUND", "$true" if foreground else "$false")
                 .replace("COVERED", "$true" if covered else "$false")
                 .replace("REVEAL", "$true" if reveal else "$false"))
+        if self.script_attribute == "_NIKKE_WEGAME_ACTION_SCRIPT":
+            stub = (stub.replace("YeYuEndfieldLauncherInput", "YeYuWeGameSurfaceInput")
+                    .replace("Set-YeYuLauncherForeground", "Set-YeYuWeGameForeground")
+                    .replace("Test-YeYuPointOwnedBy", "Test-YeYuWeGamePointOwnedBy")
+                    .replace("Test-YeYuEndfieldStarted", "Test-YeYuNikkeStarted"))
         shell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
         return subprocess.run(
             [str(shell), "-NoProfile", "-NonInteractive", "-Command", stub + function
-             + "Invoke-YeYuPhysicalClick -Handle ([IntPtr]123) -ProcessId 456 -X 100 -Y 200 -Label 'start'"],
+             + self.function_name + " -Handle ([IntPtr]123) -ProcessId 456 -X 100 -Y 200 -Label 'start'"],
             capture_output=True, text=True, timeout=20, creationflags=subprocess.CREATE_NO_WINDOW,
         )
 
@@ -114,7 +122,15 @@ function Test-YeYuEndfieldStarted { return $true }
     def test_failed_restore_stops_the_launcher_action(self):
         result = self.replay(restore_success=False)
         self.assertEqual(result.returncode, 5, result.stderr)
-        self.assertIn("launcher-z-order-restore-failed", result.stdout)
+        self.assertIn("z-order-restore-failed", result.stdout)
+
+
+class WeGameLauncherOcclusionTests(EndfieldLauncherOcclusionTests):
+    """Run the same native-input-free failure cases against WeGame production code."""
+
+    script_attribute = "_NIKKE_WEGAME_ACTION_SCRIPT"
+    function_name = "Invoke-YeYuWeGamePhysicalClick"
+    function_end = "$roots ="
 
 
 if __name__ == "__main__":
