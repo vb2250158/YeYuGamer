@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 import webbrowser
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
@@ -72,6 +72,10 @@ def _configure_manager_environment(config: PlatformConfig) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="YeYuGamer")
     parser.add_argument("--config", help="Path to platform.json")
+    parser.add_argument(
+        "--startup-timeout-seconds", type=float,
+        help="Override this host's startup budget without changing platform.json",
+    )
     parser.add_argument(
         "--no-browser",
         action="store_true",
@@ -248,7 +252,8 @@ class DesktopHost:
         if not guard.acquire():
             # A second launch is not another app or another Manager.  It only
             # asks Windows to show the running host's same local page.
-            webbrowser.open(self.config.web_url)
+            if self.open_browser:
+                webbrowser.open(self.config.web_url)
             return 0
         try:
             try:
@@ -269,8 +274,12 @@ class DesktopHost:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
+        config = PlatformConfig.load(arguments.config)
+        if arguments.startup_timeout_seconds is not None:
+            config = replace(config, startup_timeout_seconds=arguments.startup_timeout_seconds)
+            config.validate()
         host = DesktopHost(
-            PlatformConfig.load(arguments.config), open_browser=not arguments.no_browser
+            config, open_browser=not arguments.no_browser
         )
         return host.run()
     except (OSError, RuntimeError, ValueError) as error:

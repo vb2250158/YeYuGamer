@@ -24,11 +24,21 @@ if (-not (Test-Path -LiteralPath $desktopHost -PathType Leaf)) {
 }
 
 if ($NoOpenWebGui) {
+    try {
+        $runningHealth = Invoke-RestMethod -Uri 'http://127.0.0.1:8877/api/v1/health' -TimeoutSec 2 -ErrorAction Stop
+        if ($runningHealth.status -eq 'ok') {
+            Write-Host 'YeYu Gamer installed desktop host is already healthy.'
+            exit 0
+        }
+    } catch {}
+}
+
+if ($NoOpenWebGui) {
     # Manager-only recovery keeps its explicit no-browser contract. Normal
     # interactive startup below always goes through the installed shortcut.
     Start-Process `
         -FilePath $desktopHost `
-        -ArgumentList @('--config', $configPath, '--no-browser') `
+        -ArgumentList @('--config', ('"' + $configPath + '"'), '--no-browser', '--startup-timeout-seconds', [string]$TimeoutSeconds) `
         -WorkingDirectory (Split-Path -Parent $desktopHost) `
         -WindowStyle Hidden
 } else {
