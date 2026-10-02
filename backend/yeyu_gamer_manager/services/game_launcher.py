@@ -925,7 +925,13 @@ exit 4
         cancel_requested: LaunchCancellationCheck | None,
     ) -> int | None:
         """Activate one verified Endfield/CN launcher instance without closing it."""
-        if not baseline or any(name.casefold() != "games.exe" for name in baseline.values()):
+        if any(name.casefold() in self.READY_PROCESS_NAMES["Endfield"] for name in baseline.values()):
+            return None
+        # Launcher.exe is shared by unrelated products (including WeGame).
+        # Its presence must not suppress identity validation of Games.exe.
+        # The signed-path probe below remains the authority for activation.
+        baseline = {pid: name for pid, name in baseline.items() if name.casefold() == "games.exe"}
+        if not baseline:
             return None
         if len(baseline) != 1:
             raise GameLaunchHumanRequired(
@@ -2108,7 +2114,10 @@ exit 4
                     launch_executable, baseline, cancel_requested=cancel_requested,
                 ) if game_id == "Endfield" else None
             )
-            reactivation_scope = frozenset((*baseline, reactivation_pid)) if reactivation_pid else None
+            reactivation_scope = frozenset((
+                *(pid for pid, name in baseline.items() if name.casefold() == "games.exe"),
+                reactivation_pid,
+            )) if reactivation_pid else None
             # Only an official launcher leftover may be replaced.  Reusing a
             # healthy pre-existing launcher stays the fast path; recycling is a
             # last resort applied only after the probe has already failed.

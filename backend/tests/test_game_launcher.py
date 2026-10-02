@@ -1772,6 +1772,26 @@ ConvertTo-Json -InputObject $results -Compress
         self.assertEqual(observations[0].detail["action"], "endfield-official-reactivation")
         close.assert_not_called()
 
+    def test_endfield_headless_reactivation_ignores_unrelated_wegame_launcher(self) -> None:
+        launcher = Path(self.temporary.name) / "Hypergryph Launcher" / "Launcher.exe"
+        launcher.parent.mkdir()
+        launcher.write_bytes(b"fixture")
+        with mock.patch.object(self.launcher, "_resolve_endfield_launcher", return_value=launcher), mock.patch.object(
+            self.launcher, "_list_running", side_effect=[{10: "Games.exe", 99: "launcher.exe"}, {}],
+        ), mock.patch.object(self.launcher, "_run_launcher_probe", return_value=subprocess.CompletedProcess([], 0, "trusted:headless", "")) as probe, mock.patch(
+            "yeyu_gamer_manager.services.game_launcher.subprocess.Popen", return_value=mock.Mock(pid=11),
+        ) as popen, mock.patch.object(self.launcher, "_wait_until_ready", return_value=(20, "endfield.exe", 1920, 1080)) as wait, mock.patch.object(
+            self.launcher, "close_started",
+        ) as close:
+            receipt = self.launcher.ensure_started("Endfield", str(self.executable))
+        self.assertEqual("10", probe.call_args.kwargs["environment"]["YEYU_ENDFIELD_REACTIVATE_PID"])
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args.args[0], [str(launcher), "--game=endfield", "--reason=4"])
+        self.assertEqual(wait.call_args.kwargs["endfield_reactivation"], (self.executable.parent, frozenset({10, 11})))
+        self.assertEqual(receipt.baseline_process_ids, (10, 99))
+        self.assertEqual(receipt.state, "started")
+        close.assert_not_called()
+
     def test_endfield_first_launch_uses_the_same_current_official_cli(self) -> None:
         with mock.patch.object(self.launcher, "_resolve_endfield_launcher", return_value=self.executable), mock.patch.object(
             self.launcher, "_list_running", side_effect=[{}, {20: "Endfield.exe"}],
