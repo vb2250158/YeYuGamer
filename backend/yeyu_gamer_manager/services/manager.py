@@ -8,6 +8,7 @@ import os
 import secrets
 import stat
 import threading
+from .snapshot_coalescer import SnapshotCoalescer
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -245,7 +246,7 @@ def _dump(model: Any) -> dict[str, Any]:
 
 
 class ManagerService:
-    VERSION = "0.3.7"
+    VERSION = "0.3.8"
     # A pending Agent completion review may delay the batch seal (and the round
     # mail) for at most this long.  After that the machine adjudication seals
     # the batch; unreviewed runs stay review_required.
@@ -273,6 +274,7 @@ class ManagerService:
         self.store = store
         self.legacy_report = legacy_report
         self.adapter = adapter
+        self._snapshot_coalescer = SnapshotCoalescer()
         self._watchdog_lock = threading.Lock()
         # Serializes only the short launch -> Adapter Host ownership handoff.
         # A cancellation either becomes durable before Host dispatch, or waits
@@ -1527,6 +1529,10 @@ class ManagerService:
         )
 
     def snapshot(self) -> SnapshotResponse:
+        # Share only overlapping reads; subsequent requests still recompute.
+        return self._snapshot_coalescer.run(self._build_snapshot).model_copy(deep=True)
+
+    def _build_snapshot(self) -> SnapshotResponse:
         started = time.monotonic()
         timings: dict[str, float] = {}
         checkpoint = started
@@ -8652,7 +8658,7 @@ class ManagerService:
                 )
             # Sealed/cancelled historical batches cannot permanently protect a
             # process. A still-open human gate does, including another batch.
-            for owner in self.store.list_batches(5000):
+            for owner in self.store.list_unsealed_batches():
                 if owner["result"].get("sealVersion") is not None or owner["state"] == EntityState.CANCELLED:
                     continue
                 for member in owner.get("run_memberships", []):
@@ -8671,7 +8677,7 @@ class ManagerService:
                             f"{protected['game_id']} has an unreleased human gate; preserve its scene before starting another game.",
                             detail={"protectedGameId": protected["game_id"], "protectedRunId": protected["run_id"], "protectedBatchId": owner["batch_id"]},
                         )
-            for protected in self.store.list_game_runs(5000):
+            for protected in self.store.list_human_game_runs():
                 if protected["game_id"] in other_game_ids and protected["state"] == EntityState.HUMAN_REQUIRED:
                     if not self.store.list_batch_run_memberships(run_id=protected["run_id"], limit=5000):
                         raise GameLaunchHumanRequired(

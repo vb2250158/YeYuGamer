@@ -3409,6 +3409,16 @@ class SqliteStore:
                 ).fetchall()
         return [self._batch(row) for row in rows]
 
+    def list_unsealed_batches(self) -> list[dict[str, Any]]:
+        """Read every live ownership candidate without decoding sealed history."""
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT * FROM batches WHERE state != 'cancelled' "
+                "AND json_extract(result_json, '$.sealVersion') IS NULL "
+                "ORDER BY created_at DESC"
+            ).fetchall()
+        return [self._batch(row) for row in rows]
+
     def get_batch(self, batch_id: str) -> dict[str, Any]:
         return self._one("batches", "batch_id", batch_id, self._batch)
 
@@ -4600,6 +4610,15 @@ class SqliteStore:
                 rows = self.connection.execute(
                     "SELECT * FROM game_runs ORDER BY created_at DESC LIMIT ?", (limit,)
                 ).fetchall()
+        return [self._game_run(row) for row in rows]
+
+    def list_human_game_runs(self) -> list[dict[str, Any]]:
+        """Human gates cannot be crowded out by a limit on recent history."""
+        with self._lock:
+            rows = self.connection.execute(
+                "SELECT * FROM game_runs WHERE state = 'human_required' "
+                "ORDER BY created_at DESC"
+            ).fetchall()
         return [self._game_run(row) for row in rows]
 
     def get_game_run(self, run_id: str) -> dict[str, Any]:
