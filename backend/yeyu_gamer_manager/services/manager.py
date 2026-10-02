@@ -16,6 +16,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterable
 
+from .. import __version__
+
 from ..domain.models import (
     AgentWorkItemCreateRequest,
     AgentWorkItemRecord,
@@ -246,7 +248,7 @@ def _dump(model: Any) -> dict[str, Any]:
 
 
 class ManagerService:
-    VERSION = "0.3.17"
+    VERSION = __version__
     # A pending Agent completion review may delay the batch seal (and the round
     # mail) for at most this long.  After that the machine adjudication seals
     # the batch; unreviewed runs stay review_required.
