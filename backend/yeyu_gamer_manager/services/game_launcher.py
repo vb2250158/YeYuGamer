@@ -1500,6 +1500,7 @@ $signature = @'
 using System;
 using System.Runtime.InteropServices;
 public static class YeYuWeGameSurfaceInput {
+    [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
     [DllImport("user32.dll", SetLastError=true)] public static extern bool AttachThreadInput(uint currentThread, uint targetThread, bool attach);
     [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SendMessageTimeoutW(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
@@ -1529,6 +1530,22 @@ public struct YeYuWeGamePoint { public int X; public int Y; }
 public struct YeYuWeGameRect { public int Left; public int Top; public int Right; public int Bottom; }
 '@
 Add-Type -TypeDefinition $signature
+function Invoke-YeYuWeGamePhysicalCoordinateScope {
+    param([scriptblock]$Probe)
+    # GetWindowRect is DPI-virtualized in the default PowerShell process,
+    # while physical cursor input uses screen pixels. Keep all native reads,
+    # hit tests and input in one per-monitor-aware scope, restoring this
+    # thread's prior context on returns, exceptions and script exit.
+    $previous = [YeYuWeGameSurfaceInput]::SetThreadDpiAwarenessContext([IntPtr](-4))
+    if ($previous -eq [IntPtr]::Zero) { Write-Output 'error:wegame-physical-coordinate-context-unavailable'; exit 2 }
+    try { & $Probe }
+    finally {
+        if ([YeYuWeGameSurfaceInput]::SetThreadDpiAwarenessContext($previous) -eq [IntPtr]::Zero) {
+            throw 'WeGame physical-coordinate context could not be restored'
+        }
+    }
+}
+Invoke-YeYuWeGamePhysicalCoordinateScope {
 function Get-YeYuWeGameOwnerPid {
     param([IntPtr]$Handle)
     $ptr = [Runtime.InteropServices.Marshal]::AllocHGlobal(4)
@@ -1542,7 +1559,12 @@ function Test-YeYuWeGamePointOwnedBy {
     $point = New-Object YeYuWeGamePoint
     $point.X = $X; $point.Y = $Y
     $hit = [YeYuWeGameSurfaceInput]::WindowFromPoint($point)
-    return ($hit -ne [IntPtr]::Zero -and (Get-YeYuWeGameOwnerPid -Handle $hit) -eq [uint32]$ProcessId)
+    $actualPid = if ($hit -ne [IntPtr]::Zero) { Get-YeYuWeGameOwnerPid -Handle $hit } else { 0 }
+    $owned = $hit -ne [IntPtr]::Zero -and $actualPid -eq [uint32]$ProcessId
+    if (-not $owned) {
+        [Console]::Error.WriteLine(('wegame-point x={0} y={1} expectedPid={2} actualPid={3}' -f $X, $Y, $ProcessId, $actualPid))
+    }
+    return $owned
 }
 function Invoke-YeYuWeGameCaptionActivation {
     param([IntPtr]$Handle)
@@ -1764,6 +1786,7 @@ if ($null -eq $launched) { Write-Output 'blocked:wegame-foreground-not-acquired'
 if ($launched) { Write-Output ('clicked:wegame-primary:' + $match.Name + ':game-started'); exit 0 }
 Write-Output ('no-effect:wegame-primary:' + $match.Name)
 exit 4
+}
 """
 
     def _drive_nikke_wegame_surface(
