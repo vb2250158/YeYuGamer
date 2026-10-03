@@ -1500,6 +1500,9 @@ $signature = @'
 using System;
 using System.Runtime.InteropServices;
 public static class YeYuWeGameSurfaceInput {
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll", SetLastError=true)] public static extern bool AttachThreadInput(uint currentThread, uint targetThread, bool attach);
+    [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr SendMessageTimeoutW(IntPtr hWnd, uint message, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
     [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
@@ -1541,14 +1544,82 @@ function Test-YeYuWeGamePointOwnedBy {
     $hit = [YeYuWeGameSurfaceInput]::WindowFromPoint($point)
     return ($hit -ne [IntPtr]::Zero -and (Get-YeYuWeGameOwnerPid -Handle $hit) -eq [uint32]$ProcessId)
 }
+function Invoke-YeYuWeGameCaptionActivation {
+    param([IntPtr]$Handle)
+    $ownerPid = Get-YeYuWeGameOwnerPid -Handle $Handle
+    $frame = New-Object YeYuWeGameRect
+    if ($ownerPid -eq 0 -or -not [YeYuWeGameSurfaceInput]::IsWindow($Handle) -or
+        -not [YeYuWeGameSurfaceInput]::GetWindowRect($Handle, [ref]$frame)) { return $false }
+    $x = [int](($frame.Left + $frame.Right) / 2)
+    $y = $frame.Top + 14
+    if ($frame.Right - $frame.Left -lt 640 -or $frame.Bottom - $frame.Top -lt 360) { return $false }
+    # HTCAPTION=2 is a nonclient title bar. Never activate through a guessed
+    # client-area click, which could trigger a launcher action or agreement.
+    $position = [IntPtr](($x -band 0xffff) -bor (($y -band 0xffff) -shl 16))
+    $hit = [IntPtr]::Zero
+    if ([YeYuWeGameSurfaceInput]::SendMessageTimeoutW($Handle, 0x84, [IntPtr]::Zero, $position, 2, 500, [ref]$hit) -eq [IntPtr]::Zero -or
+        $hit.ToInt64() -ne 2) { return $false }
+    $restoreTopmost = ([YeYuWeGameSurfaceInput]::GetWindowLongW($Handle, -20) -band 8) -eq 0
+    $activated = $false
+    try {
+        if (-not $restoreTopmost -or [YeYuWeGameSurfaceInput]::SetWindowPos($Handle, [IntPtr](-1), 0, 0, 0, 0, 0x13)) {
+            Start-Sleep -Milliseconds 100
+            if ((Get-YeYuWeGameOwnerPid -Handle $Handle) -eq $ownerPid -and
+                (Test-YeYuWeGamePointOwnedBy -X $x -Y $y -ProcessId $ownerPid) -and
+                [YeYuWeGameSurfaceInput]::SetCursorPos($x, $y)) {
+                $hit = [IntPtr]::Zero
+                if ([YeYuWeGameSurfaceInput]::SendMessageTimeoutW($Handle, 0x84, [IntPtr]::Zero, $position, 2, 500, [ref]$hit) -ne [IntPtr]::Zero -and
+                    $hit.ToInt64() -eq 2 -and (Test-YeYuWeGamePointOwnedBy -X $x -Y $y -ProcessId $ownerPid)) {
+                    [YeYuWeGameSurfaceInput]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+                    [YeYuWeGameSurfaceInput]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+                    Start-Sleep -Milliseconds 400
+                    $activated = ([YeYuWeGameSurfaceInput]::GetForegroundWindow() -eq $Handle)
+                }
+            }
+        }
+    } finally {
+        if ($restoreTopmost -and [YeYuWeGameSurfaceInput]::IsWindow($Handle) -and
+            -not [YeYuWeGameSurfaceInput]::SetWindowPos($Handle, [IntPtr](-2), 0, 0, 0, 0, 0x13)) {
+            $activated = $false
+        }
+    }
+    [Console]::Error.WriteLine(('wegame-caption targetPid={0} acquired={1}' -f $ownerPid, $activated))
+    return $activated
+}
 function Set-YeYuWeGameForeground {
     param([IntPtr]$Handle)
-    [YeYuWeGameSurfaceInput]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
-    [YeYuWeGameSurfaceInput]::keybd_event(0x12, 0, 0x0002, [UIntPtr]::Zero)
-    [void][YeYuWeGameSurfaceInput]::BringWindowToTop($Handle)
-    [void][YeYuWeGameSurfaceInput]::SetForegroundWindow($Handle)
-    Start-Sleep -Milliseconds 400
-    return ([YeYuWeGameSurfaceInput]::GetForegroundWindow() -eq $Handle)
+    if (-not [YeYuWeGameSurfaceInput]::IsWindow($Handle)) { return $false }
+    if ([YeYuWeGameSurfaceInput]::GetForegroundWindow() -eq $Handle) { return $true }
+    $currentThread = [YeYuWeGameSurfaceInput]::GetCurrentThreadId()
+    $targetThread = [YeYuWeGameSurfaceInput]::GetWindowThreadProcessId($Handle, [IntPtr]::Zero)
+    $attached = $false
+    $detached = $true
+    $foreground = $false
+    $attachError = 0
+    $detachError = 0
+    try {
+        # Only attach this probe to the already verified WeGame window. Never
+        # attach to whichever unrelated application currently has focus.
+        if ($targetThread -ne 0 -and $targetThread -ne $currentThread) {
+            $attached = [YeYuWeGameSurfaceInput]::AttachThreadInput($currentThread, $targetThread, $true)
+            if (-not $attached) { $attachError = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
+        }
+        [void][YeYuWeGameSurfaceInput]::BringWindowToTop($Handle)
+        [void][YeYuWeGameSurfaceInput]::SetForegroundWindow($Handle)
+        Start-Sleep -Milliseconds 400
+        $foreground = ([YeYuWeGameSurfaceInput]::GetForegroundWindow() -eq $Handle)
+    } finally {
+        if ($attached -and -not [YeYuWeGameSurfaceInput]::AttachThreadInput($currentThread, $targetThread, $false)) {
+            $detachError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            $detached = $false
+            $foreground = $false
+        }
+    }
+    if (-not $foreground -and $detached) {
+        $foreground = Invoke-YeYuWeGameCaptionActivation -Handle $Handle
+    }
+    [Console]::Error.WriteLine(('wegame-foreground targetPid={0} foregroundPid={1} attached={2} acquired={3} attachError={4} detachError={5}' -f (Get-YeYuWeGameOwnerPid -Handle $Handle), (Get-YeYuWeGameOwnerPid -Handle ([YeYuWeGameSurfaceInput]::GetForegroundWindow())), $attached, $foreground, $attachError, $detachError))
+    return $foreground
 }
 function Test-YeYuNikkeStarted {
     return [bool](Get-Process -Name 'nikke' -ErrorAction SilentlyContinue)
@@ -1727,6 +1798,7 @@ exit 4
                 observer, game_id, "launcher-action", started_at, surface_names, {
                     "action": "nikke-wegame-primary-action",
                     "outcome": outcome,
+                    "lastLauncherProbe": self._last_launcher_probe,
                     "dispatched": True,
                     "gameReady": False,
                     "actions": actions,
@@ -1773,6 +1845,9 @@ exit 4
         except (OSError, subprocess.TimeoutExpired):
             return "error:wegame-probe-failed"
         outcome = result.stdout.strip()
+        cls._last_launcher_probe = cls._launcher_probe_summary(result)
+        if allow_action and result.returncode == 4 and outcome.startswith("no-effect:wegame-primary:"):
+            return outcome
         if outcome.startswith(("clicked:wegame-primary:", "ready:wegame-primary:", "waiting:", "none:", "blocked:", "human:", "error:")):
             return outcome
         return "error:wegame-invalid-probe-result"
