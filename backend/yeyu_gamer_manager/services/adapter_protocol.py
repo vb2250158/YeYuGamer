@@ -14,6 +14,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
 
 
+from ..domain.artifact_limits import MAX_ARTIFACTS_PER_TODO
+
 PROTOCOL_VERSION = "1.1"
 SCHEMA_VERSION = 1
 EXECUTION_PACKAGE_SCHEMA_VERSION = 2
@@ -25,7 +27,6 @@ MAX_EVENT_BYTES = 64 * 1024
 MAX_STDERR_BYTES = 8 * 1024
 MAX_TODOS_PER_REQUEST = 64
 MAX_ARTIFACT_BYTES = 20 * 1024 * 1024
-MAX_ARTIFACTS_PER_TODO = 20
 MAX_RUN_ARTIFACT_BYTES = 256 * 1024 * 1024
 
 ALLOWED_GAME_IDS = frozenset(
@@ -1015,7 +1016,7 @@ class AdapterEventStream:
             field="evidenceArtifactIds",
             allow_empty=True,
             uuid_values=True,
-            maximum=20,
+            maximum=self.max_artifacts_per_todo,
         )
         if status == "completed" and not evidence:
             raise AdapterProtocolError(

@@ -504,7 +504,7 @@ class AdapterProtocolTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "run_summary_mismatch")
 
-    def test_artifact_count_is_atomic_per_todo_and_twenty_is_allowed(self) -> None:
+    def test_artifact_count_is_atomic_per_todo_and_maximum_is_allowed(self) -> None:
         plan = AdapterExecutionPlan.from_document(two_todo_plan_document())
         stream = AdapterEventStream(plan)
         stream.consume_line(
@@ -558,7 +558,7 @@ class AdapterProtocolTests(unittest.TestCase):
         stream.consume_line(
             event_base(
                 "artifact_staged",
-                23,
+                MAX_ARTIFACTS_PER_TODO + 3,
                 todoInstanceId=SECOND_TODO_ID,
                 todoAttemptId=SECOND_TODO_ATTEMPT_ID,
                 artifactId=str(uuid.UUID(int=100)),
@@ -574,12 +574,12 @@ class AdapterProtocolTests(unittest.TestCase):
             stream.consume_line(
                 event_base(
                     "artifact_staged",
-                    24,
+                    MAX_ARTIFACTS_PER_TODO + 4,
                     todoInstanceId=TODO_ID,
                     todoAttemptId=TODO_ATTEMPT_ID,
                     artifactId=str(uuid.UUID(int=101)),
                     kind="game-ui-task-result",
-                    fileName="twenty-first.png",
+                    fileName="over-limit.png",
                     mimeType="image/png",
                     sizeBytes=1,
                     sha256="a" * 64,
@@ -587,14 +587,14 @@ class AdapterProtocolTests(unittest.TestCase):
                 )
             )
         self.assertEqual(raised.exception.code, "artifact_count_exceeded")
-        self.assertEqual(stream.next_sequence, 24)
-        self.assertEqual(stream.artifact_counts_by_todo[TODO_ID], 20)
+        self.assertEqual(stream.next_sequence, MAX_ARTIFACTS_PER_TODO + 4)
+        self.assertEqual(stream.artifact_counts_by_todo[TODO_ID], MAX_ARTIFACTS_PER_TODO)
         self.assertEqual(stream.artifact_counts_by_todo[SECOND_TODO_ID], 1)
-        self.assertEqual(stream.artifact_bytes, 21)
+        self.assertEqual(stream.artifact_bytes, MAX_ARTIFACTS_PER_TODO + 1)
         stream.consume_line(
             event_base(
                 "todo_progress",
-                24,
+                MAX_ARTIFACTS_PER_TODO + 4,
                 todoInstanceId=SECOND_TODO_ID,
                 todoAttemptId=SECOND_TODO_ATTEMPT_ID,
                 code="still-active",
@@ -877,6 +877,43 @@ class AdapterProtocolTests(unittest.TestCase):
         self.assertFalse(result.protocol_valid)
         self.assertEqual(result.code, "missing_run_terminal")
         self.assertEqual(result.completed_todo_instance_ids, ())
+
+    def test_terminal_history_obeys_promoted_artifact_count(self) -> None:
+        for budget, count, accepted in ((32, 29, True), (32, 32, True), (20, 20, True), (20, 21, False), (32, 33, False)):
+            with self.subTest(budget=budget, count=count):
+                stream = AdapterEventStream(self.plan, max_artifacts_per_todo=budget)
+                stream.consume_line(event_base(
+                    "hello", 0, packageId="legacy-night-rain-gamer", packageVersion="0.1.0",
+                    packageDigest=PACKAGE_DIGEST, runnerPid=1234, acceptedTodoInstanceIds=[TODO_ID],
+                ))
+                stream.consume_line(event_base(
+                    "todo_attempt_started", 1, todoInstanceId=TODO_ID,
+                    todoAttemptId=TODO_ATTEMPT_ID, attemptNo=1, operation="observe-panel",
+                ))
+                ids = []
+                for index in range(min(count, budget)):
+                    identifier = str(uuid.UUID(int=index + 1))
+                    ids.append(identifier)
+                    stream.consume_line(event_base(
+                        "artifact_staged", index + 2, todoInstanceId=TODO_ID,
+                        todoAttemptId=TODO_ATTEMPT_ID, artifactId=identifier,
+                        kind="game-ui-task-result", fileName=f"native-{index}.png",
+                        mimeType="image/png", sizeBytes=1, sha256="e" * 64, capturedAt=AT,
+                    ))
+                if not accepted:
+                    ids.append(str(uuid.UUID(int=100)))
+                terminal = event_base(
+                    "todo_terminal", len(stream.artifacts) + 2, todoInstanceId=TODO_ID,
+                    todoAttemptId=TODO_ATTEMPT_ID, status="completed",
+                    reasonCode="upstream_task_succeeded", reason="Complete history",
+                    retryable=False, evidenceArtifactIds=ids,
+                )
+                if accepted:
+                    stream.consume_line(terminal)
+                    self.assertEqual(len(stream.todo_terminals[TODO_ID]["evidenceArtifactIds"]), count)
+                else:
+                    with self.assertRaises(AdapterProtocolError):
+                        stream.consume_line(terminal)
 
     def test_manifest_v2_integrity_binding_and_forbidden_gate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
