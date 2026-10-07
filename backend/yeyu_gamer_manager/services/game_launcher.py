@@ -3714,18 +3714,20 @@ exit 4
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
-        handle = kernel32.OpenProcess(0x1000, False, process_id)
+        handle = kernel32.OpenProcess(0x101000, False, process_id)
         if not handle:
             return ctypes.get_last_error() not in cls.PROCESS_GONE_ERROR_CODES
         try:
-            exit_code = wintypes.DWORD()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-                return True
-            return int(exit_code.value) == cls.STILL_ACTIVE
+            # Exit code 0 can precede the last thread's termination, leaving
+            # the previous client alive during a later launch attempt.
+            # Only a signaled process object proves termination. Query/wait
+            # errors remain conservative, and an actual exit code 259 is
+            # distinguishable from STILL_ACTIVE by this wait observation.
+            return int(kernel32.WaitForSingleObject(handle, 0)) != 0
         finally:
             kernel32.CloseHandle(handle)
 
