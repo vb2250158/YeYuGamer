@@ -665,6 +665,37 @@ class CheckpointTransitionTests(ExecutionControlFixture):
 
 
 class TodoBlockerLifecycleTests(ExecutionControlFixture):
+    def test_twenty_one_reference_blocker_can_be_raised(self) -> None:
+        refs = tuple(f"artifact-{index}" for index in range(21))
+        active = self.make_blocker(artifact_refs=refs)
+        raise_todo_blocker(active)
+        self.assertEqual(TodoBlocker.model_validate(active.model_dump()).artifact_refs, refs)
+
+    def test_full_history_blocker_roundtrip_preserves_shared_bound(self) -> None:
+        from yeyu_gamer_manager.services.adapter_protocol import MAX_ARTIFACTS_PER_TODO
+        self.assertEqual(MAX_ARTIFACTS_PER_TODO, 32)
+        refs = tuple(f"artifact-{index}" for index in range(32))
+        active = self.make_blocker(artifact_refs=refs)
+        self.assertEqual(TodoBlocker.model_validate(active.model_dump()).artifact_refs, refs)
+        raise_todo_blocker(active)
+        resolved = self.make_blocker(
+            artifact_refs=refs, state=TodoBlockerState.RESOLVED, revision=2,
+            transitioned_at=T0 + timedelta(seconds=40),
+            resolved_at=T0 + timedelta(seconds=40),
+            resolution_code="fresh-observation",
+            resolution_reason="complete same-Todo native history",
+            resolution_artifact_refs=refs,
+        )
+        resolve_todo_blocker(active, resolved)
+        self.assertEqual(TodoBlocker.model_validate(resolved.model_dump()).resolution_artifact_refs, refs)
+        for changes in (
+            {"artifact_refs": (*refs, "artifact-over-budget")},
+            {"artifact_refs": (*refs[:-1], refs[0])},
+            {"resolution_artifact_refs": (*refs, "artifact-over-budget")},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValidationError):
+                TodoBlocker.model_validate({**resolved.model_dump(), **changes})
+
     def make_blocker(self, **updates: object) -> TodoBlocker:
         values: dict[str, object] = {
             "blocker_id": "blocker-1",
