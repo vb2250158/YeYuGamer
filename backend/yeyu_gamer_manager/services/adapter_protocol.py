@@ -17,7 +17,6 @@ from typing import Any, Callable, Mapping, Sequence
 from ..domain.artifact_limits import MAX_ARTIFACTS_PER_TODO
 from .completion_contract import UPSTREAM_RESULT_CODES
 
-
 PROTOCOL_VERSION = "1.1"
 SCHEMA_VERSION = 1
 EXECUTION_PACKAGE_SCHEMA_VERSION = 2
