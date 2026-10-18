@@ -32,7 +32,7 @@ PERSISTENT_ACTOR_SCOPES: dict[str, frozenset[str]] = {
     "agent": frozenset({"agent:read"}),
     "rabiroute": frozenset({"agent:dispatch", "agent:dispatch:read"}),
 }
-AGENT_WORKER_SCOPES = frozenset({"agent:write", "agent:read"})
+AGENT_WORKER_SCOPES = frozenset({"agent:write", "agent:read", "execution:start"})
 
 EPHEMERAL_TRAY_ACTOR_ID = "tray"
 EPHEMERAL_TRAY_SCOPES = frozenset({"webgui:bootstrap"})
