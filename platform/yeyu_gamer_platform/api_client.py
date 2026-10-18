@@ -579,9 +579,9 @@ class ManagerApiClient:
             )
         if supplied:
             raise ValueError("artifact claim context is only valid for the agent actor")
-        if self.actor not in {"webgui", "cli"}:
+        if self.actor not in {"webgui", "cli", "agent-launch"}:
             raise PermissionError(
-                "artifact reads require webgui, cli, or an active Agent claim"
+                "artifact reads require webgui, cli, agent-launch, or an active Agent claim"
             )
         return None
 

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from yeyu_gamer_platform.api_client import ManagerApiClient
+from yeyu_gamer_platform.api_client import ArtifactContent, ManagerApiClient
 from yeyu_gamer_platform.config import PlatformConfig
 
 
@@ -48,6 +48,15 @@ class OperatorEvidenceClientTests(unittest.TestCase):
             request.reset_mock()
             self.client.game_runs(limit=4)
             request.assert_called_once_with("GET", "game-runs?limit=4")
+
+    def test_uploaded_artifact_can_be_read_by_agent_launch(self):
+        with patch.object(self.client, "_request", return_value={"artifactId": "image-id"}) as request:
+            self.assertEqual(self.client.get_artifact("image-id").artifact_id, "image-id")
+            request.assert_called_once_with("GET", "artifacts/image-id", artifact_claim=None)
+        content = ArtifactContent("image-id", "image/png", None, b"image")
+        with patch.object(self.client, "_request_artifact_content", return_value=content) as request:
+            self.assertEqual(self.client.get_artifact_content("image-id").data, b"image")
+            request.assert_called_once_with("image-id", artifact_claim=None)
 
 
 if __name__ == "__main__":
