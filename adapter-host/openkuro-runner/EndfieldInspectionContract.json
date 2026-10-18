@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "repository": "https://github.com/AliceJump/ok-end-field.git",
+  "commit": "5320c06ff7bca13356bfddf7397a3bfe19bbcc15",
+  "officialBaseCommit": "5755d347a12015f101f9e29996ca0160477bd24a",
+  "archiveSha256": "11ab59bdebb93e3956ee937d43cd448e6d547467f5b13cd1a9886b91b78b707c",
+  "files": {
+    "src/config.py": "b627907837efc7c0b1fc387b3700c2477730f10066a2de847cc80955b3254d9d",
+    "src/tasks/onetime/RewardStatusInspectionTask.py": "52ff708c0233e59630d52f5bb81a2d721cde1a09bffabeddd0eaae55a7c0f273",
+    "src/tasks/onetime/CreditCollectTask.py": "6dc3024a5fa7511bf5e69de4aebd47619ab2dbbe10452b9baccddc356f5f38b5",
+    "src/core/base_mixin/game_flow_mixin.py": "e217f3036922079c0cad12f038e625072856cc14c71b3ad0e408b853c65efed5",
+    "uv.lock": "ae5751d3a8c312a86523bd266999ce4f419f57d375b1f7d5fc4c45d2fd13c74b",
+    "main.py": "5151a09d9c8c707bdb24c0d063e308d0ca54b16ad7590b3b81b5806b5c7931bd"
+  }
+}

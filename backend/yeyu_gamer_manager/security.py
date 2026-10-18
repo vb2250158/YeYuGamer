@@ -18,6 +18,11 @@ class ActorCredential:
 
 
 PERSISTENT_ACTOR_SCOPES: dict[str, frozenset[str]] = {
+    "agent-launch": frozenset({
+        "execution:start", "execution:read", "execution:control", "todo:review",
+        "evidence:read", "evidence:write",
+    }),
+    "scheduler": frozenset({"execution:start"}),
     "cli": frozenset(
         {"control:write", "agent:write", "lifecycle:write", "read:all"}
     ),

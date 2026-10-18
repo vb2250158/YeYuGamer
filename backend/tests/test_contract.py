@@ -631,7 +631,7 @@ class ManagerContractTests(unittest.TestCase):
             execute = self.client.post(
                 "/api/v1/game-runs",
                 json={"gameId": "StarRail", "mode": "execute"},
-                headers=self.mutation_headers("must-not-execute"),
+                headers=self.mutation_headers('must-not-execute', actor='agent-launch'),
             )
             self.assertEqual(execute.status_code, 409, execute.text)
             execute_problem = execute.json()
@@ -648,7 +648,7 @@ class ManagerContractTests(unittest.TestCase):
             batch = self.client.post(
                 "/api/v1/batches",
                 json={"gameIds": ["StarRail"], "mode": "execute"},
-                headers=self.mutation_headers("must-reject-deferred-batch"),
+                headers=self.mutation_headers('must-reject-deferred-batch', actor='agent-launch'),
             )
             self.assertEqual(batch.status_code, 409, batch.text)
             batch_problem = batch.json()
@@ -671,7 +671,7 @@ class ManagerContractTests(unittest.TestCase):
                         "capability": "batch.daily.run",
                         "arguments": {"gameIds": ["StarRail"]},
                     },
-                    headers=self.mutation_headers("must-reject-deferred-capability"),
+                    headers=self.mutation_headers('must-reject-deferred-capability', actor='scheduler'),
                 )
             finally:
                 manager.capabilities["batch.daily.run"] = original_batch_capability
@@ -707,7 +707,7 @@ class ManagerContractTests(unittest.TestCase):
         disabled = self.client.post(
             "/api/v1/game-runs",
             json={"gameId": "ZZZ", "mode": "execute"},
-            headers=self.mutation_headers("disabled-game"),
+            headers=self.mutation_headers('disabled-game', actor='agent-launch'),
         )
         self.assertIn(disabled.status_code, {409, 422})
 
@@ -784,9 +784,7 @@ class ManagerContractTests(unittest.TestCase):
                         "capability": "batch.daily.run",
                         "arguments": {"gameIds": candidate_game_ids},
                     },
-                    headers=self.mutation_headers(
-                        "partial-batch-capability-preserves-deferred"
-                    ),
+                    headers=self.mutation_headers('partial-batch-capability-preserves-deferred', actor='scheduler'),
                 )
         finally:
             manager.capabilities["batch.daily.run"] = original_batch_capability
@@ -858,9 +856,7 @@ class ManagerContractTests(unittest.TestCase):
             "manifestVerified": True,
             "bindings": [{"operation": "contract-test"}],
         }
-        headers = self.mutation_headers(
-            "compact-execute-batch-replay", request_id="req-compact-execute"
-        )
+        headers = self.mutation_headers('compact-execute-batch-replay', request_id='req-compact-execute', actor='agent-launch')
         counts_before = {
             table: int(
                 manager.store.connection.execute(
@@ -1276,7 +1272,7 @@ class ManagerContractTests(unittest.TestCase):
             "c_nightrain_pgr_daily_73912",
         )
         self.assertEqual(profiles["ok_ww"]["which_to_farm"], "Simulation Challenge")
-        self.assertNotIn("additional_tasks", profiles["ok_ww"])
+        self.assertEqual(profiles["ok_ww"]["additional_tasks"], [])
         self.assertEqual(profiles["zzz_one_dragon"]["weekly_app_ids"], ["ridu_weekly"])
         self.assertEqual(profiles["endfield"]["stamina_stage"], "干员经验")
         self.assertEqual(profiles["endfield"]["stamina_rotation"], ["干员经验", "超距辉映管"])
@@ -1289,7 +1285,7 @@ class ManagerContractTests(unittest.TestCase):
             "/api/v1/config",
             json={
                 "dailyToolProfiles": {
-                    "okWw": {"additionalTasks": ["Check Weekly Garden"]}
+                    "okWw": {"additionalTasks": ["Buy Astrite"]}
                 }
             },
             headers=self.mutation_headers("config-daily-tool-profiles-unsafe-ww"),
@@ -2031,7 +2027,7 @@ class ManagerContractTests(unittest.TestCase):
         resume = self.client.post(
             f"/api/v1/game-runs/{run_id}/resume-requests",
             json={"reason": "must remain disabled"},
-            headers=self.mutation_headers("domain-resume-disabled"),
+            headers=self.mutation_headers('domain-resume-disabled', actor='agent-launch'),
         )
         self.assertEqual(resume.status_code, 202, resume.text)
         self.assertFalse(
@@ -2179,7 +2175,7 @@ class ManagerContractTests(unittest.TestCase):
                     "weeklyId": weekly[0]["weeklyId"],
                 },
             },
-            headers=self.mutation_headers("domain-weekly-disabled"),
+            headers=self.mutation_headers('domain-weekly-disabled', actor='scheduler'),
         )
         self.assertEqual(disabled_weekly.status_code, 409, disabled_weekly.text)
 

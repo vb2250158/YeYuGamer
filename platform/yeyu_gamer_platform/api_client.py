@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import socket
@@ -802,6 +803,38 @@ class ManagerApiClient:
 
     def games(self) -> Any:
         return self._request("GET", "games")
+
+    def todo_instances(self, *, game_id: str | None = None, account_id: str | None = None) -> JsonObject:
+        from urllib.parse import urlencode
+        filters = {"limit": "500", "current": "true"}
+        if game_id is not None:
+            filters["gameId"] = game_id
+        if account_id is not None:
+            filters["accountId"] = account_id
+        return self._object(self._request("GET", "todo-instances?" + urlencode(filters)), resource="todo instances")
+
+    def game_runs(self, *, limit: int = 100) -> JsonObject:
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        return self._object(self._request("GET", f"game-runs?limit={limit}"), resource="game runs")
+
+    def upload_todo_screenshot(
+        self, todo_instance_id: str, screenshot_path: str | Path, *, note: str,
+        idempotency_key: str, expected_state_version: int | None = None,
+    ) -> CommandAccepted:
+        todo_instance_id = _opaque_id(todo_instance_id, name="todo_instance_id")
+        screenshot = Path(screenshot_path)
+        with screenshot.open("rb") as stream:
+            content = stream.read(8 * 1024 * 1024 + 1)
+        if not content or len(content) > 8 * 1024 * 1024:
+            raise ValueError("Screenshot must be at most 8 MiB")
+        payload = self._request(
+            "POST", f"todo-instances/{todo_instance_id}/evidence-uploads",
+            body={"fileName": screenshot.name, "contentBase64": base64.b64encode(content).decode("ascii"), "note": note},
+            idempotency_key=idempotency_key,
+            expected_state_version=self._resolve_expected_state_version(expected_state_version),
+        )
+        return CommandAccepted.from_payload(self._object(payload, resource="screenshot upload"))
 
     def create_daily_batch(
         self,

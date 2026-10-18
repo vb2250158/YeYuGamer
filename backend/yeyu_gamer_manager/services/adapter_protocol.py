@@ -14,6 +14,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Sequence
 
 
+from ..domain.artifact_limits import MAX_ARTIFACTS_PER_TODO
+from .completion_contract import UPSTREAM_RESULT_CODES
+
+
 PROTOCOL_VERSION = "1.1"
 SCHEMA_VERSION = 1
 EXECUTION_PACKAGE_SCHEMA_VERSION = 2
@@ -25,7 +29,6 @@ MAX_EVENT_BYTES = 64 * 1024
 MAX_STDERR_BYTES = 8 * 1024
 MAX_TODOS_PER_REQUEST = 64
 MAX_ARTIFACT_BYTES = 20 * 1024 * 1024
-MAX_ARTIFACTS_PER_TODO = 20
 MAX_RUN_ARTIFACT_BYTES = 256 * 1024 * 1024
 
 ALLOWED_GAME_IDS = frozenset(
@@ -648,6 +651,7 @@ class AdapterEvent:
     allowed_artifact_mime_types: tuple[str, ...]
     max_artifact_bytes: int
     max_artifacts_per_todo: int
+    step_capture_source: str = "manager"
 
 
 @dataclass(frozen=True)
@@ -664,6 +668,8 @@ class AdapterRunResult:
     protocol_valid: bool
     code: str
     message: str
+    # Manager-owned post-Host cleanup; never supplied by protocol events.
+    official_configuration_cleanup: dict[str, Any] | None = None
 
 
 class AdapterEventStream:
@@ -720,6 +726,7 @@ class AdapterEventStream:
         self.hello_seen = False
         self.run_terminal: Mapping[str, Any] | None = None
         self.started: dict[str, str] = {}
+        self.step_capture_sources: dict[str, str] = {}
         self.todo_terminals: dict[str, Mapping[str, Any]] = {}
         self.artifacts: dict[str, tuple[str, Mapping[str, Any]]] = {}
         self.artifact_counts_by_todo: dict[str, int] = {}
@@ -743,9 +750,13 @@ class AdapterEventStream:
                 },
                 set(),
             ),
+            "run_progress": (
+                {"operation", "code", "message", "metrics"},
+                set(),
+            ),
             "todo_attempt_started": (
                 {"todoInstanceId", "todoAttemptId", "attemptNo", "operation"},
-                set(),
+                {"stepCaptureSource"},
             ),
             "todo_progress": (
                 {"todoInstanceId", "todoAttemptId", "code"},
@@ -763,6 +774,11 @@ class AdapterEventStream:
                     "sha256",
                     "capturedAt",
                 },
+                set(),
+            ),
+            "run_artifact_staged": (
+                {"todoInstanceId", "artifactId", "kind", "fileName", "mimeType",
+                 "sizeBytes", "sha256", "capturedAt"},
                 set(),
             ),
             "todo_terminal": (
@@ -787,7 +803,7 @@ class AdapterEventStream:
                     "terminalEventDigest",
                     "exitCode",
                 },
-                set(),
+                {"startupHumanRequiredReason"},
             ),
         }
         if event_type not in fields_by_type:
@@ -831,8 +847,18 @@ class AdapterEventStream:
 
         if event_type == "hello":
             self._consume_hello(value)
+        elif event_type == "run_progress":
+            _identifier(value["operation"], field="operation")
+            _identifier(value["code"], field="code")
+            _text(value["message"], field="message", maximum=2048)
+            if not isinstance(value["metrics"], dict):
+                raise AdapterProtocolError("invalid_schema", "metrics must be an object")
         elif event_type == "todo_attempt_started":
+            capture_source = value.get("stepCaptureSource", "manager")
+            if capture_source not in ("manager", "adapter"):
+                raise AdapterProtocolError("invalid_schema", "stepCaptureSource is invalid")
             self._consume_started(value)
+            self.step_capture_sources[value["todoAttemptId"]] = capture_source
         elif event_type == "todo_progress":
             self._require_active_todo(value)
             _identifier(value["code"], field="code")
@@ -840,7 +866,7 @@ class AdapterEventStream:
                 _text(value["message"], field="message", maximum=2048)
             if "metrics" in value and not isinstance(value["metrics"], dict):
                 raise AdapterProtocolError("invalid_schema", "metrics must be an object")
-        elif event_type == "artifact_staged":
+        elif event_type in {"artifact_staged", "run_artifact_staged"}:
             self._consume_artifact(value)
         elif event_type == "todo_terminal":
             self._consume_todo_terminal(value)
@@ -857,6 +883,7 @@ class AdapterEventStream:
             ),
             max_artifact_bytes=self.max_artifact_bytes,
             max_artifacts_per_todo=self.max_artifacts_per_todo,
+            step_capture_source=self.step_capture_sources.get(value.get("todoAttemptId"), "manager"),
         )
 
     def _consume_hello(self, value: Mapping[str, Any]) -> None:
@@ -906,18 +933,12 @@ class AdapterEventStream:
         executable_order = tuple(self.plan.executable_todo_instance_ids)
         target_index = executable_order.index(target.todo_instance_id)
         if any(
-            self.todo_terminals.get(todo_id, {}).get("status")
-            in {
-                "failed",
-                "blocked",
-                "review_required",
-                "human_required",
-            }
+            self.todo_terminals.get(todo_id, {}).get("status") == "human_required"
             for todo_id in executable_order[:target_index]
         ):
             raise AdapterProtocolError(
                 "todo_after_blocking_predecessor",
-                "A downstream Todo cannot continue after an earlier Todo blocked the run",
+                "A downstream Todo cannot continue after an earlier Todo requires human control",
             )
         attempt_id = _canonical_uuid(value["todoAttemptId"], field="todoAttemptId")
         if self.started.get(target.todo_instance_id) != attempt_id:
@@ -938,18 +959,12 @@ class AdapterEventStream:
         blocking_predecessors = tuple(
             todo_id
             for todo_id in predecessors
-            if self.todo_terminals.get(todo_id, {}).get("status")
-            in {
-                "failed",
-                "blocked",
-                "review_required",
-                "human_required",
-            }
+            if self.todo_terminals.get(todo_id, {}).get("status") == "human_required"
         )
         if blocking_predecessors:
             raise AdapterProtocolError(
                 "todo_after_blocking_predecessor",
-                "A downstream Todo cannot start after an earlier Todo blocked the run",
+                "A downstream Todo cannot start after an earlier Todo requires human control",
             )
         attempt_id = _canonical_uuid(value["todoAttemptId"], field="todoAttemptId")
         attempt_no = _integer(
@@ -962,7 +977,8 @@ class AdapterEventStream:
         self.started[target.todo_instance_id] = attempt_id
 
     def _consume_artifact(self, value: Mapping[str, Any]) -> None:
-        target = self._require_active_todo(value)
+        run_scoped = value["eventType"] == "run_artifact_staged"
+        target = self._target(value) if run_scoped else self._require_active_todo(value)
         artifact_id = _canonical_uuid(value["artifactId"], field="artifactId")
         if artifact_id in self.artifacts:
             raise AdapterProtocolError("duplicate_artifact", "artifactId was reused")
@@ -973,10 +989,17 @@ class AdapterEventStream:
         mime = _text(value["mimeType"], field="mimeType", maximum=64)
         if mime not in self.allowed_artifact_mime_types:
             raise AdapterProtocolError("artifact_mime_denied", "mimeType is not allowed")
+        # An empty non-image artifact is legitimate: the official tools create
+        # their lifecycle log on first use, so a run that ends before any
+        # upstream output stages a 0-byte log. Demanding >= 1 byte aborted the
+        # whole stream as ``invalid_schema`` and destroyed the driver's own
+        # terminal (2026-09-23 ZZZ ``attach-home`` reported a deliberate
+        # ``review_required`` and was recorded as a protocol crash instead).
+        # Image kinds still need content: an empty frame is a failed capture.
         size_bytes = _integer(
             value["sizeBytes"],
             field="sizeBytes",
-            minimum=1,
+            minimum=1 if mime.startswith("image/") else 0,
             maximum=self.max_artifact_bytes,
         )
         digest = _text(value["sha256"], field="sha256", maximum=64)
@@ -1015,9 +1038,9 @@ class AdapterEventStream:
             field="evidenceArtifactIds",
             allow_empty=True,
             uuid_values=True,
-            maximum=20,
+            maximum=self.max_artifacts_per_todo,
         )
-        if status == "completed" and not evidence:
+        if status == "completed" and not evidence and value["reasonCode"] not in UPSTREAM_RESULT_CODES:
             raise AdapterProtocolError(
                 "completed_without_evidence", "completed requires fresh evidence"
             )
@@ -1035,6 +1058,10 @@ class AdapterEventStream:
             if artifact is None or artifact[0] != target.todo_instance_id:
                 raise AdapterProtocolError(
                     "evidence_scope_mismatch", "evidence is not staged for this Todo"
+                )
+            if artifact[1]["eventType"] == "run_artifact_staged":
+                raise AdapterProtocolError(
+                    "evidence_scope_mismatch", "integration diagnostics cannot prove a Todo result"
                 )
         self.todo_terminals[target.todo_instance_id] = value
 
@@ -1092,17 +1119,23 @@ class AdapterEventStream:
             raise AdapterProtocolError(
                 "run_summary_mismatch", "completed run still has unresolved Todos"
             )
-        if status != "completed" and not unresolved:
-            raise AdapterProtocolError(
-                "run_summary_mismatch", "non-completed run has no unresolved Todos"
-            )
+        # A root task can fail (for example while switching accounts) after
+        # every selected child returned. Preserve both facts independently.
         human_required = tuple(
             todo_id
             for todo_id in self.plan.executable_todo_instance_ids
             if self.todo_terminals.get(todo_id, {}).get("status")
             == "human_required"
         )
-        if status == "human_required" and not human_required:
+        startup_human_reason = value.get("startupHumanRequiredReason")
+        if startup_human_reason is not None:
+            _text(startup_human_reason, field="startupHumanRequiredReason", maximum=2048)
+            if status != "human_required" or attempted:
+                raise AdapterProtocolError(
+                    "run_summary_mismatch",
+                    "startup human requirement requires human_required before any Todo starts",
+                )
+        if status == "human_required" and not human_required and startup_human_reason is None:
             raise AdapterProtocolError(
                 "run_summary_mismatch",
                 "human_required run has no human_required Todo terminal",
@@ -1188,7 +1221,9 @@ class AdapterEventStream:
             protocol_valid=True,
             code="run_terminal",
             message=(
-                "Adapter run produced a validated terminal event"
+                str(self.run_terminal["startupHumanRequiredReason"])
+                if "startupHumanRequiredReason" in self.run_terminal
+                else "Adapter run produced a validated terminal event"
                 if declared_exit == 0
                 else f"Adapter run produced a validated terminal event with exit code {declared_exit}"
             ),
@@ -1276,6 +1311,15 @@ class ExecutionPackageManifest:
                 "operation_not_promoted", "Todo operation has no promoted binding"
             ) from error
         return binding
+
+
+def _is_execution_package_inventory_file(path: Path) -> bool:
+    """Declared package files only. Interpreter bytecode is not inventory."""
+    if not path.is_file():
+        return False
+    if path.suffix in {".pyc", ".pyo"}:
+        return False
+    return "__pycache__" not in path.parts
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -1562,7 +1606,7 @@ def _verify_execution_package(
     actual_files = {
         item.relative_to(root).as_posix()
         for item in root.rglob("*")
-        if item.is_file()
+        if _is_execution_package_inventory_file(item)
     }
     actual_entries = list(root.rglob("*"))
     if any(_is_reparse_point(item) for item in actual_entries):
@@ -1848,6 +1892,10 @@ def validate_plan_against_manifest(
     maximum_plan_seconds = 0
     for target in plan.todos:
         binding = manifest.binding_for(plan.game_id, target.operation)
+        if target.operation in plan.observation_only_operations:
+            capability = STATUS_INSPECTION_REFS.get(plan.game_id, {}).get(target.operation)
+            if not capability or capability not in binding.adapter_capability_refs:
+                raise AdapterProtocolError('capability_not_promoted', 'Readonly inspection is not promoted for this game')
         maximum_plan_seconds += binding.timeout_seconds
         if binding.risk != target.risk:
             raise AdapterProtocolError(

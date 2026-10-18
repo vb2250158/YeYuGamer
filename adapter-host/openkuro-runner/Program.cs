@@ -1,19 +1,16 @@
 using System;
+using System.Reflection;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Drawing;
-using System.Drawing.Drawing2D;
-using System.Drawing.Imaging;
+using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Web.Script.Serialization;
-using System.Windows.Automation;
 
 namespace YeYuGamer.LocalDailyAdapter
 {
@@ -28,44 +25,6 @@ namespace YeYuGamer.LocalDailyAdapter
             Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
         private const string PackageId = "legacy-night-rain-gamer";
         private const string ProtocolVersion = "1.1";
-        private const int SwMaximize = 3;
-        private const int SwShow = 5;
-        private const uint MouseLeftDown = 0x0002;
-        private const uint MouseLeftUp = 0x0004;
-        private static readonly Dictionary<IntPtr, int> Gf2FormalStartClicks = new Dictionary<IntPtr, int>();
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct NativeRect
-        {
-            public int Left;
-            public int Top;
-            public int Right;
-            public int Bottom;
-        }
-
-        [DllImport("user32.dll")]
-        private static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
-
-        [DllImport("user32.dll")]
-        private static extern bool GetClientRect(IntPtr hWnd, out NativeRect rect);
-
-        [DllImport("user32.dll")]
-        private static extern bool GetWindowRect(IntPtr hWnd, out NativeRect rect);
-
-        [DllImport("user32.dll")]
-        private static extern bool IsWindowVisible(IntPtr hWnd);
-
-        [DllImport("user32.dll")]
-        private static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint flags);
-
-        [DllImport("user32.dll")]
-        private static extern bool SetForegroundWindow(IntPtr hWnd);
-
-        [DllImport("user32.dll")]
-        private static extern bool SetCursorPos(int x, int y);
-
-        [DllImport("user32.dll")]
-        private static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
 
         private sealed class Binding
         {
@@ -77,20 +36,177 @@ namespace YeYuGamer.LocalDailyAdapter
             public string Arguments;
             public string DailyConfig;
             public IDictionary<string, object> DailyTaskProfile;
+            public bool Gf2SupplyRewardChoiceSupported;
+            public bool Gf2RewardInspectionSupported;
+            public bool Gf2RewardInspectionOnly;
             public string UpdateState;
             public string InnerPython;
             public string InnerEntry;
             public string AppName;
+            public bool WwInspectionSupported;
+            public bool WwInspectionOnly;
+            public bool WwRewardInspectionSupported;
+            public bool WwRewardInspectionOnly;
+            public bool WwBattlePassInspectionSupported;
+            public bool WwBattlePassInspectionOnly;
+            public HashSet<string> WwInspectionOperations;
+            public bool EndfieldRewardInspectionSupported;
+            public bool EndfieldRewardInspectionOnly;
             public string AccountId = "default";
             public IDictionary<string, object> AccountSnapshot;
             public string AccountOperation;
-            public bool AccountVerified;
-            public bool AccountHumanRequired;
-            public bool? AccountAutoStartBefore;
             public bool AccountEnabled { get { return AccountSnapshot != null && AccountSnapshot.Count != 0; } }
+            public string SavedAccountLabel {
+                get {
+                    if (AccountSnapshot == null) return String.Empty;
+                    return AccountSnapshot.ContainsKey("saved_account_label") ? AccountSnapshot["saved_account_label"] as string : String.Empty;
+                }
+            }
         }
-        private sealed class AccountBridgeGate : Exception {
-            public AccountBridgeGate(string reason) : base(reason) { }
+
+        private sealed class ConfigSnapshot {
+            public string Path;
+            public byte[] Content;
+            public bool Existed;
+        }
+
+        private static bool IsEndfieldSplitConfig(Binding binding) {
+            return binding.GameId == "Endfield" && !String.IsNullOrEmpty(binding.WorkingDirectory) &&
+                File.Exists(Path.Combine(binding.WorkingDirectory, "src", "tasks", "daily", "daily_feature.py"));
+        }
+
+        private static readonly string[] EndfieldTaskGroupKeys = {
+            "帝江号任务", "其他任务", "战斗任务", "奖励任务", "自动送货任务", "收尾任务"
+        };
+
+        private static void ApplyEndfieldTaskGroups(Binding binding, HashSet<string> selected, IDictionary<string, object> config) {
+            string source = Path.Combine(binding.WorkingDirectory ?? String.Empty, "src", "tasks", "onetime", "DailyTask.py");
+            if (!File.Exists(source)) return;
+            string schema = File.ReadAllText(source, Encoding.UTF8);
+            if (!schema.Contains("CFG_BOAT_TASKS = \"帝江号任务\"") ||
+                !schema.Contains("CFG_REWARD_TASKS = \"奖励任务\"")) return;
+            // Official v1.1.9 predicates read these persisted lists before
+            // legacy bool switches. Project only the frozen operation scope;
+            // all execution order and subtask parameters remain official.
+            config["帝江号任务"] = selected.Contains("dijiang-harvest") ? new[] { "帝江号收菜" } : new string[0];
+            var other = new List<string>();
+            if (selected.Contains("mail")) other.Add("收邮件");
+            if (selected.Contains("delivery-commission")) other.Add("转交运送委托");
+            if (selected.Contains("collect-credit")) other.Add("收信用");
+            config["其他任务"] = other;
+            config["战斗任务"] = selected.Contains("spend-sanity") ? new[] { "刷体力" } : new string[0];
+            config["奖励任务"] = selected.Contains("claim-daily-reward") ? new[] { "日常奖励" } : new string[0];
+            config["自动送货任务"] = new string[0];
+            config["收尾任务"] = new string[0];
+        }
+
+        private static List<ConfigSnapshot> SnapshotEndfieldSplitConfig(Binding binding) {
+            var snapshots = new List<ConfigSnapshot>();
+            if (!IsEndfieldSplitConfig(binding)) return snapshots;
+            string directory = Path.GetDirectoryName(binding.DailyConfig);
+            string marker = Path.Combine(directory, "_daily_split_migrations.json");
+            var state = File.Exists(marker) ? Json.DeserializeObject(File.ReadAllText(marker, Encoding.UTF8)) as IDictionary<string, object> : null;
+            object raw;
+            var completed = state != null && state.TryGetValue("completed_batches", out raw) ? raw as IEnumerable : null;
+            var batches = new HashSet<string>(completed == null ? new string[0] : completed.Cast<object>().OfType<string>(), StringComparer.Ordinal);
+            if (!new[] { "daily_split_pilot_v1", "daily_split_v2", "daily_split_v3" }.All(batches.Contains))
+                throw new InvalidOperationException("endfield_official_config_migration_required");
+            // The official migration must finish in the isolated candidate
+            // before temporary scope values can be imported as user settings.
+            foreach (string name in new[] { "DailyBattleTask", "BoatOrganizeTask", "BoatHarvestTask", "RegionalBuildTask", "ActivityRewardTask", "account_scoped_overrides" }) {
+                string path = Path.Combine(directory, name + ".json");
+                RestorePendingDailyConfig(new Binding { Executable = binding.Executable, DailyConfig = path });
+                bool existed = File.Exists(path);
+                snapshots.Add(new ConfigSnapshot { Path = path, Existed = existed, Content = existed ? File.ReadAllBytes(path) : null });
+            }
+            // Make recovery durable before the first projected write. A tool
+            // crash or adapter termination cannot discard the original bytes.
+            foreach (ConfigSnapshot snapshot in snapshots)
+                PreserveDailyConfigForRecovery(snapshot.Path, snapshot.Content, snapshot.Existed);
+            return snapshots;
+        }
+
+        private static void RestoreEndfieldSplitConfig(List<ConfigSnapshot> snapshots, bool stopped) {
+            var failures = new List<Exception>();
+            foreach (ConfigSnapshot snapshot in snapshots) {
+                try {
+                    if (stopped) {
+                        RestoreOrPreserveDailyConfig(snapshot.Path, snapshot.Content, snapshot.Existed);
+                        File.Delete(snapshot.Path + ".yeyu-restore-pending");
+                    } else PreserveDailyConfigForRecovery(snapshot.Path, snapshot.Content, snapshot.Existed);
+                } catch (Exception error) { failures.Add(error); }
+            }
+            if (failures.Count != 0) throw new AggregateException("endfield_split_config_restore_failed", failures);
+        }
+
+        private static Dictionary<string, IDictionary<string, object>> EndfieldSplitOverrides(HashSet<string> selected) {
+            var maps = new Dictionary<string, IDictionary<string, object>>(StringComparer.Ordinal) {
+                { "BoatOrganizeTask", new Dictionary<string, object> { { "⭐帝江号一键存放", false }, { "⭐简易制作", false } } },
+                { "RegionalBuildTask", new Dictionary<string, object> { { "⭐地区建设", new string[0] } } },
+                { "ActivityRewardTask", new Dictionary<string, object> { { "⭐活动奖励", new string[0] } } },
+                { "BoatHarvestTask", new Dictionary<string, object>() }
+            };
+            if (!selected.Contains("dijiang-harvest")) maps["BoatHarvestTask"]["⭐帝江号收菜"] = new string[0];
+            return maps;
+        }
+
+        private static void WriteConfigDocument(string path, IDictionary<string, object> config) {
+            string temporary = path + ".yeyu." + Guid.NewGuid().ToString("N") + ".tmp";
+            try {
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                File.WriteAllText(temporary, Json.Serialize(config), new UTF8Encoding(false));
+                if (File.Exists(path)) ReplaceConfigFile(temporary, path);
+                else File.Move(temporary, path);
+            } finally { if (File.Exists(temporary)) File.Delete(temporary); }
+        }
+
+        private static void ReplaceConfigFile(string temporary, string path) {
+            // A short Windows file lock must not break scope projection. Keep
+            // replacement atomic; never delete/truncate the user's destination.
+            for (int attempt = 0; ; attempt++) {
+                try { File.Replace(temporary, path, null); return; }
+                catch (IOException error) {
+                    int code = error.HResult & 0xffff;
+                    if (attempt >= 5 || (code != 32 && code != 33 && code != 1175) ||
+                        !File.Exists(temporary) || !File.Exists(path)) throw;
+                    Thread.Sleep(100);
+                }
+            }
+        }
+
+        private static void ApplyEndfieldSplitConfig(Binding binding, HashSet<string> selected, IDictionary<string, object> daily) {
+            if (!IsEndfieldSplitConfig(binding)) return;
+            string directory = Path.GetDirectoryName(binding.DailyConfig);
+            var maps = EndfieldSplitOverrides(selected);
+            foreach (var entry in maps) {
+                if (entry.Value.Count == 0) continue;
+                string path = Path.Combine(directory, entry.Key + ".json");
+                var config = File.Exists(path) ? Json.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as IDictionary<string, object> : new Dictionary<string, object>();
+                if (config == null) throw new InvalidOperationException("endfield_split_config_invalid");
+                foreach (var item in entry.Value) config[item.Key] = item.Value;
+                WriteConfigDocument(path, config);
+            }
+            string accountPath = Path.Combine(directory, "account_scoped_overrides.json");
+            if (!File.Exists(accountPath)) return;
+            var store = Json.DeserializeObject(File.ReadAllText(accountPath, Encoding.UTF8)) as IDictionary<string, object>;
+            object raw;
+            var accounts = store != null && store.TryGetValue("accounts", out raw) ? raw as IDictionary<string, object> : null;
+            if (accounts == null) throw new InvalidOperationException("endfield_account_scope_invalid");
+            maps["DailyTask"] = daily.Where(item => (item.Key.StartsWith("⭐", StringComparison.Ordinal) || EndfieldTaskGroupKeys.Contains(item.Key)) &&
+                (item.Key != "⭐帝江号收菜" || !selected.Contains("dijiang-harvest"))).ToDictionary(item => item.Key, item => item.Value);
+            foreach (object value in accounts.Values) {
+                var tasks = value as IDictionary<string, object>;
+                if (tasks == null) throw new InvalidOperationException("endfield_account_scope_invalid");
+                foreach (var entry in maps) {
+                    if (entry.Value.Count == 0) continue;
+                    object segment;
+                    var overrides = tasks.TryGetValue(entry.Key, out segment) ? segment as IDictionary<string, object> : new Dictionary<string, object>();
+                    if (overrides == null) throw new InvalidOperationException("endfield_account_scope_invalid");
+                    foreach (var item in entry.Value) overrides[item.Key] = item.Value;
+                    tasks[entry.Key] = overrides;
+                }
+            }
+            WriteConfigDocument(accountPath, store);
         }
 
         public static int Main(string[] args)
@@ -131,6 +247,8 @@ namespace YeYuGamer.LocalDailyAdapter
             var todosByOperation = new Dictionary<string, Tuple<string, IDictionary<string, object>>>(StringComparer.Ordinal);
             var terminal = new HashSet<string>(StringComparer.Ordinal);
             var completed = new HashSet<string>(StringComparer.Ordinal);
+            var failedTodos = new HashSet<string>(StringComparer.Ordinal);
+            bool upstreamDailyFailed = false;
             for (int index = 0; index < ids.Length; index++) {
                 string id = ids[index] as string;
                 IDictionary<string, object> todo = todos[index] as IDictionary<string, object>;
@@ -162,71 +280,48 @@ namespace YeYuGamer.LocalDailyAdapter
                 if (!todosByOperation.TryGetValue(operation, out target) || attempted.Contains(target.Item1)) return;
                 attempted.Add(target.Item1);
                 Emit(Base(request, binding.GameId, "todo_attempt_started", sequence++, new Dictionary<string, object> {
-                    { "todoInstanceId", target.Item1 }, { "todoAttemptId", attempts[target.Item1] }, { "attemptNo", AttemptNumber(target.Item2) }, { "operation", operation }
+                    { "todoInstanceId", target.Item1 }, { "todoAttemptId", attempts[target.Item1] }, { "attemptNo", AttemptNumber(target.Item2) }, { "operation", operation },
+                    { "stepCaptureSource", "adapter" }
                 }));
             };
-            var wwCaptureEvidence = new Dictionary<string, List<Tuple<string, string, bool, string>>>(StringComparer.Ordinal);
-            var wwCaptureErrors = new Dictionary<string, string>(StringComparer.Ordinal);
-            var accountArtifacts = new Dictionary<string, List<string>>(StringComparer.Ordinal);
-            var accountCapturePhases = new HashSet<string>(StringComparer.Ordinal);
-            Action<string, string, string> captureAccount = (operation, state, stageDetail) => {
-                Tuple<string, IDictionary<string, object>> target;
-                if (!binding.AccountEnabled || !todosByOperation.TryGetValue(operation, out target) || terminal.Contains(target.Item1)) return;
-                if (!accountCapturePhases.Add(state)) throw new AccountBridgeGate("ww_account_duplicate_capture_phase");
-                startTodo(operation);
-                string name; string marked; string at; string captureDetail;
-                bool captured = CaptureWwRewardEvidence(binding, staging, state, false, out name, out marked, out at, out captureDetail);
-                if (!captured) throw new AccountBridgeGate("ww_account_evidence_capture_failed");
-                string artifactId = Guid.NewGuid().ToString();
-                string imagePath = Path.Combine(staging, name);
-                Emit(Base(request, binding.GameId, "artifact_staged", sequence++, new Dictionary<string, object> {
-                    { "todoInstanceId", target.Item1 }, { "todoAttemptId", attempts[target.Item1] }, { "artifactId", artifactId },
-                    { "kind", "game-ui-account-switch" }, { "fileName", name }, { "mimeType", "image/png" },
-                    { "sizeBytes", new FileInfo(imagePath).Length }, { "sha256", Hash(imagePath) }, { "capturedAt", at }
-                }));
-                if (!accountArtifacts.ContainsKey(operation)) accountArtifacts[operation] = new List<string>();
-                accountArtifacts[operation].Add(artifactId);
-            };
-            int wwDailyActivityPoints = -1;
-            Action<string, string, string> captureWwEvidence = (operation, phase, stageDetail) => {
-                if (binding.GameId != "WW" || operation != "claim-daily-reward") return;
-                if (phase == "before") {
-                    const string marker = "daily_activity_points=";
-                    int markerIndex = (stageDetail ?? String.Empty).IndexOf(marker, StringComparison.Ordinal);
-                    int parsedPoints;
-                    if (markerIndex >= 0) {
-                        string value = (stageDetail ?? String.Empty).Substring(markerIndex + marker.Length);
-                        int separator = value.IndexOf(';');
-                        if (separator >= 0) value = value.Substring(0, separator);
-                        if (Int32.TryParse(value.Trim(), out parsedPoints)) wwDailyActivityPoints = parsedPoints;
-                    }
-                }
-                string captureKey = operation + ":" + phase;
-                if (wwCaptureEvidence.ContainsKey(captureKey) || wwCaptureErrors.ContainsKey(captureKey)) return;
-                string rawName; string watermarkedName; string capturedAt; string captureDetail;
-                bool afterClaim = phase == "after";
-                if (CaptureWwRewardEvidence(binding, staging, phase, afterClaim,
-                        out rawName, out watermarkedName, out capturedAt, out captureDetail)) {
-                    var captured = new List<Tuple<string, string, bool, string>> {
-                        Tuple.Create(
-                            rawName,
-                            afterClaim ? "game-ui-daily-reward-raw" : "game-ui-daily-reward-before",
-                            true,
-                            capturedAt)
-                    };
-                    if (afterClaim) {
-                        captured.Add(Tuple.Create(
-                            watermarkedName,
-                            "game-ui-daily-reward-watermarked",
-                            false,
-                            capturedAt));
-                    }
-                    wwCaptureEvidence[captureKey] = captured;
-                } else {
-                    wwCaptureErrors[captureKey] = captureDetail;
-                }
-            };
-            Action<string, string, string> terminalTodo = (operation, state, stageDetail) => {
+            var wwSidecarStepEvidence = new Dictionary<string, List<Tuple<string, string, string>>>(StringComparer.Ordinal);
+            var pendingTerminals = new List<Tuple<string, string, string>>();
+            var pendingTerminalOperations = new HashSet<string>(StringComparer.Ordinal);
+            bool toolFinished = false;
+            bool humanChoiceRequired = false;
+            var stagedUpstreamLogs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var pendingUntaggedStages = new List<Tuple<string, string, string>>();
+            string officialCurrentAccount = String.Empty;
+            bool wwUnattributedStartupPublished = false;
+            string observationFile = Environment.GetEnvironmentVariable("YEYU_GAMER_WW_MULTI_OBSERVATION_FILE");
+            string observationMode = Environment.GetEnvironmentVariable("YEYU_GAMER_WW_MULTI_OBSERVATION_MODE");
+            binding.WwInspectionOnly = binding.GameId == "WW" && WwShouldUseInspection(
+                todosByOperation.Keys, RequestedSelection(request), binding.WwInspectionSupported);
+            binding.WwRewardInspectionOnly = binding.GameId == "WW" && WwShouldUseRewardInspection(
+                todosByOperation.Keys, binding.WwRewardInspectionSupported);
+            binding.WwBattlePassInspectionOnly = binding.GameId == "WW" && WwShouldUseBattlePassInspection(
+                todosByOperation.Keys, binding.WwBattlePassInspectionSupported);
+            var wwInspectionGroups = WwInspectionGroups(binding, todosByOperation.Keys.ToArray());
+            binding.WwInspectionOperations = new HashSet<string>(
+                wwInspectionGroups.SelectMany(group => group).Where(operation => operation != "attach-world"),
+                StringComparer.Ordinal);
+            binding.EndfieldRewardInspectionOnly = binding.GameId == "Endfield" && EndfieldShouldUseRewardInspection(
+                binding.GameId, binding.AccountId, todosByOperation.Keys, request, binding.EndfieldRewardInspectionSupported);
+            if (binding.EndfieldRewardInspectionOnly) {
+                binding.Arguments = "\"" + binding.InnerEntry + "\" --task 32 --exit";
+                binding.DailyConfig = Path.Combine(binding.WorkingDirectory, "configs", "RewardStatusInspectionTask.json");
+            }
+            binding.Gf2RewardInspectionOnly = binding.GameId == "GF2" && Gf2ShouldUseRewardInspection(
+                binding.AccountId, todosByOperation.Keys, request, binding.Gf2RewardInspectionSupported);
+            if (binding.Gf2RewardInspectionOnly) {
+                binding.Arguments = "\"" + binding.InnerEntry + "\" --task 7 --exit";
+                binding.DailyConfig = Path.Combine(binding.WorkingDirectory, "configs", "RewardStatusInspectionTask.json");
+            }
+            if (binding.WwInspectionOnly || binding.WwRewardInspectionOnly || binding.WwBattlePassInspectionOnly || wwInspectionGroups.Count > 1) observationMode = String.Empty;
+            bool wwObservationWrite = binding.GameId == "WW" && String.Equals(observationMode, "write", StringComparison.Ordinal);
+            bool wwObservationRead = binding.GameId == "WW" && String.Equals(observationMode, "read", StringComparison.Ordinal);
+            bool wwLiveToolStarted = false;
+            Action<string, string, string> emitTerminalTodo = (operation, state, stageDetail) => {
                 Tuple<string, IDictionary<string, object>> target;
                 if (!todosByOperation.TryGetValue(operation, out target) || terminal.Contains(target.Item1)) return;
                 // A launcher/update failure is not an attempt of every daily
@@ -239,48 +334,22 @@ namespace YeYuGamer.LocalDailyAdapter
                 string id = target.Item1;
                 string attemptId = attempts[id];
                 var evidenceArtifactIds = new List<string>();
-                if (accountArtifacts.ContainsKey(operation)) evidenceArtifactIds.AddRange(accountArtifacts[operation]);
-                if (binding.GameId == "WW" && operation == "claim-daily-reward") {
-                    List<Tuple<string, string, bool, string>> beforeEvidence;
-                    List<Tuple<string, string, bool, string>> afterEvidence;
-                    bool hasBefore = wwCaptureEvidence.TryGetValue(operation + ":before", out beforeEvidence);
-                    bool hasAfter = wwCaptureEvidence.TryGetValue(operation + ":after", out afterEvidence);
-                    foreach (List<Tuple<string, string, bool, string>> captureSet in
-                        new[] { beforeEvidence, afterEvidence }.Where(value => value != null)) {
-                        foreach (Tuple<string, string, bool, string> artifact in captureSet) {
-                            string imagePath = Path.Combine(staging, artifact.Item1);
-                            string imageArtifactId = Guid.NewGuid().ToString();
-                            Emit(Base(request, binding.GameId, "artifact_staged", sequence++, new Dictionary<string, object> {
-                                { "todoInstanceId", id }, { "todoAttemptId", attemptId }, { "artifactId", imageArtifactId },
-                                { "kind", artifact.Item2 }, { "fileName", artifact.Item1 }, { "mimeType", "image/png" },
-                                { "sizeBytes", new FileInfo(imagePath).Length }, { "sha256", Hash(imagePath) }, { "capturedAt", artifact.Item4 }
-                            }));
-                            evidenceArtifactIds.Add(imageArtifactId);
-                        }
-                    }
-                    if (state == "completed" && hasBefore && hasAfter && wwDailyActivityPoints >= 100) {
-                        string pointsName = "ww-daily-activity-100-" + Guid.NewGuid().ToString("N") + ".txt";
-                        string pointsPath = Path.Combine(staging, pointsName);
-                        File.WriteAllText(pointsPath, "dailyActivityPoints=" + wwDailyActivityPoints, new UTF8Encoding(false));
-                        string pointsArtifactId = Guid.NewGuid().ToString();
+                List<Tuple<string, string, string>> sidecarEvidence;
+                if (binding.GameId == "WW" && wwSidecarStepEvidence.TryGetValue(operation, out sidecarEvidence)) {
+                    foreach (Tuple<string, string, string> artifact in sidecarEvidence) {
+                        string imagePath = Path.Combine(staging, artifact.Item1);
+                        if (!File.Exists(imagePath)) continue;
+                        if (artifact.Item2 == "game-ui-key-step-verification-raw")
+                            WriteWwInspectionScope(binding, request, id, attemptId, imagePath, artifact.Item3);
+                        if (artifact.Item2 == "game-ui-reward-verification-raw")
+                            WriteWwVerificationScope(binding, request, id, attemptId, imagePath, artifact.Item3, operation);
+                        string imageArtifactId = Guid.NewGuid().ToString();
                         Emit(Base(request, binding.GameId, "artifact_staged", sequence++, new Dictionary<string, object> {
-                            { "todoInstanceId", id }, { "todoAttemptId", attemptId }, { "artifactId", pointsArtifactId },
-                            { "kind", "game-ui-daily-activity-100" }, { "fileName", pointsName }, { "mimeType", "text/plain" },
-                            { "sizeBytes", new FileInfo(pointsPath).Length }, { "sha256", Hash(pointsPath) }, { "capturedAt", DateTime.UtcNow.ToString("o") }
+                            { "todoInstanceId", id }, { "todoAttemptId", attemptId }, { "artifactId", imageArtifactId },
+                            { "kind", artifact.Item2 }, { "fileName", artifact.Item1 }, { "mimeType", StepArtifactMimeType(artifact.Item2) },
+                            { "sizeBytes", new FileInfo(imagePath).Length }, { "sha256", Hash(imagePath) }, { "capturedAt", artifact.Item3 }
                         }));
-                        evidenceArtifactIds.Add(pointsArtifactId);
-                        safeStageDetail += "; dailyActivityPoints=" + wwDailyActivityPoints
-                            + "; completionScreenshot=before+after-raw+after-watermarked";
-                    } else if (state == "completed") {
-                        state = "failed";
-                        string beforeError;
-                        string afterError;
-                        wwCaptureErrors.TryGetValue(operation + ":before", out beforeError);
-                        wwCaptureErrors.TryGetValue(operation + ":after", out afterError);
-                        safeStageDetail += "; completion_contract_failed: dailyActivityPoints="
-                            + wwDailyActivityPoints + "; before="
-                            + (hasBefore ? "ok" : (beforeError ?? "missing"))
-                            + "; after=" + (hasAfter ? "ok" : (afterError ?? "missing"));
+                        evidenceArtifactIds.Add(imageArtifactId);
                     }
                 }
                 string name = binding.GameId.ToLowerInvariant() + "-daily-" + Guid.NewGuid().ToString("N") + ".txt";
@@ -306,10 +375,33 @@ namespace YeYuGamer.LocalDailyAdapter
                     { "fileName", name }, { "mimeType", "text/plain" }, { "sizeBytes", new FileInfo(path).Length }, { "sha256", Hash(path) }, { "capturedAt", DateTime.UtcNow.ToString("o") }
                 }));
                 evidenceArtifactIds.Add(artifactId);
+                // Normal terminals are flushed after process exit, so one
+                // immutable snapshot includes the final upstream log tail.
+                // A human-required stop retains the log available at the stop.
+                string[] upstreamLogs = Directory.GetFiles(staging, binding.GameId.ToLowerInvariant() + "-upstream-*.jsonl");
+                foreach (string upstreamLog in upstreamLogs.Where(value => !Path.GetFileName(value).Contains("-snapshot-") && !stagedUpstreamLogs.Contains(value))) {
+                    FileInfo upstreamInfo = new FileInfo(upstreamLog);
+                    if (upstreamInfo.Length != 0) {
+                        string snapshotName = binding.GameId.ToLowerInvariant() + "-upstream-snapshot-" + Guid.NewGuid().ToString("N") + ".jsonl";
+                        string snapshotPath = Path.Combine(staging, snapshotName);
+                        File.Copy(upstreamLog, snapshotPath, true);
+                        FileInfo snapshotInfo = new FileInfo(snapshotPath);
+                        stagedUpstreamLogs.Add(upstreamLog);
+                        string upstreamArtifactId = Guid.NewGuid().ToString();
+                        Emit(Base(request, binding.GameId, "artifact_staged", sequence++, new Dictionary<string, object> {
+                            { "todoInstanceId", id }, { "todoAttemptId", attemptId }, { "artifactId", upstreamArtifactId },
+                            { "kind", "tool-log-upstream" }, { "fileName", snapshotName }, { "mimeType", "text/plain" },
+                            { "sizeBytes", snapshotInfo.Length }, { "sha256", Hash(snapshotPath) }, { "capturedAt", upstreamInfo.LastWriteTimeUtc.ToString("o") }
+                        }));
+                        evidenceArtifactIds.Add(upstreamArtifactId);
+                    }
+                }
                 bool failed = state == "failed";
                 bool skipped = state == "skipped";
                 bool completedStage = state == "completed";
                 bool humanRequired = state == "human_required";
+                bool unsupported = state == "unsupported";
+                bool uncertain = state == "uncertain";
                 // A clean process exit is transport evidence only. Every
                 // supported upstream tool must emit a structured stage event
                 // before a selected Todo can be considered completed.
@@ -317,8 +409,8 @@ namespace YeYuGamer.LocalDailyAdapter
                 // selected conditional daily.  Preserve the upstream reason
                 // and artifact, but do not leave the current-day obligation
                 // permanently skipped/deferred.
-                string terminalStatus = humanRequired ? "human_required" : failed ? "failed" : (skipped || completedStage) ? "completed" : "review_required";
-                string reasonCode = humanRequired ? TypedFailureReason(safeStageDetail, "ww_account_human_required") : failed ? TypedFailureReason(safeStageDetail, "upstream_stage_failed") : skipped ? "upstream_stage_not_needed" : completedStage ? "upstream_stage_completed" : "upstream_stage_unverified";
+                string terminalStatus = humanRequired ? "human_required" : unsupported ? "review_required" : failed ? "failed" : (skipped || completedStage) ? "completed" : "review_required";
+                string reasonCode = humanRequired ? TypedFailureReason(safeStageDetail, "ww_account_human_required") : unsupported ? (binding.GameId == "WW" ? "ww_account_switch_unsupported" : "upstream_schema_migration_required") : uncertain ? "upstream_result_uncertain" : failed ? TypedFailureReason(safeStageDetail, "upstream_stage_failed") : skipped ? "upstream_task_skipped" : completedStage ? "upstream_task_succeeded" : "upstream_observation_missing";
                 Emit(Base(request, binding.GameId, "todo_terminal", sequence++, new Dictionary<string, object> {
                     { "todoInstanceId", id }, { "todoAttemptId", attemptId }, { "status", terminalStatus },
                     { "reasonCode", reasonCode },
@@ -326,11 +418,36 @@ namespace YeYuGamer.LocalDailyAdapter
                     // fresh full batch may retry the fixed GUI lifecycle from
                     // the beginning. Human-required outcomes are produced by
                     // the upstream stage bridge and remain non-retryable.
-                    { "reason", safeStageDetail }, { "retryable", !humanRequired && (failed || (!skipped && !completedStage)) }, { "evidenceArtifactIds", evidenceArtifactIds.ToArray() }
+                    { "reason", safeStageDetail }, { "retryable", !humanRequired && !unsupported && !uncertain && (failed || (!skipped && !completedStage)) }, { "evidenceArtifactIds", evidenceArtifactIds.ToArray() }
                 }));
                 terminal.Add(id);
                 if (terminalStatus == "completed") completed.Add(id);
+                if (terminalStatus == "failed") failedTodos.Add(id);
             };
+            // Keep terminal evidence open until the tool has finished writing
+            // its final logs. The task itself continues without waiting on us.
+            Action<string, string, string> terminalTodo = (operation, state, terminalDetail) => {
+                Tuple<string, IDictionary<string, object>> target;
+                if (!todosByOperation.TryGetValue(operation, out target) || !attempted.Contains(target.Item1) || terminal.Contains(target.Item1)) return;
+                if (!toolFinished && state != "human_required") {
+                    if (pendingTerminalOperations.Add(operation)) {
+                        if (state == "completed" || state == "failed" || state == "skipped")
+                            Emit(Base(request, binding.GameId, "todo_progress", sequence++, new Dictionary<string, object> {
+                                { "todoInstanceId", target.Item1 }, { "todoAttemptId", attempts[target.Item1] },
+                                { "code", "upstream_step_returned" },
+                                { "message", String.IsNullOrEmpty(terminalDetail) ? "Official step returned; collecting final tool logs." : terminalDetail.Substring(0, Math.Min(terminalDetail.Length, 2000)) },
+                                { "metrics", new Dictionary<string, object> {
+                                    { "officialStatus", state }, { "operation", operation },
+                                    { "waitingFor", "official tool exit and complete log collection" }
+                                } }
+                            }));
+                        pendingTerminals.Add(Tuple.Create(operation, state, terminalDetail));
+                    }
+                    return;
+                }
+                emitTerminalTodo(operation, state, terminalDetail);
+            };
+
             Action<string, string> progressTodo = (operation, stageDetail) => {
                 // Manager protocol: todo_progress = base fields + todoInstanceId,
                 // todoAttemptId, code (identifier) and optional message; it is
@@ -352,87 +469,326 @@ namespace YeYuGamer.LocalDailyAdapter
                     { "code", code }, { "message", message }
                 }));
             };
+            Action<string, string, string> ApplyWwStage = (operation, state, stageDetail) => {
+                if (operation == "upstream-daily-task") {
+                    upstreamDailyFailed |= state == "failed";
+                    if (binding.GameId == "Endfield") {
+                        Emit(Base(request, binding.GameId, "run_progress", sequence++, new Dictionary<string, object> {
+                            { "operation", operation }, { "code", "official_daily_status" },
+                            { "message", stageDetail.Substring(0, Math.Min(stageDetail.Length, 2000)) },
+                            { "metrics", new Dictionary<string, object> {
+                                { "officialStatus", state }, { "trigger", "Official DailyTask.run" },
+                                { "waitingFor", state == "started" ? "Official prerequisite or selected method result" : "Official tool exit and complete log collection" }
+                            } }
+                        }));
+                    }
+                    return;
+                }
+                if (state == "started") {
+                    Tuple<string, IDictionary<string, object>> target;
+                    bool newStep = todosByOperation.TryGetValue(operation, out target) && !attempted.Contains(target.Item1);
+                    startTodo(operation);
+                    if (binding.GameId == "Endfield" && newStep) {
+                        Emit(Base(request, binding.GameId, "todo_progress", sequence++, new Dictionary<string, object> {
+                            { "todoInstanceId", target.Item1 }, { "todoAttemptId", attempts[target.Item1] },
+                            { "code", "official_method_entered" }, { "message", stageDetail },
+                            { "metrics", new Dictionary<string, object> {
+                                { "trigger", "Manager selected this operation and official DailyTask entered its method" },
+                                { "waitingFor", "Official method return or exception" }
+                            } }
+                        }));
+                    }
+                }
+                else if (state == "progress") progressTodo(operation, stageDetail);
+                else if (state == "step_artifact") ImportWwSidecarArtifact(wwObservationRead ? observationFile : Path.Combine(staging, "stage.jsonl"), operation, state, stageDetail, wwSidecarStepEvidence);
+                else if (state == "skipped") {
+                    // The official condition may skip the task body before
+                    // a method-enter event exists. Record that decision,
+                    // without claiming the task body was executed.
+                    startTodo(operation);
+                    terminalTodo(operation, state, stageDetail);
+                }
+                else if (state == "human_required") {
+                    startTodo(operation);
+                    terminalTodo(operation, state, stageDetail);
+                    humanChoiceRequired = true;
+                }
+                else if (state == "completed" || state == "failed" || state == "unsupported" || state == "uncertain") terminalTodo(operation, state, stageDetail);
+            };
             int exitCode; string detail; bool cancelled;
             try {
-                exitCode = RunDaily(binding, todosByOperation.Keys.ToArray(), (operation, state, stageDetail) => {
-                    if (binding.AccountHumanRequired) return;
-                    if (binding.AccountEnabled && state.StartsWith("account_capture_", StringComparison.Ordinal)) {
-                        string captureOperation = terminal.Contains(todosByOperation[operation].Item1)
-                            ? todosByOperation.Keys.FirstOrDefault(value => !terminal.Contains(todosByOperation[value].Item1)) : operation;
-                        if (captureOperation == null) throw new AccountBridgeGate("ww_account_capture_without_unresolved_todo");
-                        captureAccount(captureOperation, state, stageDetail);
-                        return;
-                    }
-                    if (binding.AccountEnabled && state == "account_verified") {
-                        if (!accountArtifacts.ContainsKey(operation) ||
-                            !new [] { "account_capture_before", "account_capture_list", "account_capture_selected", "account_capture_after" }.All(accountCapturePhases.Contains))
-                            throw new AccountBridgeGate("ww_account_identity_evidence_missing");
-                        binding.AccountVerified = true;
-                        string receiptName = "ww-account-receipt-" + Guid.NewGuid().ToString("N") + ".txt";
-                        string receiptPath = Path.Combine(staging, receiptName);
-                        File.WriteAllText(receiptPath, Json.Serialize(new Dictionary<string, object> {
-                            { "accountId", binding.AccountId }, { "verificationMethod", "unique-saved-label-and-stable-world" },
-                            { "savedLabelVerified", true }, { "uidVerified", false }
-                        }), new UTF8Encoding(false));
-                        string receiptId = Guid.NewGuid().ToString();
-                        Tuple<string, IDictionary<string, object>> target = todosByOperation[operation];
-                        Emit(Base(request, binding.GameId, "artifact_staged", sequence++, new Dictionary<string, object> {
-                            { "todoInstanceId", target.Item1 }, { "todoAttemptId", attempts[target.Item1] }, { "artifactId", receiptId },
-                            { "kind", "account-switch-receipt" }, { "fileName", receiptName }, { "mimeType", "text/plain" },
-                            { "sizeBytes", new FileInfo(receiptPath).Length }, { "sha256", Hash(receiptPath) }, { "capturedAt", DateTime.UtcNow.ToString("o") }
+                if (binding.GameId == "WW" && !binding.WwInspectionOnly && !binding.WwRewardInspectionOnly && !binding.WwBattlePassInspectionOnly && wwInspectionGroups.Count <= 1 && !WwSelectionIsWholeOfficialDaily(todosByOperation.Keys, RequestedSelection(request))) {
+                    string unsupportedReason = "ww_selection_unsupported: upstream DailyTask has no official per-step enablement for this partial selection";
+                    Emit(Base(request, binding.GameId, "run_progress", sequence++, new Dictionary<string, object> {
+                        { "operation", "official-config-validation" }, { "code", "ww_selection_unsupported" },
+                        { "message", unsupportedReason },
+                        { "metrics", new Dictionary<string, object> {
+                            { "trigger", "Selected operations cannot be expressed by the bound official DailyTask configuration" },
+                            { "waitingFor", "A supported official task selection before a new run" },
+                            { "unstartedOperations", todosByOperation.Keys.ToArray() }
+                        } }
+                    }));
+                    exitCode = 0;
+                    detail = unsupportedReason;
+                    cancelled = false;
+                } else if (binding.GameId == "GF2" && Gf2MainOnlyOperationsSelected(todosByOperation.Keys) && !IsGf2MainSourceBinding(binding)) {
+                    const string unsupportedReason = "gf2_main_source_required: selected GF2 operations require the audited official main source binding; the legacy DailyTask combines or lacks these methods";
+                    Emit(Base(request, binding.GameId, "run_progress", sequence++, new Dictionary<string, object> {
+                        { "operation", "official-config-validation" }, { "code", "gf2_main_source_required" },
+                        { "message", unsupportedReason },
+                        { "metrics", new Dictionary<string, object> {
+                            { "trigger", "Selected operations require methods absent from the bound official version" },
+                            { "waitingFor", "Bind the supported official version before a new run" },
+                            { "unstartedOperations", todosByOperation.Keys.ToArray() }
+                        } }
+                    }));
+                    exitCode = 0;
+                    detail = unsupportedReason;
+                    cancelled = false;
+                } else exitCode = RunDaily(binding, todosByOperation.Keys.ToArray(), (operation, state, stageDetail) => {
+                    if (binding.GameId == "Endfield" && state == "integration") {
+                        var integration = Json.DeserializeObject(stageDetail) as IDictionary<string, object>;
+                        if (integration == null) throw new InvalidDataException("Invalid Endfield integration event");
+                        Emit(Base(request, binding.GameId, "run_progress", sequence++, new Dictionary<string, object> {
+                            { "operation", operation }, { "code", integration["code"] },
+                            { "message", integration["message"] }, { "metrics", integration["metrics"] }
                         }));
-                        accountArtifacts[operation].Add(receiptId);
-                        progressTodo(operation, stageDetail);
                         return;
                     }
-                    if (binding.AccountEnabled && state == "human_required") {
-                        string gateOperation = todosByOperation.Keys.FirstOrDefault(value => !terminal.Contains(todosByOperation[value].Item1));
-                        if (gateOperation == null) throw new InvalidOperationException("ww_account_human_gate_without_unresolved_todo");
-                        startTodo(gateOperation);
-                        terminalTodo(gateOperation, state, stageDetail);
-                        binding.AccountHumanRequired = true;
+                    if (binding.GameId == "Endfield" && state == "integration_artifact") {
+                        string fileName = DetailValue(stageDetail, "file");
+                        string kind = DetailValue(stageDetail, "kind");
+                        if (String.IsNullOrEmpty(fileName) || Path.GetFileName(fileName) != fileName ||
+                            !new[] { "game-ui-login-before-raw", "game-ui-login-after-raw" }.Contains(kind))
+                            throw new InvalidDataException("Invalid Endfield login artifact");
+                        string imagePath = Path.Combine(staging, fileName);
+                        Emit(Base(request, binding.GameId, "run_artifact_staged", sequence++, new Dictionary<string, object> {
+                            // Protocol anchor only; a run diagnostic never starts this Todo.
+                            { "todoInstanceId", ids[0] },
+                            { "artifactId", Guid.NewGuid().ToString() }, { "kind", kind }, { "fileName", fileName },
+                            { "mimeType", "image/png" }, { "sizeBytes", new FileInfo(imagePath).Length },
+                            { "sha256", Hash(imagePath) }, { "capturedAt", DetailValue(stageDetail, "capturedAt") }
+                        }));
                         return;
                     }
-                    if (binding.AccountEnabled && !binding.AccountVerified && state != "started" && state != "progress")
-                        throw new AccountBridgeGate("ww_account_identity_not_verified");
-                    if (state == "started") startTodo(operation);
-                    else if (state == "progress") progressTodo(operation, stageDetail);
-                    else if (state == "capture_before") captureWwEvidence(operation, "before", stageDetail);
-                    else if (state == "capture_after") captureWwEvidence(operation, "after", stageDetail);
-                    else if (state == "completed" || state == "failed" || state == "skipped") terminalTodo(operation, state, stageDetail);
-                }, () => cancellationRequested.WaitOne(0), out detail, out cancelled);
+                    if ((binding.GameId == "GF2" || binding.GameId == "Endfield") && state == "progress" &&
+                        (stageDetail.StartsWith("step_capture_unavailable:before:", StringComparison.Ordinal) ||
+                         stageDetail.StartsWith("step_capture_unavailable:after:", StringComparison.Ordinal) ||
+                         stageDetail.StartsWith("step_capture_unavailable:recognition:", StringComparison.Ordinal))) {
+                        string phase = stageDetail.Split(':')[1];
+                        Emit(Base(request, binding.GameId, "run_progress", sequence++, new Dictionary<string, object> {
+                            { "operation", operation + "-screenshot-" + phase }, { "code", "step_capture_unavailable" },
+                            { "message", stageDetail.Substring(0, Math.Min(stageDetail.Length, 2000)) },
+                            { "metrics", new Dictionary<string, object> {
+                                { "integrationStatus", "failed" },
+                                { "trigger", "Official recognition input: " + operation + ":" + phase },
+                                { "waitingFor", "" }
+                            } }
+                        }));
+                        return;
+                    }
+                    if ((binding.GameId == "GF2" || binding.GameId == "Endfield") && state == "step_artifact") {
+                        Tuple<string, IDictionary<string, object>> target;
+                        if (!todosByOperation.TryGetValue(operation, out target) || !attempted.Contains(target.Item1)) return;
+                        var descriptor = ParseStepArtifactDescriptor(binding.GameId, binding.Gf2RewardInspectionOnly, stageDetail);
+                        if (descriptor == null) return;
+                        string fileName = descriptor.Item1;
+                        string kind = descriptor.Item2;
+                        string imagePath = Path.Combine(staging, fileName);
+                        if (!File.Exists(imagePath)) return;
+                        Emit(Base(request, binding.GameId, "artifact_staged", sequence++, new Dictionary<string, object> {
+                            { "todoInstanceId", target.Item1 }, { "todoAttemptId", attempts[target.Item1] },
+                            { "artifactId", Guid.NewGuid().ToString() }, { "kind", kind }, { "fileName", fileName },
+                            { "mimeType", descriptor.Item3 }, { "sizeBytes", new FileInfo(imagePath).Length },
+                            { "sha256", Hash(imagePath) }, { "capturedAt", DetailValue(stageDetail, "capturedAt") }
+                        }));
+                        return;
+                    }
+                    if (state == "tool_started") {
+                        if (binding.GameId == "WW") {
+                            // After a cached account replay, supplementary
+                            // official entries produce new files in staging.
+                            // They must not import from or overwrite the shared
+                            // ordinary multi-account observation cache.
+                            if (wwLiveToolStarted || wwObservationRead) {
+                                wwObservationRead = false;
+                                wwObservationWrite = false;
+                            }
+                            wwLiveToolStarted = true;
+                        }
+                        if (binding.GameId == "WW" && binding.WwInspectionOperations.Count > 1) {
+                            // Each fixed official invocation must confirm its
+                            // saved account independently before attribution.
+                            officialCurrentAccount = String.Empty;
+                            pendingUntaggedStages.Clear();
+                        }
+                        Emit(Base(request, binding.GameId, "run_progress", sequence++, new Dictionary<string, object> {
+                            { "operation", "official-tool-start" }, { "code", "waiting_for_official_task" },
+                            { "message", stageDetail },
+                            { "metrics", new Dictionary<string, object> {
+                                { "trigger", "Manager selected the official task through its CLI" },
+                                { "waitingFor", "Official method-enter event or tool process exit" }
+                            } }
+                        }));
+                        return;
+                    }
+                    if (binding.GameId == "WW" && (operation == "official-login-input" || operation == "login-window-activation")) {
+                        Emit(Base(request, binding.GameId, "run_progress", sequence++, new Dictionary<string, object> {
+                            { "operation", operation }, { "code", operation == "official-login-input" ? "official_log_record" : "login_window_activation" },
+                            { "message", stageDetail.Substring(0, Math.Min(stageDetail.Length, 2000)) },
+                            { "metrics", new Dictionary<string, object> {
+                                { "trigger", operation == "official-login-input" ? "Official wait_login called PostMessage.update_mouse_pos" : "Official wait_login selected native dialog Button while game is not foreground" },
+                                { "waitingFor", "Official login state change; input target selection does not prove login" }
+                            } }
+                        }));
+                        return;
+                    }
+                    if (binding.GameId == "WW" && operation == "upstream-multi-account-task") {
+                        upstreamDailyFailed |= state == "failed";
+                        Emit(Base(request, binding.GameId, "run_progress", sequence++, new Dictionary<string, object> {
+                            { "operation", operation }, { "code", "official_multi_account_status" },
+                            { "message", stageDetail.Substring(0, Math.Min(stageDetail.Length, 2000)) },
+                            { "metrics", new Dictionary<string, object> {
+                                { "officialStatus", state }, { "trigger", "Official MultiAccountDailyTask.run" },
+                                { "waitingFor", state == "started" ? "Official multi-account task result" : "Official tool exit and complete log collection" }
+                            } }
+                        }));
+                        return;
+                    }
+                    string eventAccount = DetailValue(stageDetail, "account");
+                    if (operation == "official-account") {
+                        if (state == "detected" && !String.IsNullOrEmpty(eventAccount)) {
+                            officialCurrentAccount = eventAccount;
+                            var pending = pendingUntaggedStages.ToArray();
+                            pendingUntaggedStages.Clear();
+                            if (WwAccountsMatch(eventAccount, binding.SavedAccountLabel)) {
+                                foreach (var item in pending) ApplyWwStage(item.Item1, item.Item2, item.Item3);
+                            } else if (wwObservationWrite) {
+                                foreach (var item in pending)
+                                    AppendWwObservation(observationFile, item.Item1, item.Item2, item.Item3, eventAccount);
+                            }
+                        }
+                        return;
+                    }
+                    if (wwObservationWrite) AppendWwObservation(observationFile, operation, state, stageDetail, eventAccount);
+                    if (wwObservationRead && (state == "sidecar_before" || state == "sidecar_after" || state == "sidecar_after_watermarked")) {
+                        ImportWwSidecarArtifact(observationFile, operation, state, stageDetail, wwSidecarStepEvidence);
+                        return;
+                    }
+                    if (binding.AccountEnabled && (wwObservationWrite || wwObservationRead)) {
+                        if (state == "step_artifact" && DetailValue(stageDetail, "accountAttribution") == "unconfirmed") {
+                            // Recognition input copied before an official
+                            // account identity is diagnostic forever. A later
+                            // login must not attach it to pending account steps.
+                            Tuple<string, IDictionary<string, object>> target;
+                            string fileName = DetailValue(stageDetail, "file");
+                            string kind = DetailValue(stageDetail, "kind");
+                            if (todosByOperation.TryGetValue(operation, out target) && IsStepArtifactKind(kind) &&
+                                !String.IsNullOrEmpty(fileName) && fileName == Path.GetFileName(fileName)) {
+                                string artifactPath = Path.Combine(staging, fileName);
+                                if (File.Exists(artifactPath))
+                                    Emit(Base(request, binding.GameId, "run_artifact_staged", sequence++, new Dictionary<string, object> {
+                                        { "todoInstanceId", target.Item1 }, { "artifactId", Guid.NewGuid().ToString() },
+                                        { "kind", kind }, { "fileName", fileName }, { "mimeType", StepArtifactMimeType(kind) },
+                                        { "sizeBytes", new FileInfo(artifactPath).Length }, { "sha256", Hash(artifactPath) },
+                                        { "capturedAt", DetailValue(stageDetail, "capturedAt") }
+                                    }));
+                            }
+                            return;
+                        }
+                        if (String.IsNullOrEmpty(eventAccount)) {
+                            if (String.IsNullOrEmpty(officialCurrentAccount)) {
+                                pendingUntaggedStages.Add(Tuple.Create(operation, state, stageDetail));
+                                if (!wwUnattributedStartupPublished && operation == "attach-world" && state == "step_artifact" &&
+                                    (DetailValue(stageDetail, "kind") == "game-ui-step-before-raw" ||
+                                     DetailValue(stageDetail, "kind") == "game-ui-recognition-raw")) {
+                                    Tuple<string, IDictionary<string, object>> target;
+                                    string fileName = DetailValue(stageDetail, "file");
+                                    if (todosByOperation.TryGetValue(operation, out target) && !String.IsNullOrEmpty(fileName) && fileName == Path.GetFileName(fileName)) {
+                                        string imagePath = Path.Combine(staging, fileName);
+                                        if (File.Exists(imagePath)) {
+                                            Emit(Base(request, binding.GameId, "run_artifact_staged", sequence++, new Dictionary<string, object> {
+                                                { "todoInstanceId", target.Item1 }, { "artifactId", Guid.NewGuid().ToString() },
+                                                { "kind", "game-ui-account-unconfirmed-before-raw" }, { "fileName", fileName },
+                                                { "mimeType", "image/png" }, { "sizeBytes", new FileInfo(imagePath).Length },
+                                                { "sha256", Hash(imagePath) }, { "capturedAt", DetailValue(stageDetail, "capturedAt") }
+                                            }));
+                                            wwUnattributedStartupPublished = true;
+                                        }
+                                    }
+                                }
+                                Emit(Base(request, binding.GameId, "run_progress", sequence++, new Dictionary<string, object> {
+                                    { "operation", operation }, { "code", "official_account_pending" },
+                                    { "message", stageDetail.Substring(0, Math.Min(stageDetail.Length, 1800)) + "; official account attribution pending" },
+                                    { "metrics", new Dictionary<string, object> {
+                                        { "officialStatus", state }, { "accountAttribution", "pending" },
+                                        { "trigger", "Official task emitted this stage before detecting the current account" },
+                                        { "waitingFor", "Official MultiAccountDailyTask account identity; no account completion inferred" }
+                                    } }
+                                }));
+                                return;
+                            }
+                            eventAccount = officialCurrentAccount;
+                        }
+                        if (!WwAccountsMatch(eventAccount, binding.SavedAccountLabel)) {
+                            return;
+                        }
+                    }
+                    ApplyWwStage(operation, state, stageDetail);
+                }, () => cancellationRequested.WaitOne(0), wwObservationRead, observationFile, out detail, out cancelled);
             }
             catch (Exception error) { exitCode = -1; detail = "tool_start_failed: " + error.Message; cancelled = false; }
-            if (binding.AccountEnabled && !binding.AccountVerified && !binding.AccountHumanRequired && !cancelled) {
-                StopStaleFormalProcesses(binding);
-                startTodo(binding.AccountOperation);
-                terminalTodo(binding.AccountOperation, "human_required", "ww_account_switch_unverified: " + detail);
-                binding.AccountHumanRequired = true;
-                exitCode = 0;
+            toolFinished = true;
+            foreach (var pending in pendingTerminals) {
+                emitTerminalTodo(pending.Item1, pending.Item2, pending.Item3);
             }
-            if (!cancelled && !binding.AccountHumanRequired) {
+            // Unobserved children remain unresolved and unattempted, even if
+            // the root DailyTask returned successfully. Do not invent starts
+            // or take "before" screenshots after the task has already exited.
+            if (!cancelled && !humanChoiceRequired) {
                 foreach (string operation in todosByOperation.Keys) {
                     Tuple<string, IDictionary<string, object>> target = todosByOperation[operation];
                     if (attempted.Contains(target.Item1) && !terminal.Contains(target.Item1))
                         terminalTodo(operation, exitCode == 0 ? "review_required" : "failed", detail + "; stage_event_missing");
                 }
             }
-            // PyAppify's visible WW shell returns 70 after an --exit one-time
-            // task even when its own log says "Script run Success".  The
-            // run-scoped stage bridge is the authoritative semantic result;
-            // accept that fixed wrapper code only when every selected Todo
-            // emitted a completed terminal event.  Other non-zero exits stay
-            // crashes and can never be hidden by this normalization.
-            bool wwFormalExitCompleted = binding.GameId == "WW" && exitCode == 70 && completed.Count == ids.Length;
-            bool transportClean = exitCode == 0 || wwFormalExitCompleted;
+            // A run which never started one of the configured Todos still
+            // produced upstream logs: a multi-account task may fail before it
+            // ever reports account identity, so nothing above attributes those
+            // stages to a Todo and the raw log would stay in the staging inbox.
+            // Archive the remainder as run diagnostics so a failed round keeps
+            // its complete upstream evidence.  A run diagnostic never starts,
+            // completes or fails a Todo.
+            foreach (string upstreamLog in Directory.GetFiles(staging, binding.GameId.ToLowerInvariant() + "-upstream-*.jsonl")
+                         .Where(value => !Path.GetFileName(value).Contains("-snapshot-") && !stagedUpstreamLogs.Contains(value))) {
+                FileInfo upstreamInfo = new FileInfo(upstreamLog);
+                if (upstreamInfo.Length == 0) continue;
+                string snapshotName = binding.GameId.ToLowerInvariant() + "-upstream-snapshot-" + Guid.NewGuid().ToString("N") + ".jsonl";
+                string snapshotPath = Path.Combine(staging, snapshotName);
+                File.Copy(upstreamLog, snapshotPath, true);
+                FileInfo snapshotInfo = new FileInfo(snapshotPath);
+                stagedUpstreamLogs.Add(upstreamLog);
+                Emit(Base(request, binding.GameId, "run_artifact_staged", sequence++, new Dictionary<string, object> {
+                    // Protocol anchor only; a run diagnostic never starts this Todo.
+                    { "todoInstanceId", ids[0] },
+                    { "artifactId", Guid.NewGuid().ToString() }, { "kind", "tool-log-upstream" },
+                    { "fileName", snapshotName }, { "mimeType", "text/plain" },
+                    { "sizeBytes", snapshotInfo.Length }, { "sha256", Hash(snapshotPath) },
+                    { "capturedAt", upstreamInfo.LastWriteTimeUtc.ToString("o") }
+                }));
+            }
+            // A normal process exit does not erase an official task failure.
+            // Keep transport outcome and business outcome independent.
+            bool transportClean = exitCode == 0;
             bool allCompleted = completed.Count == ids.Length && transportClean;
-            string runStatus = binding.AccountHumanRequired ? "human_required" : cancelled ? "cancelled" : (allCompleted ? "completed" : (transportClean ? "review_required" : "failed"));
-            int declaredExitCode = wwFormalExitCompleted ? 0 : exitCode;
+            bool humanStopConfirmed = humanChoiceRequired && exitCode == 30;
+            string runStatus = ResolveRunStatus(cancelled, upstreamDailyFailed || failedTodos.Count > 0, allCompleted, transportClean, humanStopConfirmed);
+            int declaredExitCode = exitCode;
             string[] attemptedIds = ids.Cast<string>().Where(id => attempted.Contains(id)).ToArray();
             string[] completedIds = ids.Cast<string>().Where(id => completed.Contains(id)).ToArray();
             string[] unresolvedIds = ids.Cast<string>().Where(id => !completed.Contains(id)).ToArray();
             Emit(Base(request, binding.GameId, "run_terminal", sequence++, new Dictionary<string, object> {
-                { "status", runStatus }, { "transportOutcome", cancelled ? "cancelled" : (transportClean ? "clean" : "crashed") },
+                { "status", runStatus }, { "transportOutcome", cancelled ? "cancelled" : (transportClean || humanStopConfirmed ? "clean" : "crashed") },
                 { "attemptedTodoInstanceIds", attemptedIds }, { "completedTodoInstanceIds", completedIds }, { "unresolvedTodoInstanceIds", unresolvedIds },
                 { "terminalEventDigest", TerminalDigest(request, runStatus, attemptedIds, completedIds, unresolvedIds, declaredExitCode) }, { "exitCode", declaredExitCode }
             }));
@@ -442,262 +798,12 @@ namespace YeYuGamer.LocalDailyAdapter
             return declaredExitCode;
         }
 
-        private static bool CaptureWwRewardEvidence(Binding binding, string staging, string phase, bool includeWatermark,
-            out string rawName, out string watermarkedName, out string capturedAt, out string detail) {
-            rawName = null;
-            watermarkedName = null;
-            capturedAt = DateTime.UtcNow.ToString("o");
-            detail = "ww_game_window_not_found";
-            IntPtr window;
-            NativeRect bounds;
-            if (!FindWwGameWindow(binding, out window, out bounds, out detail)) return false;
-            int width = bounds.Right - bounds.Left;
-            int height = bounds.Bottom - bounds.Top;
-            Bitmap raw = null;
-            try {
-                ShowWindowAsync(window, SwShow);
-                SetForegroundWindow(window);
-                Thread.Sleep(1200);
-                raw = new Bitmap(width, height, PixelFormat.Format24bppRgb);
-                bool printed;
-                using (Graphics graphics = Graphics.FromImage(raw)) {
-                    IntPtr hdc = graphics.GetHdc();
-                    try { printed = PrintWindow(window, hdc, 2); }
-                    finally { graphics.ReleaseHdc(hdc); }
-                }
-                if (!printed || !FrameHasVisualContent(raw)) {
-                    using (Graphics graphics = Graphics.FromImage(raw)) {
-                        graphics.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
-                    }
-                }
-                if (!FrameHasVisualContent(raw)) {
-                    detail = "ww_game_capture_blank";
-                    return false;
-                }
-                string token = Guid.NewGuid().ToString("N");
-                rawName = "ww-reward-" + phase + "-raw-" + token + ".png";
-                watermarkedName = includeWatermark ? "ww-reward-" + phase + "-watermarked-" + token + ".png" : null;
-                string rawPath = Path.Combine(staging, rawName);
-                raw.Save(rawPath, ImageFormat.Png);
-                if (includeWatermark) {
-                    string watermarkedPath = Path.Combine(staging, watermarkedName);
-                    using (Bitmap marked = new Bitmap(raw))
-                    using (Graphics graphics = Graphics.FromImage(marked)) {
-                        graphics.SmoothingMode = SmoothingMode.AntiAlias;
-                        graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
-                        string stamp = "YeYu Gamer | " + DateTime.UtcNow.AddHours(8).ToString("yyyy-MM-dd HH:mm:ss") + " CST (UTC+8)";
-                        float fontSize = Math.Max(18f, Math.Min(32f, width / 55f));
-                        using (Font font = MakeWatermarkFont(fontSize))
-                        using (Brush foreground = new SolidBrush(Color.White))
-                        using (Brush background = new SolidBrush(Color.FromArgb(190, 0, 0, 0))) {
-                            SizeF textSize = graphics.MeasureString(stamp, font);
-                            float padding = Math.Max(10f, fontSize * 0.55f);
-                            RectangleF box = new RectangleF(
-                                Math.Max(0f, width - textSize.Width - padding * 2f),
-                                Math.Max(0f, height - textSize.Height - padding * 2f),
-                                Math.Min(width, textSize.Width + padding * 2f),
-                                Math.Min(height, textSize.Height + padding * 2f));
-                            graphics.FillRectangle(background, box);
-                            graphics.DrawString(stamp, font, foreground, box.Left + padding, box.Top + padding);
-                        }
-                        marked.Save(watermarkedPath, ImageFormat.Png);
-                    }
-                }
-                capturedAt = DateTime.UtcNow.ToString("o");
-                detail = "wwGameWindow=" + width + "x" + height + "; phase=" + phase
-                    + (includeWatermark ? "; watermark=Beijing-time" : String.Empty);
-                return true;
-            } catch (Exception error) {
-                detail = "ww_game_capture_error: " + error.GetType().Name + ": " + error.Message;
-                if (rawName != null) TryDelete(Path.Combine(staging, rawName));
-                if (watermarkedName != null) TryDelete(Path.Combine(staging, watermarkedName));
-                rawName = null;
-                watermarkedName = null;
-                return false;
-            } finally {
-                if (raw != null) raw.Dispose();
-            }
+        private static string ResolveRunStatus(bool cancelled, bool officialFailed, bool allCompleted, bool transportClean, bool humanStopConfirmed) {
+            if (cancelled) return "cancelled";
+            if (humanStopConfirmed) return "human_required";
+            if (officialFailed || !transportClean) return "failed";
+            return allCompleted ? "completed" : "review_required";
         }
-
-        private static bool CaptureLaunchTimeoutEvidence(Binding binding, string staging,
-            out string fileName, out string capturedAt, out string detail) {
-            fileName = null;
-            capturedAt = DateTime.UtcNow.ToString("o");
-            detail = "launch_timeout_window_not_found";
-            if (String.IsNullOrEmpty(staging)) return false;
-            IntPtr window;
-            NativeRect bounds;
-            string windowDetail;
-            if (!FindLaunchTimeoutWindow(binding, out window, out bounds, out windowDetail)) {
-                detail = windowDetail;
-                return false;
-            }
-            return CaptureWindowPng(window, bounds, staging,
-                binding.GameId.ToLowerInvariant() + "-launch-timeout",
-                out fileName, out capturedAt, out detail);
-        }
-
-        private static bool FindLaunchTimeoutWindow(Binding binding, out IntPtr window, out NativeRect bounds, out string detail) {
-            window = IntPtr.Zero;
-            bounds = new NativeRect();
-            detail = "launch_timeout_window_not_found";
-            if (FindWindowForExecutable(binding.Executable, binding.ToolRoot, false, new string[0],
-                    "formal_gui_window", out window, out bounds, out detail)) return true;
-            if (!String.IsNullOrEmpty(binding.InnerPython) &&
-                FindWindowForExecutable(binding.InnerPython, binding.ToolRoot, true, new string[0],
-                    "formal_inner_gui_window", out window, out bounds, out detail)) return true;
-            string gameRoot = String.IsNullOrEmpty(binding.Game) ? null : Path.GetDirectoryName(Path.GetFullPath(binding.Game));
-            string[] extraNames = binding.GameId == "WW" ? new string[] { "Client-Win64-Shipping" } : new string[0];
-            return FindWindowForExecutable(binding.Game, gameRoot, true, extraNames,
-                "game_window", out window, out bounds, out detail);
-        }
-
-        private static bool FindWindowForExecutable(string executable, string allowedRoot, bool allowRootDescendant,
-            string[] extraProcessNames, string label, out IntPtr window, out NativeRect bounds, out string detail) {
-            window = IntPtr.Zero;
-            bounds = new NativeRect();
-            detail = label + "_not_found";
-            if (String.IsNullOrEmpty(executable)) return false;
-            string expected = Path.GetFullPath(executable);
-            string root = String.IsNullOrEmpty(allowedRoot) ? null :
-                Path.GetFullPath(allowedRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            names.Add(Path.GetFileNameWithoutExtension(executable));
-            if (extraProcessNames != null) foreach (string name in extraProcessNames) if (!String.IsNullOrWhiteSpace(name)) names.Add(name);
-            foreach (string processName in names) {
-                foreach (Process process in Process.GetProcessesByName(processName)) {
-                    try {
-                        process.Refresh();
-                        IntPtr candidate = process.MainWindowHandle;
-                        if (candidate == IntPtr.Zero || !IsWindowVisible(candidate)) continue;
-                        string image = null;
-                        try { image = process.MainModule.FileName; }
-                        catch (System.ComponentModel.Win32Exception) { }
-                        catch (InvalidOperationException) { }
-                        if (!String.IsNullOrEmpty(image)) {
-                            string fullImage = Path.GetFullPath(image);
-                            if (!String.Equals(fullImage, expected, StringComparison.OrdinalIgnoreCase) &&
-                                !(allowRootDescendant && root != null && fullImage.StartsWith(root, StringComparison.OrdinalIgnoreCase)))
-                                continue;
-                        }
-                        NativeRect rect;
-                        if (!GetWindowRect(candidate, out rect)) continue;
-                        int width = rect.Right - rect.Left;
-                        int height = rect.Bottom - rect.Top;
-                        if (width < 320 || height < 180) continue;
-                        window = candidate;
-                        bounds = rect;
-                        detail = label + "=" + width + "x" + height;
-                        return true;
-                    } finally { process.Dispose(); }
-                }
-            }
-            return false;
-        }
-
-        private static bool CaptureWindowPng(IntPtr window, NativeRect bounds, string staging, string prefix,
-            out string fileName, out string capturedAt, out string detail) {
-            fileName = null;
-            capturedAt = DateTime.UtcNow.ToString("o");
-            detail = prefix + "_capture_failed";
-            int width = bounds.Right - bounds.Left;
-            int height = bounds.Bottom - bounds.Top;
-            Bitmap raw = null;
-            try {
-                Directory.CreateDirectory(staging);
-                ShowWindowAsync(window, SwShow);
-                SetForegroundWindow(window);
-                Thread.Sleep(500);
-                raw = new Bitmap(width, height, PixelFormat.Format24bppRgb);
-                bool printed;
-                using (Graphics graphics = Graphics.FromImage(raw)) {
-                    IntPtr hdc = graphics.GetHdc();
-                    try { printed = PrintWindow(window, hdc, 2); }
-                    finally { graphics.ReleaseHdc(hdc); }
-                }
-                if (!printed || !FrameHasVisualContent(raw)) {
-                    using (Graphics graphics = Graphics.FromImage(raw)) {
-                        graphics.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, new Size(width, height), CopyPixelOperation.SourceCopy);
-                    }
-                }
-                if (!FrameHasVisualContent(raw)) {
-                    detail = prefix + "_capture_blank";
-                    return false;
-                }
-                fileName = prefix + "-" + Guid.NewGuid().ToString("N") + ".png";
-                raw.Save(Path.Combine(staging, fileName), ImageFormat.Png);
-                capturedAt = DateTime.UtcNow.ToString("o");
-                detail = prefix + "_captured=" + width + "x" + height;
-                return true;
-            } catch (Exception error) {
-                detail = prefix + "_capture_error: " + error.GetType().Name + ": " + error.Message;
-                if (fileName != null) TryDelete(Path.Combine(staging, fileName));
-                fileName = null;
-                return false;
-            } finally {
-                if (raw != null) raw.Dispose();
-            }
-        }
-
-        private static bool FindWwGameWindow(Binding binding, out IntPtr window, out NativeRect bounds, out string detail) {
-            window = IntPtr.Zero;
-            bounds = new NativeRect();
-            detail = "ww_game_window_not_found";
-            string expectedImage = Path.GetFullPath(binding.Game);
-            string expectedRoot = Path.GetDirectoryName(expectedImage).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-            string[] allowedNames = { Path.GetFileNameWithoutExtension(expectedImage), "Client-Win64-Shipping" };
-            foreach (string processName in allowedNames.Distinct(StringComparer.OrdinalIgnoreCase)) {
-                foreach (Process process in Process.GetProcessesByName(processName)) {
-                    try {
-                        process.Refresh();
-                        IntPtr candidate = process.MainWindowHandle;
-                        if (candidate == IntPtr.Zero || !IsWindowVisible(candidate)) continue;
-                        string image = null;
-                        try { image = process.MainModule.FileName; }
-                        catch (System.ComponentModel.Win32Exception) { }
-                        catch (InvalidOperationException) { }
-                        if (!String.IsNullOrEmpty(image)) {
-                            string fullImage = Path.GetFullPath(image);
-                            if (!String.Equals(fullImage, expectedImage, StringComparison.OrdinalIgnoreCase) &&
-                                !fullImage.StartsWith(expectedRoot, StringComparison.OrdinalIgnoreCase)) continue;
-                        }
-                        NativeRect rect;
-                        if (!GetWindowRect(candidate, out rect)) continue;
-                        int width = rect.Right - rect.Left;
-                        int height = rect.Bottom - rect.Top;
-                        if (width < 640 || height < 360) continue;
-                        window = candidate;
-                        bounds = rect;
-                        detail = "ww_game_window_ready";
-                        return true;
-                    } finally { process.Dispose(); }
-                }
-            }
-            return false;
-        }
-
-        private static bool FrameHasVisualContent(Bitmap bitmap) {
-            int minimum = 255;
-            int maximum = 0;
-            var colors = new HashSet<int>();
-            for (int y = bitmap.Height / 16; y < bitmap.Height; y += Math.Max(1, bitmap.Height / 12)) {
-                for (int x = bitmap.Width / 16; x < bitmap.Width; x += Math.Max(1, bitmap.Width / 16)) {
-                    Color color = bitmap.GetPixel(Math.Min(bitmap.Width - 1, x), Math.Min(bitmap.Height - 1, y));
-                    int brightness = (color.R + color.G + color.B) / 3;
-                    minimum = Math.Min(minimum, brightness);
-                    maximum = Math.Max(maximum, brightness);
-                    colors.Add(color.ToArgb());
-                }
-            }
-            return maximum - minimum >= 18 && colors.Count >= 12;
-        }
-
-        private static Font MakeWatermarkFont(float size) {
-            try { return new Font("Microsoft YaHei UI", size, FontStyle.Bold, GraphicsUnit.Pixel); }
-            catch { return new Font(FontFamily.GenericSansSerif, size, FontStyle.Bold, GraphicsUnit.Pixel); }
-        }
-
-        private static void TryDelete(string path) { try { if (File.Exists(path)) File.Delete(path); } catch { } }
 
         private static Dictionary<string, string> ParseArguments(string[] args) {
             if (args == null || args.Length != 8) return null;
@@ -732,6 +838,9 @@ namespace YeYuGamer.LocalDailyAdapter
             IDictionary<string, object> snapshot = request["accountSnapshot"] as IDictionary<string, object>;
             if (snapshot == null || snapshot.Count == 0) return;
             binding.AccountId = request.ContainsKey("accountId") ? (string)request["accountId"] : "default";
+            // An empty label is current-client mode. A saved label selects the
+            // official MultiAccountDailyTask entry; switching stays upstream.
+            if (String.IsNullOrWhiteSpace(snapshot["saved_account_label"] as string)) return;
             binding.AccountSnapshot = snapshot;
             binding.AccountOperation = ((IDictionary<string, object>)todos[0])["operation"] as string;
         }
@@ -744,7 +853,130 @@ namespace YeYuGamer.LocalDailyAdapter
         private static bool AllowedOperation(string gameId, string operation) {
             if (gameId == "WW") return operation == "attach-world" || operation == "inspect-daily-progress" || operation == "farm-nightmare-daily-echo" || operation == "spend-waveplates" || operation == "claim-daily-reward" || operation == "claim-mail" || operation == "claim-battle-pass";
             if (gameId == "Endfield") return operation == "attach-world" || operation == "mail" || operation == "spend-sanity" || operation == "delivery-commission" || operation == "collect-credit" || operation == "dijiang-harvest" || operation == "claim-daily-reward";
-            return operation == "attach-home" || operation == "mail" || operation == "public-area-dispatch" || operation == "spend-stamina" || operation == "squad-tasks" || operation == "claim-daily-missions" || operation == "battle-pass-free-track";
+            return operation == "attach-home" || operation == "mail" || operation == "activity-supply" || operation == "star-wish" || operation == "event-battle" || operation == "exploration-claim" || operation == "public-area-dispatch" || operation == "spend-stamina" || operation == "squad-tasks" || operation == "claim-daily-missions" || operation == "battle-pass-free-track";
+        }
+        private static bool EndfieldShouldUseRewardInspection(string gameId, string accountId,
+            IEnumerable<string> operations, IDictionary<string, object> request, bool supported) {
+            object value;
+            if (!request.TryGetValue("observationOnlyOperations", out value)) return false;
+            var observations = value as object[];
+            if (observations != null && observations.Length == 0) return false;
+            var selected = new HashSet<string>(operations ?? Enumerable.Empty<string>(), StringComparer.Ordinal);
+            if (gameId != "Endfield" || accountId != "default" || !supported || observations == null ||
+                observations.Length != 1 || (observations[0] as string) != "claim-daily-reward" ||
+                !selected.Contains("claim-daily-reward") ||
+                !selected.IsSubsetOf(new [] { "attach-world", "claim-daily-reward" }))
+                throw new InvalidDataException("endfield_readonly_scope_invalid");
+            return true;
+        }
+
+        private static bool Gf2ShouldUseRewardInspection(string accountId, IEnumerable<string> operations,
+            IDictionary<string, object> request, bool supported) {
+            object raw;
+            if (!request.TryGetValue("observationOnlyOperations", out raw)) return false;
+            var observations = raw as object[];
+            var selected = new HashSet<string>(operations ?? Enumerable.Empty<string>(), StringComparer.Ordinal);
+            var allowed = new HashSet<string>(new[] { "claim-daily-missions", "battle-pass-free-track" }, StringComparer.Ordinal);
+            selected.Remove("attach-home");
+            if (!supported || accountId != "default" || observations == null || observations.Length < 1 || observations.Length > 2 ||
+                observations.Any(item => !(item is string) || !allowed.Contains((string)item)) ||
+                observations.Distinct().Count() != observations.Length ||
+                !selected.SetEquals(observations.Cast<string>()))
+                throw new InvalidDataException("gf2_readonly_scope_invalid");
+            return true;
+        }
+
+        private static bool EndfieldInspectionSourceMatches(string root, IDictionary<string, object> source) {
+            string policyPath = Path.Combine(Path.GetDirectoryName(typeof(Program).Assembly.Location), "EndfieldInspectionContract.json");
+            if (source == null || !File.Exists(policyPath)) return false;
+            var policy = Json.DeserializeObject(File.ReadAllText(policyPath, Encoding.UTF8)) as IDictionary<string, object>;
+            if (policy == null || !NumberEquals(policy["schemaVersion"], 1) ||
+                (source["commit"] as string) != (policy["commit"] as string) ||
+                !source.ContainsKey("officialBaseCommit") ||
+                (source["officialBaseCommit"] as string) != (policy["officialBaseCommit"] as string) ||
+                (source["repository"] as string) != (policy["repository"] as string)) return false;
+            string archive = Path.Combine(root, "official-source.zip");
+            if (!File.Exists(archive) || Hash(archive) != (policy["archiveSha256"] as string)) return false;
+            string working = Path.GetFullPath(Path.Combine(root, "Endfield", "source")) + Path.DirectorySeparatorChar;
+            var files = policy["files"] as IDictionary<string, object>;
+            if (files == null || files.Count != 6) return false;
+            foreach (var file in files) {
+                string path = Path.GetFullPath(Path.Combine(working, file.Key.Replace('/', Path.DirectorySeparatorChar)));
+                if (!path.StartsWith(working, StringComparison.OrdinalIgnoreCase) || !File.Exists(path) ||
+                    (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0 || Hash(path) != (file.Value as string)) return false;
+            }
+            return true;
+        }
+        private static readonly HashSet<string> WwOfficialDailyOperations = new HashSet<string>(StringComparer.Ordinal) {
+            "attach-world", "inspect-daily-progress", "farm-nightmare-daily-echo", "spend-waveplates",
+            "claim-daily-reward", "claim-mail", "claim-battle-pass"
+        };
+        // Frozen account selection supplied by the Manager.  Absent for older
+        // Managers and for the current-client scope.
+        private static HashSet<string> RequestedSelection(IDictionary<string, object> request) {
+            var selected = new HashSet<string>(StringComparer.Ordinal);
+            object raw;
+            if (request == null || !request.TryGetValue("selectedOperations", out raw)) return selected;
+            var items = raw as IEnumerable<object>;
+            if (items == null) return selected;
+            foreach (object item in items) {
+                string value = item as string;
+                if (!String.IsNullOrWhiteSpace(value)) selected.Add(value);
+            }
+            return selected;
+        }
+        private static bool WwSelectionIsWholeOfficialDaily(IEnumerable<string> operations, HashSet<string> selected) {
+            var actual = new HashSet<string>(operations ?? Enumerable.Empty<string>(), StringComparer.Ordinal);
+            // ensure_main/open_daily are mandatory official prerequisites and
+            // can be called again after their Todo was already completed. They
+            // are not spending/claiming actions. All official task-body actions
+            // must still be runnable: a completed claim must never be replayed
+            // merely because the frozen user selection contains it.
+            var body = new HashSet<string>(WwOfficialDailyOperations, StringComparer.Ordinal);
+            body.ExceptWith(new[] { "attach-world", "inspect-daily-progress" });
+            if (!actual.IsSubsetOf(WwOfficialDailyOperations) || !body.IsSubsetOf(actual)) return false;
+            return selected == null || selected.Count == 0 || WwOfficialDailyOperations.IsSubsetOf(selected);
+        }
+        private static bool WwShouldUseInspection(IEnumerable<string> operations, HashSet<string> selected, bool supported) {
+            var actual = new HashSet<string>(operations ?? Enumerable.Empty<string>(), StringComparer.Ordinal);
+            return supported && actual.IsSubsetOf(new[] { "attach-world", "inspect-daily-progress" }) && actual.Contains("inspect-daily-progress")
+                && !WwSelectionIsWholeOfficialDaily(actual, selected);
+        }
+        private static List<string[]> WwInspectionGroups(Binding binding, string[] operations) {
+            var result = new List<string[]>();
+            var actual = new HashSet<string>(operations ?? new string[0], StringComparer.Ordinal);
+            if (binding.GameId != "WW" || actual.Count != (operations ?? new string[0]).Length ||
+                !actual.IsSubsetOf(new[] { "attach-world", "inspect-daily-progress", "claim-daily-reward", "claim-battle-pass" })) return result;
+            var supported = new Dictionary<string, bool> {
+                { "inspect-daily-progress", binding.WwInspectionSupported },
+                { "claim-daily-reward", binding.WwRewardInspectionSupported },
+                { "claim-battle-pass", binding.WwBattlePassInspectionSupported }
+            };
+            foreach (string operation in new[] { "inspect-daily-progress", "claim-daily-reward", "claim-battle-pass" }) {
+                if (!actual.Contains(operation)) continue;
+                if (!supported[operation]) return new List<string[]>();
+                result.Add(actual.Contains("attach-world") ? new[] { "attach-world", operation } : new[] { operation });
+            }
+            return result;
+        }
+        private static bool WwShouldUseRewardInspection(IEnumerable<string> operations, bool supported) {
+            var actual = new HashSet<string>(operations ?? Enumerable.Empty<string>(), StringComparer.Ordinal);
+            return supported && actual.Contains("claim-daily-reward")
+                && actual.IsSubsetOf(new[] { "attach-world", "claim-daily-reward" });
+        }
+        private static bool WwShouldUseBattlePassInspection(IEnumerable<string> operations, bool supported) {
+            var actual = new HashSet<string>(operations ?? Enumerable.Empty<string>(), StringComparer.Ordinal);
+            return supported && actual.Contains("claim-battle-pass")
+                && actual.IsSubsetOf(new[] { "attach-world", "claim-battle-pass" });
+        }
+        private static readonly HashSet<string> Gf2MainOnlyOperations = new HashSet<string>(StringComparer.Ordinal) {
+            "activity-supply", "star-wish", "event-battle", "exploration-claim"
+        };
+        private static bool Gf2MainOnlyOperationsSelected(IEnumerable<string> operations) {
+            return (operations ?? Enumerable.Empty<string>()).Any(Gf2MainOnlyOperations.Contains);
+        }
+        private static bool IsGf2MainSourceBinding(Binding binding) {
+            return binding != null && String.Equals(binding.AppName, "ok-gf2-official-source-candidate", StringComparison.Ordinal);
         }
         private static Binding LoadBinding(string gameId) {
             string path = Environment.GetEnvironmentVariable("YEYU_GAMER_INSTALLATION_BINDING_PATH");
@@ -766,7 +998,7 @@ namespace YeYuGamer.LocalDailyAdapter
             bool versionOne = NumberEquals(doc == null ? null : doc["schemaVersion"], 1);
             bool versionTwo = NumberEquals(doc == null ? null : doc["schemaVersion"], 2);
             bool validVersionOne = versionOne && doc.Count == 4;
-            bool validVersionTwo = versionTwo && expectedGameId == "WW" && doc.Count == 5 && doc["dailyTaskProfile"] is IDictionary<string, object>;
+            bool validVersionTwo = versionTwo && (expectedGameId == "WW" || expectedGameId == "Endfield" || expectedGameId == "GF2") && doc.Count == 5 && doc["dailyTaskProfile"] is IDictionary<string, object>;
             if (doc == null || (!validVersionOne && !validVersionTwo) || (doc["gameId"] as string) != expectedGameId || !(doc["gamePath"] is string) || !(doc["toolPath"] is string)) throw new InvalidOperationException("manager_installation_binding_invalid");
             string game = doc["gamePath"] as string; string root = doc["toolPath"] as string;
             if (!Path.IsPathRooted(game) || !Path.IsPathRooted(root) || game.StartsWith("\\\\") || root.StartsWith("\\\\")) throw new InvalidOperationException("configured_installation_missing");
@@ -775,9 +1007,11 @@ namespace YeYuGamer.LocalDailyAdapter
         }
         private static Binding MakeFormalGuiBinding(string gameId, string game, string root, IDictionary<string, object> dailyTaskProfile) {
             if (gameId == "WW") {
+                Binding officialSourceCandidate = TryMakeWwOfficialSourceCandidateBinding(game, root, dailyTaskProfile);
+                if (officialSourceCandidate != null) return officialSourceCandidate;
                 string working = Path.Combine(root, "data", "apps", "ok-ww", "working");
-                Binding binding = MakeBinding(gameId, game, root, Path.Combine(root, "ok-ww.exe"),
-                    String.Empty, Path.Combine(working, "configs", "DailyTask.json"), dailyTaskProfile, root);
+                Binding binding = MakeBinding(gameId, game, root, Path.Combine(root, "data", "apps", "ok-ww", "python", "pythonw.exe"),
+                    "\"" + Path.Combine(working, "main.py") + "\" --task 1 --exit", Path.Combine(working, "configs", "DailyTask.json"), dailyTaskProfile, working);
                 binding.AppName = "ok-ww";
                 binding.UpdateState = Path.Combine(root, "data", "apps", "ok-ww", "app.json");
                 binding.InnerPython = Path.Combine(root, "data", "apps", "ok-ww", "python", "pythonw.exe");
@@ -786,10 +1020,12 @@ namespace YeYuGamer.LocalDailyAdapter
                 return binding;
             }
             if (gameId == "Endfield") {
+                Binding officialSourceCandidate = TryMakeEndfieldOfficialSourceCandidateBinding(game, root, dailyTaskProfile);
+                if (officialSourceCandidate != null) return officialSourceCandidate;
                 string appRoot = Path.Combine(root, "data", "apps", "ok-ef");
                 string endfieldWorkingDirectory = Path.Combine(appRoot, "working");
-                Binding binding = MakeBinding(gameId, game, root, Path.Combine(root, "ok-ef.exe"),
-                    String.Empty, Path.Combine(endfieldWorkingDirectory, "configs", "DailyTask.json"), null, root);
+                Binding binding = MakeBinding(gameId, game, root, Path.Combine(appRoot, "python", "pythonw.exe"),
+                    "\"" + Path.Combine(endfieldWorkingDirectory, "main.py") + "\" --task 1 --exit", Path.Combine(endfieldWorkingDirectory, "configs", "DailyTask.json"), dailyTaskProfile, endfieldWorkingDirectory);
                 binding.AppName = "ok-ef";
                 binding.UpdateState = Path.Combine(appRoot, "app.json");
                 binding.InnerPython = Path.Combine(appRoot, "python", "pythonw.exe");
@@ -797,33 +1033,245 @@ namespace YeYuGamer.LocalDailyAdapter
                 if (!File.Exists(binding.UpdateState) || !File.Exists(binding.InnerPython) || !File.Exists(binding.InnerEntry)) throw new InvalidOperationException("configured_gui_entry_missing");
                 return binding;
             }
-            string workingDirectory = Path.Combine(root, "working");
-            string formalEntry = EnsureGf2FormalEntry(root, workingDirectory);
-            return MakeBinding(gameId, game, root, formalEntry,
-                "-t 1 -e", Path.Combine(workingDirectory, "configs", "DailyTask.json"), null, root);
-        }
-        private static string EnsureGf2FormalEntry(string root, string workingDirectory) {
-            string formalEntry = Path.Combine(root, "ok-gf2.exe");
-            string packagedEntry = Path.Combine(workingDirectory, "ok-gf2.exe");
-            string updateState = Path.Combine(root, "app.json");
-            if (!File.Exists(packagedEntry) || !File.Exists(updateState))
-                throw new InvalidOperationException("configured_gui_entry_missing");
-            // PyAppify resolves app.json beside its signed bootstrap EXE.  Some
-            // migrated installations retained only the repository copy under
-            // working/, which opens a generic Error window before its updater
-            // can run. Restore the fixed formal root entry atomically once;
-            // future formal updates own and replace this root copy themselves.
-            if (!File.Exists(formalEntry)) {
-                string temporary = formalEntry + "." + Guid.NewGuid().ToString("N") + ".tmp";
-                File.Copy(packagedEntry, temporary, true);
-                File.Move(temporary, formalEntry);
-                if (!File.Exists(formalEntry) || new FileInfo(formalEntry).Length != new FileInfo(packagedEntry).Length)
-                    throw new InvalidOperationException("formal_gui_entry_restore_failed");
+            if (gameId == "GF2") {
+                Binding officialSourceCandidate = TryMakeGf2OfficialSourceCandidateBinding(game, root, dailyTaskProfile);
+                if (officialSourceCandidate != null) return officialSourceCandidate;
             }
-            NormalizeGf2Profile(updateState);
-            return formalEntry;
+            string workingDirectory = Path.Combine(root, "working");
+            return MakeBinding(gameId, game, root, Path.Combine(root, "python", "pythonw.exe"),
+                "\"" + Path.Combine(workingDirectory, "main.py") + "\" --task 1 --exit", Path.Combine(workingDirectory, "configs", "DailyTask.json"), dailyTaskProfile, workingDirectory);
         }
-        private static void NormalizeGf2Profile(string updateState) {
+        // WW candidates use a pinned, prepared source tree.  Manifest fields
+        // are validated as provenance only: the fixed layout below supplies
+        // both the Python entry point and its command line.
+        private static Binding TryMakeWwOfficialSourceCandidateBinding(string game, string root, IDictionary<string, object> dailyTaskProfile) {
+            if (String.IsNullOrWhiteSpace(root) || root.StartsWith("\\\\")) return null;
+            string candidateRoot = Path.GetFullPath(root); string recordPath = Path.Combine(candidateRoot, "WW", "runtime-preparation.json"); if (!File.Exists(recordPath)) return null;
+            IDictionary<string, object> record = Json.DeserializeObject(File.ReadAllText(recordPath, Encoding.UTF8)) as IDictionary<string, object>;
+            IDictionary<string, object> source = record == null ? null : record["source"] as IDictionary<string, object>; IDictionary<string, object> archive = source == null ? null : source["archive"] as IDictionary<string, object>; IDictionary<string, object> entry = record == null ? null : record["entry"] as IDictionary<string, object>;
+            string expectedWorking = Path.Combine(candidateRoot, "WW", "source"); string expectedPythonw = Path.Combine(candidateRoot, "r", "Scripts", "pythonw.exe"); string expectedMain = Path.Combine(expectedWorking, "main.py"); string expectedArchive = Path.Combine(candidateRoot, "official-source.zip"); string expectedDailyConfig = Path.Combine(expectedWorking, "configs", "DailyTask.json");
+
+            bool inspectionPatch = record != null && source != null && (record["candidateKind"] as string) == "isolated-local-ww-source-patch" &&
+                (source["commit"] as string) == "1a779fbf3a2211342c6c83f06011b534cbb80466" && source.ContainsKey("officialBaseCommit") &&
+                (source["officialBaseCommit"] as string) == "6ffaa7f0b0b7f3140367de96c8eacba533c96894" &&
+                Hash(Path.Combine(expectedWorking, "src", "task", "DailyTask.py")) == "b5f3fb78b095c2a23c17911f10706a565c9c22ead690ed8f6f799cb46452b19b" &&
+                Hash(Path.Combine(expectedWorking, "src", "task", "MultiAccountDailyTask.py")) == "2280a301ea9315631a96edabbaf88b775a6d2c3ac4e2dc409c82982321685c45";
+            bool rewardInspectionPatch = record != null && source != null && (record["candidateKind"] as string) == "isolated-local-ww-source-patch" &&
+                (source["commit"] as string) == "da98151e6bcd2c4f0c191e80c059f84c5e6c4939" && source.ContainsKey("officialBaseCommit") &&
+                (source["officialBaseCommit"] as string) == "6ffaa7f0b0b7f3140367de96c8eacba533c96894" &&
+                Hash(Path.Combine(expectedWorking, "src", "task", "DailyTask.py")) == "f51aa3aa9a6e614f9bd2a2341dd19a3a10e571ce4be685d372bd513c94cf275c" &&
+                Hash(Path.Combine(expectedWorking, "src", "task", "MultiAccountDailyTask.py")) == "94a90a9dac2ff0f92134af3fed1c083d8a61f5684e57b93309401fdf8f60cea1" &&
+                Hash(Path.Combine(expectedWorking, "src", "task", "resources", "daily_reward_claimed_check.png")) == "57ef1470aaf2e9d8fb55773d06f14b693a076ea5dc668f685e09b3a83223fd3f";
+            bool battlePassInspectionPatch = record != null && source != null && (record["candidateKind"] as string) == "isolated-local-ww-source-patch" &&
+                (source["commit"] as string) == "274346512f904b2e2bc2dea78a45982fa0012e83" && source.ContainsKey("officialBaseCommit") &&
+                (source["officialBaseCommit"] as string) == "6ffaa7f0b0b7f3140367de96c8eacba533c96894" &&
+                Hash(Path.Combine(expectedWorking, "src", "task", "DailyTask.py")) == "84f52efb8b61ea1bb24a0e972ab510ffd4f048786af0a94c821e7fec37c92463" &&
+                Hash(Path.Combine(expectedWorking, "src", "task", "MultiAccountDailyTask.py")) == "5ccee3872e8190b94490d9b7329aee6920706d3ab79bef4923595217b54ec0ed" &&
+                Hash(Path.Combine(expectedWorking, "src", "task", "resources", "daily_reward_claimed_check.png")) == "57ef1470aaf2e9d8fb55773d06f14b693a076ea5dc668f685e09b3a83223fd3f";
+            bool battlePassHistoryPatch = record != null && source != null && (record["candidateKind"] as string) == "isolated-local-ww-source-patch" &&
+                source.ContainsKey("officialBaseCommit") &&
+                (source["officialBaseCommit"] as string) == "6ffaa7f0b0b7f3140367de96c8eacba533c96894" &&
+                (((source["commit"] as string) == "93e19b4f455390f50b8e126c23cf4f4be1595adb" && Hash(Path.Combine(expectedWorking, "src", "task", "DailyTask.py")) == "0805055d5838b99318b052550666f86b4bade94b400a553d98f21ece53b54198") ||
+                 ((source["commit"] as string) == "cc2e2e7f32d25b5af269c4b16d063d259ce6cffb" && Hash(Path.Combine(expectedWorking, "src", "task", "DailyTask.py")) == "e673110270a9023e2608c58272897c40da9819d54fe384ee5b110a9dc461fee6") ||
+                 ((source["commit"] as string) == "81edb5af888688be64e879f346b0f2440bacd958" && Hash(Path.Combine(expectedWorking, "src", "task", "DailyTask.py")) == "81fd98025c06507c5547e2b8c76fe23ef9d4e12c8fae20c53ca0ac6dc653e828") ||
+                 ((source["commit"] as string) == "85e54379b3a6859f30f2a1df6326091f3a51929d" && Hash(Path.Combine(expectedWorking, "src", "task", "DailyTask.py")) == "facab02135deab404e7d59602655c91d915b7ef49a3f74506baf42332f524b5b")) &&
+                Hash(Path.Combine(expectedWorking, "src", "task", "MultiAccountDailyTask.py")) == "5ccee3872e8190b94490d9b7329aee6920706d3ab79bef4923595217b54ec0ed" &&
+                Hash(Path.Combine(expectedWorking, "src", "task", "resources", "daily_reward_claimed_check.png")) == "57ef1470aaf2e9d8fb55773d06f14b693a076ea5dc668f685e09b3a83223fd3f" &&
+                IsAuditedWwCaptureSdkPatch(candidateRoot, record);
+            battlePassInspectionPatch = battlePassInspectionPatch || battlePassHistoryPatch;
+            bool localPatch = inspectionPatch || rewardInspectionPatch || battlePassInspectionPatch || (record != null && source != null && (record["candidateKind"] as string) == "isolated-local-ww-source-patch" &&
+                new[] { "20a2d40d0eaa0cfa053ceafecd9a4d04395291f4", "737c89ef00e36248baa0ab92df248af935528b56", "4a1b39d002c5754557bdc7b30782fad0048cd106", "567e71c93c32f03a7bd3ad013205438c0adcba11" }.Contains(source["commit"] as string) && source.ContainsKey("officialBaseCommit") &&
+                (source["officialBaseCommit"] as string) == "f5f38c8d9e2b7f7e91edad77bd5fab14df3f162d");
+            bool officialSource = record != null && source != null && (record["candidateKind"] as string) == "isolated-official-ww-source" &&
+                new[] { "c3fef9a06f61f96abeb53571fb47dd578b6f7063", "07a578842b34dda3428535eb46f8b98f76fddb0d", "36c557437de745cdef506bcfa148569d3e09cfcf", "f5f38c8d9e2b7f7e91edad77bd5fab14df3f162d", "2243d465d58c74f52765b658174bff76165656ee" }.Contains(source["commit"] as string);
+            if (!NumberEquals(record == null ? null : record["schemaVersion"], 1) || (record["status"] as string) != "read-only-import-ready" || !(officialSource || localPatch) || source == null || (source["repository"] as string) != "https://github.com/ok-oldking/ok-wuthering-waves.git" || (source["sourceDirectory"] as string) != "WW/source" || archive == null || (archive["file"] as string) != "official-source.zip" || !(archive["sha256"] is string) || entry == null || (entry["sourceEntry"] as string) != "main.py" || (entry["arguments"] as string) != "main.py --task 1 --exit" || !String.Equals(entry["pythonwRelativePath"] as string, "r\\Scripts\\pythonw.exe", StringComparison.OrdinalIgnoreCase) || !String.Equals(entry["workingDirectoryRelativePath"] as string, "WW/source", StringComparison.OrdinalIgnoreCase) || !File.Exists(expectedPythonw) || !File.Exists(expectedMain) || !File.Exists(expectedArchive) || !String.Equals(Hash(expectedArchive), archive["sha256"] as string, StringComparison.OrdinalIgnoreCase)) throw new InvalidOperationException("configured_official_source_candidate_invalid");
+            Binding binding = MakeBinding("WW", game, candidateRoot, expectedPythonw,
+                "\"" + expectedMain + "\" --task 1 --exit", expectedDailyConfig, dailyTaskProfile, expectedWorking);
+            binding.AppName = localPatch ? "ok-ww-local-source-patch-candidate" : "ok-ww-official-source-candidate";
+            binding.WwInspectionSupported = inspectionPatch || rewardInspectionPatch || battlePassInspectionPatch;
+            binding.WwRewardInspectionSupported = rewardInspectionPatch || battlePassInspectionPatch;
+            binding.WwBattlePassInspectionSupported = battlePassInspectionPatch;
+            binding.InnerPython = expectedPythonw;
+            binding.InnerEntry = expectedMain;
+            return binding;
+        }
+        internal static bool IsAuditedWwCaptureSdkPatch(string root, IDictionary<string, object> record) {
+            if (record == null || !record.ContainsKey("sdkSourcePatch")) return false;
+            IDictionary<string, object> sdk = record["sdkSourcePatch"] as IDictionary<string, object>;
+            if (sdk == null || new[] { "repository", "officialBaseCommit", "commit", "version", "candidateKind", "windowsGraphicsSha256", "wheelFile", "wheelSha256" }.Any(key => !sdk.ContainsKey(key))) return false;
+            const string wheelName = "ok_script-2.0.8+local.wgcclose.20261007-py3-none-any.whl";
+            string sourceFile = Path.Combine(root, "r", "Lib", "site-packages", "ok", "device", "capture_methods", "windows_graphics.py");
+            string wheel = Path.Combine(root, "source-patches", wheelName);
+            return (sdk["repository"] as string) == "https://github.com/ok-oldking/ok-script.git" &&
+                (sdk["officialBaseCommit"] as string) == "752e01d02c9e298a3128f11d9ec0ed9c654dd0e6" &&
+                (sdk["commit"] as string) == "0442e1f200bad209342c468f2ed44106c16cb9f6" &&
+                (sdk["version"] as string) == "2.0.8+local.wgcclose.20261007" &&
+                (sdk["candidateKind"] as string) == "local-upstream-sdk-source-patch" &&
+                (sdk["windowsGraphicsSha256"] as string) == "d6f0d75442b0dc627a5bcfa7b7ae874083826b5a2047de88bc6b7296d4e9a047" &&
+                (sdk["wheelFile"] as string) == "source-patches/" + wheelName &&
+                (sdk["wheelSha256"] as string) == "bfb4a4f000d41df8ad8e4ed96144c2c8a2895ae6587f9161e4d55c34605ffe07" &&
+                File.Exists(sourceFile) && File.Exists(wheel) &&
+                Hash(sourceFile) == "d6f0d75442b0dc627a5bcfa7b7ae874083826b5a2047de88bc6b7296d4e9a047" &&
+                Hash(wheel) == "bfb4a4f000d41df8ad8e4ed96144c2c8a2895ae6587f9161e4d55c34605ffe07";
+        }
+        // An isolated Endfield source candidate is deliberately a fixed layout,
+        // rather than a generic manifest launcher.  The preparation record only
+        // proves provenance and file integrity; none of its path or argv values
+        // are used to construct the child process command.
+        private static Binding TryMakeEndfieldOfficialSourceCandidateBinding(string game, string root, IDictionary<string, object> dailyTaskProfile) {
+            if (String.IsNullOrWhiteSpace(root) || root.StartsWith("\\\\")) return null;
+            string candidateRoot = Path.GetFullPath(root);
+            string recordPath = Path.Combine(candidateRoot, "Endfield", "runtime-preparation.json");
+            if (!File.Exists(recordPath)) return null;
+            IDictionary<string, object> record = Json.DeserializeObject(File.ReadAllText(recordPath, Encoding.UTF8)) as IDictionary<string, object>;
+            IDictionary<string, object> source = record == null ? null : record["source"] as IDictionary<string, object>;
+            IDictionary<string, object> hashes = source == null ? null : source["keyFileSha256"] as IDictionary<string, object>;
+            IDictionary<string, object> entry = record == null ? null : record["entry"] as IDictionary<string, object>;
+            string expectedWorking = Path.Combine(candidateRoot, "Endfield", "source");
+            string expectedPythonw = Path.Combine(candidateRoot, "r", "Scripts", "pythonw.exe");
+            string expectedMain = Path.Combine(expectedWorking, "main.py");
+            string expectedDailyConfig = Path.Combine(expectedWorking, "configs", "DailyTask.json");
+            string gameFlow = Path.Combine(expectedWorking, "src", "core", "base_mixin", "game_flow_mixin.py");
+            string creditCollect = Path.Combine(expectedWorking, "src", "tasks", "onetime", "CreditCollectTask.py");
+            bool rewardInspectionPatch = EndfieldInspectionSourceMatches(candidateRoot, source);
+            bool localPatch = record != null && source != null && hashes != null &&
+                (record["candidateKind"] as string) == "isolated-local-source-patch-with-formal-runtime-binding" &&
+                source.ContainsKey("officialBaseCommit") &&
+                (((source["commit"] as string) == "ec5058f90b91f816201227cd66b75770422c7c67" &&
+                  (source["officialBaseCommit"] as string) == "34626b32e5cf5f8a7039b0d10c898169a5c421d6") ||
+                 ((source["commit"] as string) == "194b7c94f2e29980667c41a1b16df0556cacd6be" &&
+                  (source["officialBaseCommit"] as string) == "bb5af7df07297fdb6edfc483cedd7167840d5e82") ||
+                 ((source["commit"] as string) == "19eb6d2015850b25f6d27c74edf27bf932567503" &&
+                  (source["officialBaseCommit"] as string) == "ef58c1c2d87e0f80a0075324e4797c1fbf267d5c") ||
+                 ((source["commit"] as string) == "84e5df86197a68c4001f3a810b38c953aad60950" &&
+                  (source["officialBaseCommit"] as string) == "ef58c1c2d87e0f80a0075324e4797c1fbf267d5c") ||
+                 ((source["commit"] as string) == "402b2da9bc46be6a2876f3f1ec4ed732754b636f" &&
+                  (source["officialBaseCommit"] as string) == "08af80be42ae11fdd482fbdb0b00f87f08cdf2e3") ||
+                 ((source["commit"] as string) == "168d7470760d88b01f6441b1d3255b08f4316954" &&
+                  (source["officialBaseCommit"] as string) == "cfa1069a30eab05f9bc26ff571cfa7222b9d064e" &&
+                  File.Exists(creditCollect) && String.Equals(Hash(creditCollect), "fe4020ff763b6d292be1a4d063f42fc4d47d3e24b9971088102c0ba16d8674e8", StringComparison.OrdinalIgnoreCase)) ||
+                 ((source["commit"] as string) == "b69a1c12c6907ed0830320ae7433111ddea5e675" &&
+                  (source["officialBaseCommit"] as string) == "cfa1069a30eab05f9bc26ff571cfa7222b9d064e" &&
+                  File.Exists(creditCollect) && String.Equals(Hash(creditCollect), "6dc3024a5fa7511bf5e69de4aebd47619ab2dbbe10452b9baccddc356f5f38b5", StringComparison.OrdinalIgnoreCase))) &&
+                hashes.ContainsKey("gameFlow") && File.Exists(gameFlow) && String.Equals(Hash(gameFlow), hashes["gameFlow"] as string, StringComparison.OrdinalIgnoreCase);
+            bool officialSource = record != null && source != null &&
+                (record["candidateKind"] as string) == "isolated-official-source-with-formal-runtime-binding" &&
+                ((source["commit"] as string) == "b13f1197a503e6473fbf63c1f927a33838739d1f" ||
+                 (source["commit"] as string) == "9b45815dcefdb3d4c273fdc26482782eb1e18395" ||
+                 (source["commit"] as string) == "0815bdf3da08bcf5de0b0e0d55efbd7b7719ace4" ||
+                 (source["commit"] as string) == "60bb694e63658adeeec83cc474a5a06626f25c6e" ||
+                 (source["commit"] as string) == "83434dc40e2db364eb9dfa0fe9d0234bc4d7a164" ||
+                 (source["commit"] as string) == "3d1d521f6fb367c8da2cd480511585fd219e69aa");
+            if (!NumberEquals(record == null ? null : record["schemaVersion"], 1) ||
+                (record["status"] as string) != "read-only-import-ready" ||
+                !(officialSource || localPatch || rewardInspectionPatch) ||
+                source == null || (source["repository"] as string) != "https://github.com/AliceJump/ok-end-field.git" ||
+                (source["sourceDirectory"] as string) != "Endfield/source" || hashes == null ||
+                !(hashes["main"] is string) || entry == null ||
+                (entry["sourceEntry"] as string) != "main.py" || (entry["arguments"] as string) != "main.py --task 1 --exit" ||
+                !String.Equals(entry["pythonw"] as string, expectedPythonw, StringComparison.OrdinalIgnoreCase) ||
+                !String.Equals(entry["workingDirectory"] as string, expectedWorking, StringComparison.OrdinalIgnoreCase) ||
+                !File.Exists(expectedPythonw) || !File.Exists(expectedMain) || !String.Equals(Hash(expectedMain), hashes["main"] as string, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("configured_official_source_candidate_invalid");
+            Binding binding = MakeBinding("Endfield", game, candidateRoot, expectedPythonw,
+                "\"" + expectedMain + "\" --task 1 --exit", expectedDailyConfig, dailyTaskProfile, expectedWorking);
+            binding.AppName = localPatch || rewardInspectionPatch ? "ok-ef-local-source-patch-candidate" : "ok-ef-official-source-candidate";
+            binding.EndfieldRewardInspectionSupported = rewardInspectionPatch;
+            binding.InnerPython = expectedPythonw;
+            binding.InnerEntry = expectedMain;
+            return binding;
+        }
+        // GF2 candidates have the same constrained source layout as Endfield:
+        // the manifest is evidence to validate, never a caller-controlled
+        // command template.  Keep the fixed main.py DailyTask entry below.
+        private static Binding TryMakeGf2OfficialSourceCandidateBinding(string game, string root, IDictionary<string, object> dailyTaskProfile) {
+            if (String.IsNullOrWhiteSpace(root) || root.StartsWith("\\\\")) return null;
+            string candidateRoot = Path.GetFullPath(root);
+            string recordPath = Path.Combine(candidateRoot, "GF2", "runtime-preparation.json");
+            if (!File.Exists(recordPath)) return null;
+            IDictionary<string, object> record = Json.DeserializeObject(File.ReadAllText(recordPath, Encoding.UTF8)) as IDictionary<string, object>;
+            IDictionary<string, object> source = record == null ? null : record["source"] as IDictionary<string, object>;
+            IDictionary<string, object> hashes = source == null ? null : source["keyFileSha256"] as IDictionary<string, object>;
+            IDictionary<string, object> entry = record == null ? null : record["entry"] as IDictionary<string, object>;
+            string expectedWorking = Path.Combine(candidateRoot, "GF2", "source");
+            string expectedPythonw = Path.Combine(candidateRoot, "r", "Scripts", "pythonw.exe");
+            string expectedMain = Path.Combine(expectedWorking, "main.py");
+            string expectedDailyConfig = Path.Combine(expectedWorking, "configs", "DailyTask.json");
+            bool officialRelease1277 = source != null &&
+                (source["repository"] as string) == "https://github.com/AliceJump/ok-gf2.git" &&
+                (source["commit"] as string) == "5f19a91bed0c98d3cbd919e40cbfcfe0e34b3f42" &&
+                source.ContainsKey("tag") && (source["tag"] as string) == "v1.2.77";
+            bool approvedCandidate = ApprovedGf2SourceMatches(record, source, expectedWorking);
+            if (!NumberEquals(record == null ? null : record["schemaVersion"], 1) ||
+                (record["status"] as string) != "read-only-import-ready" ||
+                ((record["candidateKind"] as string) != "isolated-official-gf2-source" && !approvedCandidate) ||
+                source == null || (!(officialRelease1277 || approvedCandidate) && ((source["repository"] as string) != "https://cnb.cool/ok-oldking/ok-gf2.git" ||
+                ((source["commit"] as string) != "4122e01e8a69063ae37807f316f2ae8f80eeedb1" &&
+                 (source["commit"] as string) != "13a569429b9b0b50db06e95b0cb1f65bf54a38b7"))) ||
+                (source["sourceDirectory"] as string) != "GF2/source" || hashes == null ||
+                !(hashes["main"] is string) || entry == null ||
+                (entry["sourceEntry"] as string) != "main.py" || (entry["arguments"] as string) != "main.py --task 1 --exit" ||
+                !String.Equals(entry["pythonw"] as string, expectedPythonw, StringComparison.OrdinalIgnoreCase) ||
+                !String.Equals(entry["workingDirectory"] as string, expectedWorking, StringComparison.OrdinalIgnoreCase) ||
+                !File.Exists(expectedPythonw) || !File.Exists(expectedMain) || !String.Equals(Hash(expectedMain), hashes["main"] as string, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("configured_official_source_candidate_invalid");
+            if (record.ContainsKey("sdkSourcePatch")) {
+                IDictionary<string, object> sdk = record["sdkSourcePatch"] as IDictionary<string, object>;
+                string sdkFile = Path.Combine(candidateRoot, "r", "Lib", "site-packages", "ok", "device", "interaction_methods", "genshin.py");
+                const string sdkHash = "a23a384e038dfb012ef7d4dbba76d0bdbaf4e13b993efdaef9a6a2d74cbb5cd8";
+                if (!officialRelease1277 || sdk == null ||
+                    SdkSourceField(sdk, "repository") != "https://github.com/ok-oldking/ok-script.git" ||
+                    SdkSourceField(sdk, "officialBaseCommit") != "752e01d02c9e298a3128f11d9ec0ed9c654dd0e6" ||
+                    SdkSourceField(sdk, "commit") != "dabd9f7f99c2dec7ce1ff90a6f84576e0dc99ca4" ||
+                    SdkSourceField(sdk, "version") != "2.0.8+local.genshincleanup.20261003" ||
+                    SdkSourceField(sdk, "candidateKind") != "local-upstream-sdk-source-patch" ||
+                    SdkSourceField(sdk, "genshinSha256") != sdkHash || !File.Exists(sdkFile) ||
+                    !String.Equals(Hash(sdkFile), sdkHash, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("configured_official_sdk_candidate_invalid");
+            }
+            Binding binding = MakeBinding("GF2", game, candidateRoot, expectedPythonw,
+                "\"" + expectedMain + "\" --task 1 --exit", expectedDailyConfig, dailyTaskProfile, expectedWorking);
+            binding.AppName = "ok-gf2-official-source-candidate";
+            binding.Gf2SupplyRewardChoiceSupported = officialRelease1277 || approvedCandidate;
+            binding.Gf2RewardInspectionSupported = approvedCandidate && source.ContainsKey("inspectionVersion") &&
+                (source["inspectionVersion"] as string) == "gf2.reward-status.inspect@1.0";
+            binding.InnerPython = expectedPythonw;
+            binding.InnerEntry = expectedMain;
+            return binding;
+        }
+        private static bool ApprovedGf2SourceMatches(IDictionary<string, object> record, IDictionary<string, object> source, string working) {
+            if (record == null || source == null) return false;
+            string registryPath = Path.Combine(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location), "gf2-source-candidates.json");
+            if (!File.Exists(registryPath)) return false;
+            var registry = Json.DeserializeObject(File.ReadAllText(registryPath, Encoding.UTF8)) as IDictionary<string, object>;
+            if (registry == null || !NumberEquals(registry["schemaVersion"], 1)) return false;
+            foreach (var row in (object[])registry["candidates"]) {
+                var candidate = row as IDictionary<string, object>;
+                if (candidate == null || SdkSourceField(candidate, "candidateKind") != SdkSourceField(record, "candidateKind")) continue;
+                bool matches = true;
+                foreach (string key in new[] { "repository", "commit", "tag", "officialBaseCommit" }) {
+                    object actual;
+                    source.TryGetValue(key, out actual);
+                    if (candidate.ContainsKey(key) && !Object.Equals(candidate[key], actual)) matches = false;
+                }
+                if (source.ContainsKey("inspectionVersion") != candidate.ContainsKey("inspectionVersion") ||
+                    (source.ContainsKey("inspectionVersion") && !Object.Equals(source["inspectionVersion"], candidate["inspectionVersion"]))) matches = false;
+                var files = candidate["files"] as IDictionary<string, object>;
+                if (!matches || files == null) continue;
+                foreach (var file in files) {
+                    string path = Path.GetFullPath(Path.Combine(working, file.Key.Replace('/', Path.DirectorySeparatorChar)));
+                    if (!path.StartsWith(working.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase) ||
+                        !File.Exists(path) || !String.Equals(Hash(path), file.Value as string, StringComparison.OrdinalIgnoreCase)) matches = false;
+                }
+                if (matches) return true;
+            }
+            return false;
+        }
+        private static string SdkSourceField(IDictionary<string, object> fields, string name) {
+            object value;
+            return fields.TryGetValue(name, out value) ? value as string : null;
+        }
+private static void NormalizeGf2Profile(string updateState) {
             IDictionary<string, object> state = Json.DeserializeObject(File.ReadAllText(updateState, Encoding.UTF8)) as IDictionary<string, object>;
             if (state == null || !state.ContainsKey("profiles"))
                 throw new InvalidOperationException("formal_gui_profile_state_invalid");
@@ -850,128 +1298,257 @@ namespace YeYuGamer.LocalDailyAdapter
         }
         private static Binding MakeBinding(string gameId, string game, string toolRoot, string executable, string arguments, string dailyConfig, IDictionary<string, object> dailyTaskProfile = null, string workingDirectory = null) {
             string effectiveWorkingDirectory = String.IsNullOrEmpty(workingDirectory) ? toolRoot : workingDirectory;
-            if (String.IsNullOrEmpty(game) || String.IsNullOrEmpty(toolRoot) || !File.Exists(game) || !File.Exists(executable) || !File.Exists(dailyConfig) || !Directory.Exists(effectiveWorkingDirectory)) throw new InvalidOperationException("configured_installation_missing");
-            if (gameId == "GF2" && !File.Exists(Path.Combine(toolRoot, "working", "main.py"))) throw new InvalidOperationException("configured_gui_entry_missing");
+            if (String.IsNullOrEmpty(game) || String.IsNullOrEmpty(toolRoot) || !File.Exists(game) || !File.Exists(executable) ||
+                String.IsNullOrEmpty(Path.GetDirectoryName(dailyConfig)) || !Directory.Exists(effectiveWorkingDirectory)) throw new InvalidOperationException("configured_installation_missing");
             Binding result = new Binding { GameId = gameId, Game = game, ToolRoot = toolRoot, WorkingDirectory = effectiveWorkingDirectory, Executable = executable, Arguments = arguments, DailyConfig = dailyConfig, DailyTaskProfile = dailyTaskProfile };
-            if (gameId == "GF2") {
-                result.AppName = "ok-gf2";
-                result.UpdateState = Path.Combine(toolRoot, "app.json");
-                result.InnerPython = Path.Combine(toolRoot, "python", "pythonw.exe");
-                result.InnerEntry = Path.Combine(toolRoot, "working", "main.py");
-                if (!File.Exists(result.UpdateState) || !File.Exists(result.InnerPython) || !File.Exists(result.InnerEntry))
-                    throw new InvalidOperationException("configured_gui_entry_missing");
-            }
             return result;
         }
         private static bool NumberEquals(object value, int expected) { return (value is int && (int)value == expected) || (value is decimal && (decimal)value == expected); }
-        private static int RunDaily(Binding binding, string[] selectedOperations, Action<string, string, string> onStage, Func<bool> cancellationRequested, out string detail, out bool cancelled) {
+        private static int RunDaily(Binding binding, string[] selectedOperations, Action<string, string, string> onStage, Func<bool> cancellationRequested, bool observationReplay, string observationFile, out string detail, out bool cancelled) {
+            var groups = WwInspectionGroups(binding, selectedOperations);
+            // Manager deliberately skips client launch for shared-observation
+            // replay. Preserve that no-process contract; missing verification
+            // remains unresolved for a separately managed live inspection.
+            if (observationReplay || groups.Count <= 1)
+                return RunDailySingle(binding, selectedOperations, onStage, cancellationRequested, observationReplay, observationFile, out detail, out cancelled);
+            bool progress = binding.WwInspectionOnly, reward = binding.WwRewardInspectionOnly, pass = binding.WwBattlePassInspectionOnly;
+            detail = String.Empty;
             cancelled = false;
-            if (binding.GameId == "WW" && binding.DailyTaskProfile != null) ApplyOkWWDailyTaskProfile(binding);
-            bool shellLaunchedFormal = binding.GameId == "WW" || binding.GameId == "Endfield" || binding.GameId == "GF2";
-            bool useShellExecute = shellLaunchedFormal;
-            if (shellLaunchedFormal) StopStaleFormalProcesses(binding);
-            var start = new ProcessStartInfo { FileName = binding.Executable, Arguments = binding.Arguments, WorkingDirectory = binding.WorkingDirectory, UseShellExecute = useShellExecute, CreateNoWindow = false };
+            try {
+                for (int index = 0; index < groups.Count; index++) {
+                    if (cancellationRequested()) { cancelled = true; detail = "ww_readonly_inspection_cancelled_before_next_entry"; return 0; }
+                    string[] group = groups[index];
+                    binding.WwInspectionOnly = group.Contains("inspect-daily-progress");
+                    binding.WwRewardInspectionOnly = group.Contains("claim-daily-reward");
+                    binding.WwBattlePassInspectionOnly = group.Contains("claim-battle-pass");
+                    bool first = index == 0;
+                    Action<string, string, string> observe = (operation, state, message) => {
+                        // Session entry is one Todo, although the official
+                        // saved-account task checks it for each invocation.
+                        if (first || operation != "attach-world") onStage(operation, state, message);
+                    };
+                    int exit = RunDailySingle(binding, group, observe, cancellationRequested, false, String.Empty, out detail, out cancelled);
+                    if (exit != 0 || cancelled) return exit;
+                }
+                return 0;
+            } finally {
+                binding.WwInspectionOnly = progress;
+                binding.WwRewardInspectionOnly = reward;
+                binding.WwBattlePassInspectionOnly = pass;
+            }
+        }
+        private static int RunDailySingle(Binding binding, string[] selectedOperations, Action<string, string, string> onStage, Func<bool> cancellationRequested, bool observationReplay, string observationFile, out string detail, out bool cancelled) {
+            // A duplicated case-variant environment name ("Path" beside "PATH")
+            // makes every ProcessStartInfo.EnvironmentVariables read throw, which
+            // would stop this runner before it can start the official tool.
+            // Collapse such names before the start info below is populated.
+            YeYuGamer.AdapterHost.UpstreamConsoleCapture.NormalizeInheritedEnvironment();
+            detail = String.Empty;
+            cancelled = false;
+            byte[] originalDailyConfig = null;
+            bool originalDailyConfigExisted = false;
+            bool dailyConfigSnapshotTaken = false;
+            var splitConfigSnapshots = new List<ConfigSnapshot>();
+            Process process = null;
+            string processArguments = binding.Arguments;
+            if (binding.GameId == "WW" && binding.AccountEnabled && processArguments.IndexOf(" --task 1 ", StringComparison.Ordinal) >= 0)
+                processArguments = processArguments.Replace(" --task 1 ", " --task 7 ");
+            if (observationReplay) {
+                ReplayWwOfficialObservations(binding, observationFile, onStage);
+                detail = "ww_official_multi_account_replay";
+                return 0;
+            }
+            var start = new ProcessStartInfo { FileName = binding.Executable, Arguments = processArguments, WorkingDirectory = binding.WorkingDirectory, UseShellExecute = false, CreateNoWindow = true };
             string staging = Environment.GetEnvironmentVariable("YEYU_GAMER_ADAPTER_STAGING_DIR");
             string stageFile = Path.Combine(staging, binding.GameId.ToLowerInvariant() + "-stage-" + Guid.NewGuid().ToString("N") + ".jsonl");
             File.WriteAllText(stageFile, String.Empty, new UTF8Encoding(false));
             var seenStageLines = new HashSet<string>(StringComparer.Ordinal);
-            DateTime formalStartedAtUtc = DateTime.UtcNow;
+            bool humanRequired = false;
+            Action<string, string, string> observeStage = (operation, state, stageDetail) => {
+                onStage(operation, state, stageDetail);
+                if (state == "human_required" && selectedOperations.Contains(operation)) humanRequired = true;
+            };
             try {
-            if (shellLaunchedFormal) {
-                // Endfield's formal updater can replace the working tree before
-                // auto-starting Python. Hold auto-start until that update pass is
-                // complete, then inject the run bridge and reopen the same formal
-                // GUI entry. This keeps both updating and execution visible.
-                if (binding.GameId == "Endfield") SetFormalAutoStart(binding, false);
-                if (binding.AccountEnabled) {
-                    IDictionary<string, object> update = Json.DeserializeObject(File.ReadAllText(binding.UpdateState, Encoding.UTF8)) as IDictionary<string, object>;
-                    if (update == null || !update.ContainsKey("auto_start") || !(update["auto_start"] is bool))
-                        throw new AccountBridgeGate("ww_account_formal_autostart_contract_unverified");
-                    binding.AccountAutoStartBefore = (bool)update["auto_start"];
-                    SetFormalAutoStart(binding, false);
-                }
-                WriteFormalRunSidecar(binding, stageFile, selectedOperations);
+            RestorePendingDailyConfig(binding);
+            originalDailyConfigExisted = File.Exists(binding.DailyConfig);
+            originalDailyConfig = originalDailyConfigExisted ? File.ReadAllBytes(binding.DailyConfig) : null;
+            dailyConfigSnapshotTaken = true;
+            splitConfigSnapshots = binding.EndfieldRewardInspectionOnly ? new List<ConfigSnapshot>() : SnapshotEndfieldSplitConfig(binding);
+            EnsureDailyConfigForInjection(binding.DailyConfig);
+            if (binding.Gf2RewardInspectionOnly) {
+                var inspectionConfig = new Dictionary<string, object> {
+                    { "委托状态", selectedOperations.Contains("claim-daily-missions") },
+                    { "巡录状态", selectedOperations.Contains("battle-pass-free-track") }, { "Exit After Task", true }
+                };
+                File.WriteAllText(binding.DailyConfig, Json.Serialize(inspectionConfig), new UTF8Encoding(false));
+            } else if (binding.EndfieldRewardInspectionOnly) {
+                var inspectionConfig = Json.DeserializeObject(File.ReadAllText(binding.DailyConfig, Encoding.UTF8)) as IDictionary<string, object>;
+                if (inspectionConfig == null) throw new InvalidDataException("endfield_inspection_config_invalid");
+                // The official daily reward operation includes both handbook
+                // and pass rewards. Never confirm it from a daily-only page.
+                inspectionConfig["查看通行证"] = true;
+                File.WriteAllText(binding.DailyConfig, Json.Serialize(inspectionConfig), new UTF8Encoding(false));
+            } else {
+            if (binding.GameId == "WW" && binding.DailyTaskProfile != null) ApplyOkWWDailyTaskProfile(binding);
+            if (binding.GameId == "Endfield" && binding.DailyTaskProfile != null) ApplyEndfieldDailyTaskProfile(binding);
+            if (binding.GameId == "GF2" && binding.DailyTaskProfile != null) ApplyGf2DailyTaskProfile(binding);
+            ApplySelectedOfficialDailyConfig(binding, selectedOperations);
             }
-            else {
-                start.EnvironmentVariables["YEYU_GAMER_STAGE_FILE"] = stageFile;
-                start.EnvironmentVariables["YEYU_GAMER_SELECTED_OPERATIONS"] = Json.Serialize(selectedOperations);
-                ConfigureToolOutput(start);
-            }
-                var process = Process.Start(start);
-                if (!shellLaunchedFormal) DrainToolOutput(process);
-                Process formalProcess = null;
-                string attachOperation = binding.GameId == "GF2" ? "attach-home" : "attach-world";
+            start.EnvironmentVariables["YEYU_GAMER_STAGE_FILE"] = stageFile;
+            start.EnvironmentVariables["YEYU_GAMER_SELECTED_OPERATIONS"] = Json.Serialize(selectedOperations);
+            start.EnvironmentVariables["YEYU_GAMER_GAME_ID"] = binding.GameId;
+            start.EnvironmentVariables["YEYU_GAMER_GF2_REWARD_INSPECTION_ONLY"] = binding.Gf2RewardInspectionOnly ? "1" : "0";
+            start.EnvironmentVariables["YEYU_GAMER_ENDFIELD_REWARD_INSPECTION_ONLY"] = binding.EndfieldRewardInspectionOnly ? "1" : "0";
+            start.EnvironmentVariables["YEYU_GAMER_UPSTREAM_LOG_FILE"] = Path.Combine(staging, binding.GameId.ToLowerInvariant() + "-upstream-" + Guid.NewGuid().ToString("N") + ".jsonl");
+            start.EnvironmentVariables["PYTHONPATH"] = AppDomain.CurrentDomain.BaseDirectory + ";" + binding.WorkingDirectory;
+            start.EnvironmentVariables["PYTHONDONTWRITEBYTECODE"] = "1";
+            ConfigureToolOutput(start);
+                process = Process.Start(start);
+                if (process == null) throw new InvalidOperationException("tool_start_failed");
+                DrainToolOutput(process, Path.Combine(staging, binding.GameId.ToLowerInvariant() + "-upstream-console-" + Guid.NewGuid().ToString("N") + ".jsonl"));
                 // Each fixed entry starts the upstream Qt GUI and selects its
                 // first one-time DailyTask. The GUI remains visible while its
                 // own updater/startup path runs and emits finer-grained stages.
-                onStage(binding.AccountEnabled ? binding.AccountOperation : attachOperation, "started", binding.GameId + " formal GUI launched; waiting for its DailyTask runtime");
-                string formalHandoff = String.Empty;
-                if (shellLaunchedFormal) {
-                    formalProcess = process;
-                    int handoffExit;
-                    Process inner;
-                    if (!WaitForFormalUpdateAndStartInner(binding, ref formalProcess, stageFile, selectedOperations,
-                        formalStartedAtUtc, cancellationRequested, onStage, out inner, out handoffExit,
-                        out formalHandoff, out cancelled)) {
-                        detail = formalHandoff;
-                        return handoffExit;
-                    }
-                    process = inner;
-                    // Discovering Python/Qt proves only transport handoff.  The
-                    // run-scoped bridge must emit the semantic attach terminal.
-                }
+                onStage("official-tool-start", "tool_started", binding.GameId + " official process started; pid=" + process.Id + "; waiting for its DailyTask runtime");
                 while (!process.WaitForExit(150)) {
                     process.Refresh();
-                    if (binding.GameId == "GF2" && String.Equals(process.MainWindowTitle, "Error", StringComparison.OrdinalIgnoreCase)) {
-                        string blockingState = DetectFormalBlockingState(binding, process);
-                        StopToolProcess(process);
-                        detail = String.IsNullOrEmpty(blockingState)
-                            ? "client_update_required: GF2 formal GUI stopped at an error gate"
-                            : blockingState;
-                        return 72;
-                    }
                     if (cancellationRequested != null && cancellationRequested()) {
                         // This stops only the fixed tool child. The game client is
                         // intentionally not part of the process tree we terminate.
                         StopToolProcess(process);
-                        StopToolProcess(formalProcess);
                         detail = "cancelled_by_manager";
                         cancelled = true;
                         return process.HasExited ? process.ExitCode : -1;
                     }
-                    DrainOkWWStageEvents(stageFile, seenStageLines, onStage);
-                    if (binding.AccountHumanRequired) {
+                    DrainOkWWStageEvents(stageFile, seenStageLines, observeStage);
+                    if (humanRequired) {
+                        // Stop only the fixed tool child; retain the game client
+                        // and the official unresolved choice for the user.
                         StopToolProcess(process);
-                        StopToolProcess(formalProcess);
-                        detail = "ww_account_human_required";
-                        return 0;
+                        detail = "official_human_choice_required; fixed tool stopped; game client retained";
+                        cancelled = false;
+                        return 30;
                     }
                 }
-                DrainOkWWStageEvents(stageFile, seenStageLines, onStage);
-                StopToolProcess(formalProcess);
+                process.WaitForExit(); // Complete asynchronous stdout/stderr callbacks before sealing logs.
+                DrainOkWWStageEvents(stageFile, seenStageLines, observeStage);
+                if (humanRequired) { detail = "official_human_choice_required; official tool exited"; return 30; }
                 int toolExitCode = SafeExitCode(process);
-                if (seenStageLines.Count == 0) {
-                    detail = "telemetry_missing: fixed DailyTask emitted no run-scoped stage event";
-                    return 73;
-                }
                 detail = "fixedTask=daily; gameId=" + binding.GameId + "; toolExitCode=" + toolExitCode +
-                    (String.IsNullOrEmpty(formalHandoff) ? String.Empty : "; " + formalHandoff); return toolExitCode;
-            } catch (AccountBridgeGate error) {
-                StopStaleFormalProcesses(binding);
-                onStage(binding.AccountOperation, "human_required", error.Message);
-                detail = error.Message;
-                return 0;
+                    "; official process exited"; return toolExitCode;
             } finally {
-                if (binding.GameId == "Endfield") {
-                    try { SetFormalAutoStart(binding, true); }
-                    catch (Exception) { }
+                bool stopped = process == null;
+                if (process != null) {
+                    try { StopToolProcess(process); stopped = process.HasExited; if (stopped) process.WaitForExit(); }
+                    catch (Exception error) { detail = (detail ?? String.Empty) + ";toolStopFailed=" + error.GetType().Name; }
                 }
-                if (binding.AccountAutoStartBefore.HasValue) {
-                    try { SetFormalAutoStart(binding, binding.AccountAutoStartBefore.Value); }
-                    catch (Exception) { }
+                if (dailyConfigSnapshotTaken) {
+                    try { RestoreEndfieldSplitConfig(splitConfigSnapshots, stopped); }
+                    finally {
+                    if (stopped) RestoreOrPreserveDailyConfig(binding.DailyConfig, originalDailyConfig, originalDailyConfigExisted);
+                    else {
+                        // Preserve the original until the bound tool really
+                        // exits; a live child can otherwise overwrite restore.
+                        PreserveDailyConfigForRecovery(binding.DailyConfig, originalDailyConfig, originalDailyConfigExisted);
+                        throw new InvalidOperationException("tool_stop_incomplete: original daily config retained for recovery");
+                    }
+                    }
                 }
-                if (shellLaunchedFormal) ClearFormalRunSidecars(binding);
+                if (process != null) process.Dispose();
             }
+        }
+        private static void RestorePendingDailyConfig(Binding binding) {
+            string pending = binding.DailyConfig + ".yeyu-restore-pending";
+            string legacyAbsent = pending + ".absent";
+            bool hasPending = File.Exists(pending);
+            bool hasLegacyAbsent = File.Exists(legacyAbsent);
+            if (!hasPending && !hasLegacyAbsent) return;
+            if (hasPending && hasLegacyAbsent) throw new InvalidOperationException("daily_config_restore_pending_invalid");
+            string expected = Path.GetFullPath(binding.Executable);
+            foreach (Process candidate in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(expected))) {
+                using (candidate) {
+                    if (candidate.HasExited) continue;
+                    string image;
+                    try { image = Path.GetFullPath(candidate.MainModule.FileName); }
+                    catch { throw new InvalidOperationException("tool_stop_unverified: pending daily config recovery"); }
+                    if (String.Equals(image, expected, StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidOperationException("tool_still_running: pending daily config recovery");
+                }
+            }
+            // Compatibility with the short-lived two-file absent marker.  New
+            // pending writes use only the self-describing record below.
+            if (hasLegacyAbsent) {
+                RestoreDailyConfigSnapshot(binding.DailyConfig, null, false);
+                File.Delete(legacyAbsent);
+                return;
+            }
+            byte[] record = File.ReadAllBytes(pending);
+            bool hasHeader = record.Length >= PendingDailyConfigHeader.Length + 7 &&
+                PendingDailyConfigHeader.SequenceEqual(record.Take(PendingDailyConfigHeader.Length));
+            if (!hasHeader) {
+                // Compatibility with the previous raw-byte recovery format.
+                RestoreDailyConfigSnapshot(binding.DailyConfig, record, true);
+                File.Delete(pending);
+                return;
+            }
+            int markerStart = PendingDailyConfigHeader.Length;
+            string marker = Encoding.ASCII.GetString(record, markerStart, 7);
+            if (marker == "ABSENT\n") RestoreDailyConfigSnapshot(binding.DailyConfig, null, false);
+            else if (marker == "PRESENT") {
+                if (record.Length < markerStart + 8 || record[markerStart + 7] != (byte)'\n')
+                    throw new InvalidOperationException("daily_config_restore_pending_invalid");
+                RestoreDailyConfigSnapshot(binding.DailyConfig, record.Skip(markerStart + 8).ToArray(), true);
+            } else throw new InvalidOperationException("daily_config_restore_pending_invalid");
+            // Delete only after the requested restoration. If either action
+            // fails, the pending record remains and the next run retries.
+            File.Delete(pending);
+        }
+        private static readonly byte[] PendingDailyConfigHeader = Encoding.ASCII.GetBytes("YEYU-OPENKURO-RESTORE-V1\n");
+        // Missing DailyTask.json is a supported upstream state: Config loads
+        // its class defaults and persists them.  The empty document below is
+        // only this run's carrier for selected official overrides; upstream
+        // still owns all omitted default values.
+        private static void EnsureDailyConfigForInjection(string path) {
+            if (File.Exists(path)) return;
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+            File.WriteAllText(path, "{}", new UTF8Encoding(false));
+        }
+        private static void RestoreDailyConfigSnapshot(string path, byte[] content, bool existed) {
+            if (existed) {
+                if (content == null) throw new InvalidOperationException("daily_config_snapshot_invalid");
+                File.WriteAllBytes(path, content);
+            } else if (File.Exists(path)) File.Delete(path);
+        }
+        private static void RestoreOrPreserveDailyConfig(string path, byte[] content, bool existed) {
+            try { RestoreDailyConfigSnapshot(path, content, existed); }
+            catch (Exception restoreError) {
+                try { PreserveDailyConfigForRecovery(path, content, existed); }
+                catch (Exception pendingError) {
+                    throw new InvalidOperationException("daily_config_restore_failed_and_recovery_pending_failed",
+                        new AggregateException(restoreError, pendingError));
+                }
+                // The original restoration error remains visible to the
+                // caller, but its source bytes are now durable for retry.
+                throw;
+            }
+        }
+        private static void PreserveDailyConfigForRecovery(string path, byte[] content, bool existed) {
+            string pending = path + ".yeyu-restore-pending";
+            if (File.Exists(pending)) return;
+            if (existed && content == null) throw new InvalidOperationException("daily_config_snapshot_invalid");
+            byte[] marker = Encoding.ASCII.GetBytes(existed ? "PRESENT\n" : "ABSENT\n");
+            byte[] payload = content ?? new byte[0];
+            byte[] record = new byte[PendingDailyConfigHeader.Length + marker.Length + payload.Length];
+            Buffer.BlockCopy(PendingDailyConfigHeader, 0, record, 0, PendingDailyConfigHeader.Length);
+            Buffer.BlockCopy(marker, 0, record, PendingDailyConfigHeader.Length, marker.Length);
+            Buffer.BlockCopy(payload, 0, record, PendingDailyConfigHeader.Length + marker.Length, payload.Length);
+            Directory.CreateDirectory(Path.GetDirectoryName(path));
+            string temporary = pending + ".tmp." + Guid.NewGuid().ToString("N");
+            try {
+                File.WriteAllBytes(temporary, record);
+                try { File.Move(temporary, pending); }
+                catch (IOException) { if (!File.Exists(pending)) throw; }
+            } finally { if (File.Exists(temporary)) File.Delete(temporary); }
         }
         private static void StopStaleFormalProcesses(Binding binding) {
             foreach (string executable in new string[] { binding.Executable, binding.InnerPython }) {
@@ -993,743 +1570,11 @@ namespace YeYuGamer.LocalDailyAdapter
                 }
             }
         }
-        private sealed class FormalUpdatePolicy {
-            public int CheckSeconds;
-            public int IdleSeconds;
-            public int HardCapSeconds;
-        }
-        private sealed class FormalUpdateObservation {
-            public bool Exists;
-            public bool ValidJson;
-            public bool Installed;
-            public string CurrentVersion = String.Empty;
-            public string StartingVersion = String.Empty;
-            public string UpdateState = String.Empty;
-            public string UpdateTargetVersion = String.Empty;
-            public string UpdateError = String.Empty;
-            public DateTime LastWriteUtc = DateTime.MinValue;
-            public long Length;
-            public string ContentDigest = String.Empty;
-        }
-        private static FormalUpdatePolicy FormalUpdatePolicyFromEnvironment() {
-            int check = PositiveEnvInt("YEYU_GAMER_FORMAL_UPDATE_CHECK_SECONDS", 120, 15, 3600);
-            int idle = PositiveEnvInt("YEYU_GAMER_FORMAL_UPDATE_IDLE_SECONDS", check, 15, 3600);
-            int hard = PositiveEnvInt("YEYU_GAMER_FORMAL_UPDATE_HARD_CAP_SECONDS", 1200, 60, 86400);
-            if (hard < check) hard = check;
-            if (hard < idle) hard = idle;
-            return new FormalUpdatePolicy { CheckSeconds = check, IdleSeconds = idle, HardCapSeconds = hard };
-        }
-        private static int PositiveEnvInt(string name, int defaultValue, int minimum, int maximum) {
-            string raw = Environment.GetEnvironmentVariable(name);
-            int value;
-            if (String.IsNullOrWhiteSpace(raw) || !Int32.TryParse(raw.Trim(), out value) || value < minimum || value > maximum)
-                return defaultValue;
-            return value;
-        }
-        private static FormalUpdateObservation ReadFormalUpdateObservation(string path) {
-            var observation = new FormalUpdateObservation();
-            try {
-                if (String.IsNullOrEmpty(path) || !File.Exists(path)) return observation;
-                FileInfo info = new FileInfo(path);
-                string content;
-                using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-                using (var reader = new StreamReader(stream, Encoding.UTF8, true)) content = reader.ReadToEnd();
-                observation.Exists = true;
-                observation.LastWriteUtc = info.LastWriteTimeUtc;
-                observation.Length = info.Length;
-                using (var sha = SHA256.Create()) {
-                    observation.ContentDigest = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(content))).Replace("-", String.Empty).ToLowerInvariant();
-                }
-                IDictionary<string, object> state = Json.DeserializeObject(content) as IDictionary<string, object>;
-                if (state == null) return observation;
-                observation.ValidJson = true;
-                object installed;
-                observation.Installed = state.TryGetValue("installed", out installed) && installed is bool && (bool)installed;
-                observation.CurrentVersion = JsonText(state, "current_version");
-                observation.StartingVersion = JsonText(state, "app_starting_version");
-                observation.UpdateState = JsonText(state, "update_state");
-                observation.UpdateTargetVersion = JsonText(state, "update_target_version");
-                observation.UpdateError = JsonText(state, "update_error");
-            } catch (Exception) { }
-            return observation;
-        }
-        private static string JsonText(IDictionary<string, object> state, string key) {
-            object value;
-            if (state == null || !state.TryGetValue(key, out value) || value == null) return String.Empty;
-            return Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? String.Empty;
-        }
-        private static bool FormalObservationChanged(FormalUpdateObservation current, FormalUpdateObservation previous) {
-            if (current == null || previous == null) return false;
-            return current.Exists != previous.Exists ||
-                current.LastWriteUtc != previous.LastWriteUtc ||
-                current.Length != previous.Length ||
-                !String.Equals(current.ContentDigest, previous.ContentDigest, StringComparison.Ordinal);
-        }
-        private static bool FormalObservationShowsProgress(FormalUpdateObservation current, FormalUpdateObservation previous) {
-            if (current == null || !current.Exists) return false;
-            if (!String.IsNullOrWhiteSpace(current.UpdateTargetVersion)) return true;
-            if (!String.IsNullOrWhiteSpace(current.UpdateState) &&
-                !String.Equals(current.UpdateState, "idle", StringComparison.OrdinalIgnoreCase)) return true;
-            return previous != null && FormalObservationChanged(current, previous);
-        }
-        private static string FormalUpdateSummary(FormalUpdateObservation observation, DateTime startedAtUtc, DateTime nowUtc, string extra) {
-            string state = observation == null || String.IsNullOrWhiteSpace(observation.UpdateState) ? "<missing>" : observation.UpdateState;
-            string target = observation == null || String.IsNullOrWhiteSpace(observation.UpdateTargetVersion) ? "<none>" : observation.UpdateTargetVersion;
-            string error = observation == null || String.IsNullOrWhiteSpace(observation.UpdateError) ? "<none>" : observation.UpdateError;
-            int elapsed = Math.Max(0, (int)(nowUtc - startedAtUtc).TotalSeconds);
-            return "update_state=" + state + "; update_target_version=" + target +
-                "; update_error=" + error + "; elapsedSeconds=" + elapsed +
-                (String.IsNullOrWhiteSpace(extra) ? String.Empty : "; " + extra);
-        }
-        private static bool SupportsFormalUpdateRetry(string gameId) {
-            return gameId == "WW" || gameId == "Endfield" || gameId == "GF2";
-        }
-        private static bool WaitForFormalUpdateAndStartInner(Binding binding, ref Process formal,
-            string stageFile, string[] selectedOperations, DateTime formalStartedAtUtc,
-            Func<bool> cancellationRequested, Action<string, string, string> onStage, out Process inner,
-            out int exitCode, out string detail, out bool cancelled) {
-            inner = null; exitCode = -1; detail = "telemetry_missing:formal_gui_update_check_failed"; cancelled = false;
-            int formalUpdateAttempt = 1;
-            FormalUpdatePolicy policy = FormalUpdatePolicyFromEnvironment();
-            DateTime nextGf2StartAttempt = DateTime.MinValue;
-            while (formalUpdateAttempt <= 2) {
-                DateTime attemptStartedAtUtc = DateTime.UtcNow;
-                int baseWindowSeconds = formalUpdateAttempt == 1 ? policy.CheckSeconds : 180;
-                DateTime hardDeadline = attemptStartedAtUtc.AddSeconds(policy.HardCapSeconds);
-                DateTime deadline = attemptStartedAtUtc.AddSeconds(baseWindowSeconds);
-                if (deadline > hardDeadline) deadline = hardDeadline;
-                DateTime nextUiGateCheck = DateTime.MinValue;
-                FormalUpdateObservation previousObservation = null;
-                FormalUpdateObservation lastObservation = null;
-                DateTime lastProgressAtUtc = attemptStartedAtUtc;
-                while (DateTime.UtcNow < deadline) {
-                    if (cancellationRequested != null && cancellationRequested()) {
-                        StopToolProcess(formal);
-                        detail = formalUpdateAttempt == 1
-                            ? "cancelled_by_manager_during_formal_update"
-                            : "cancelled_by_manager_during_formal_update_retry";
-                        cancelled = true;
-                        exitCode = formal.HasExited ? formal.ExitCode : -1;
-                        return false;
-                    }
-                    formal.WaitForExit(150);
-                    RefreshFormalLayout(binding);
-                    FormalUpdateObservation observation = ReadFormalUpdateObservation(binding.UpdateState);
-                    lastObservation = observation;
-                    DateTime nowUtc = DateTime.UtcNow;
-                    if (nowUtc >= nextUiGateCheck) {
-                        nextUiGateCheck = nowUtc.AddSeconds(2);
-                        string blockingState = DetectFormalBlockingState(binding, formal);
-                        if (!String.IsNullOrEmpty(blockingState)) {
-                            StopToolProcess(formal);
-                            detail = blockingState;
-                            exitCode = 74;
-                            return false;
-                        }
-                    }
-                    if (FormalObservationShowsProgress(observation, previousObservation)) {
-                        lastProgressAtUtc = nowUtc;
-                        DateTime proposed = nowUtc.AddSeconds(policy.IdleSeconds);
-                        if (proposed > hardDeadline) proposed = hardDeadline;
-                        if (proposed > deadline.AddSeconds(15) ||
-                            (deadline <= nowUtc.AddSeconds(5) && proposed > deadline)) {
-                            deadline = proposed;
-                            string progressDetail = "formal_gui_update_deadline_extended: " +
-                                FormalUpdateSummary(observation, formalStartedAtUtc, nowUtc,
-                                    "attempt=" + formalUpdateAttempt + "; deadlineUtc=" + deadline.ToString("o") +
-                                    "; idleWindowSeconds=" + policy.IdleSeconds +
-                                    "; hardCapSeconds=" + policy.HardCapSeconds);
-                            if (onStage != null) {
-                                foreach (string operation in selectedOperations)
-                                    onStage(operation, "progress", progressDetail);
-                            }
-                        }
-                    }
-                    string updateError = String.Empty;
-                    if (!FormalUpdateReady(observation, out updateError)) {
-                        if (!String.IsNullOrEmpty(updateError)) {
-                            StopToolProcess(formal);
-                            detail = "client_update_required: " + updateError + "; " +
-                                FormalUpdateSummary(observation, formalStartedAtUtc, nowUtc,
-                                    "attempt=" + formalUpdateAttempt);
-                            exitCode = -1;
-                            return false;
-                        }
-                        previousObservation = observation;
-                        continue;
-                    }
-                    Process preInjectionInner = null;
-                    bool formalLoaded = HasFormalLoaded(binding, formalStartedAtUtc);
-                    if (!formalLoaded && binding.GameId == "GF2") {
-                        preInjectionInner = FindFormalInner(binding, formalStartedAtUtc);
-                        formalLoaded = preInjectionInner != null;
-                        if (!formalLoaded && DateTime.UtcNow >= nextGf2StartAttempt) {
-                            TryStartGf2FormalApplication(binding, formal);
-                            nextGf2StartAttempt = DateTime.UtcNow.AddSeconds(5);
-                        }
-                    }
-                    if (!formalLoaded) {
-                        previousObservation = observation;
-                        Thread.Sleep(150);
-                        continue;
-                    }
-                    if (preInjectionInner == null) preInjectionInner = FindFormalInner(binding, formalStartedAtUtc);
-                    if (preInjectionInner != null) StopToolProcess(preInjectionInner);
-                    if (binding.GameId == "WW") {
-                        EnsureWwGuiStreamGuard(binding);
-                        EnsureWwConditionalStageBoundaries(binding);
-                        EnsureWwAccountBridge(binding);
-                    }
-                    if (binding.GameId == "Endfield") EnsureEndfieldManagerBridge(binding);
-                    EnsureFormalGuiManagerBridge(binding);
-                    WriteFormalRunSidecar(binding, stageFile, selectedOperations);
-                    DateTime innerStartedAfterUtc = formalStartedAtUtc;
-                    if (binding.GameId == "Endfield" || binding.GameId == "GF2" || binding.AccountEnabled) {
-                        if (binding.GameId == "Endfield" || binding.AccountEnabled) SetFormalAutoStart(binding, true);
-                        StopToolProcess(formal);
-                        innerStartedAfterUtc = DateTime.UtcNow;
-                        var restart = new ProcessStartInfo {
-                            FileName = binding.Executable,
-                            Arguments = binding.Arguments,
-                            WorkingDirectory = binding.WorkingDirectory,
-                            UseShellExecute = true,
-                            CreateNoWindow = false
-                        };
-                        formal = Process.Start(restart);
-                        if (formal == null) throw new InvalidOperationException("formal_gui_restart_failed");
-                    }
-                    DateTime innerDeadline = DateTime.UtcNow.AddSeconds(180);
-                    while (DateTime.UtcNow < innerDeadline) {
-                        if (cancellationRequested != null && cancellationRequested()) {
-                            StopToolProcess(formal);
-                            detail = formalUpdateAttempt == 1
-                                ? "cancelled_by_manager_during_inner_gui_startup"
-                                : "cancelled_by_manager_during_inner_gui_retry_startup";
-                            cancelled = true;
-                            exitCode = formal.HasExited ? formal.ExitCode : -1;
-                            return false;
-                        }
-                        inner = FindFormalInner(binding, innerStartedAfterUtc);
-                        if (inner != null) {
-                            detail = formalUpdateAttempt == 1
-                                ? "formalGuiUpdate=checked; formalGuiAutoStart=true; innerGuiBound=true"
-                                : "formalGuiUpdate=checked-after-retry; formalGuiAutoStart=true; innerGuiBound=true";
-                            return true;
-                        }
-                        Thread.Sleep(150);
-                    }
-                    StopToolProcess(formal);
-                    detail = formalUpdateAttempt == 1
-                        ? "telemetry_missing:formal_gui_inner_bind_timeout"
-                        : "telemetry_missing:formal_gui_inner_bind_retry_timeout";
-                    return false;
-                }
-                // A PyAppify/libgit2 fetch can occasionally stop making progress
-                // even though a fresh formal launch succeeds immediately. Retry
-                // the same visible, update-capable entry once instead of skipping
-                // the updater or holding the Manager batch for hours.
-                if (formalUpdateAttempt == 1 && SupportsFormalUpdateRetry(binding.GameId)) {
-                    StopToolProcess(formal);
-                    StopStaleFormalProcesses(binding);
-                    Thread.Sleep(500);
-                    var retryStart = new ProcessStartInfo {
-                        FileName = binding.Executable,
-                        Arguments = binding.Arguments,
-                        WorkingDirectory = binding.WorkingDirectory,
-                        UseShellExecute = true,
-                        CreateNoWindow = false
-                    };
-                    formalStartedAtUtc = DateTime.UtcNow;
-                    formal = Process.Start(retryStart);
-                    if (formal == null) {
-                        detail = "formal_gui_update_retry_start_failed";
-                        return false;
-                    }
-                    formalUpdateAttempt++;
-                    nextGf2StartAttempt = DateTime.MinValue;
-                    if (onStage != null) {
-                        string retryDetail = "formal_gui_update_retry_started: " +
-                            FormalUpdateSummary(lastObservation, formalStartedAtUtc, DateTime.UtcNow,
-                                "retryWindowSeconds=180");
-                        foreach (string operation in selectedOperations)
-                            onStage(operation, "progress", retryDetail);
-                    }
-                    continue;
-                }
-                string screenshotName; string capturedAt; string captureDetail;
-                string timeoutExtra = "attempt=" + formalUpdateAttempt +
-                    "; idleWindowSeconds=" + policy.IdleSeconds +
-                    "; hardCapSeconds=" + policy.HardCapSeconds +
-                    "; lastProgressElapsedSeconds=" + Math.Max(0, (int)(lastProgressAtUtc - formalStartedAtUtc).TotalSeconds);
-                if (CaptureLaunchTimeoutEvidence(binding, Path.GetDirectoryName(stageFile), out screenshotName, out capturedAt, out captureDetail)) {
-                    timeoutExtra += "; launchTimeoutArtifact=" + screenshotName +
-                        "; launchTimeoutArtifactKind=game-ui-launch-timeout; launchTimeoutCapturedAt=" + capturedAt;
-                } else {
-                    timeoutExtra += "; launchTimeoutCapture=" + captureDetail;
-                }
-                StopToolProcess(formal);
-                detail = "telemetry_missing:formal_gui_update_check_timeout; " +
-                    FormalUpdateSummary(lastObservation, formalStartedAtUtc, DateTime.UtcNow, timeoutExtra);
-                exitCode = -1;
-                return false;
-            }
-            detail = "telemetry_missing:formal_gui_update_check_timeout";
-            exitCode = -1;
-            return false;
-        }
-        private static string PatchWwConditionalStageBoundaries(string source) {
-            const string marker = "# YEYU_GAMER_WW_CONDITIONAL_STAGES_V1";
-            const string nightmareAnchor = "        manager_requires_nightmare = (\n";
-            const string staminaAnchor = "        need_stamina = not daily_reward_ready and used_stamina < 180\n";
-            const string nightmareAction = "'farm-nightmare-daily-echo', 'started',\n";
-            const string staminaAction = "self.yeyu_stage('spend-waveplates', 'started', 'running configured stamina route')";
-            string normalized = source.Replace("\r\n", "\n");
-            string nightmareEntry =
-                "        " + marker + "\n" +
-                "        if (self._yeyu_selected_operations is not None\n" +
-                "                and self.yeyu_operation_enabled('farm-nightmare-daily-echo')):\n" +
-                "            self.yeyu_stage('farm-nightmare-daily-echo', 'started',\n" +
-                "                            'evaluating current daily condition; nightmare_present={}; nightmare_completed={}; daily_activity_points={}'.format(\n" +
-                "                                self._last_nightmare_daily_present, self._last_nightmare_daily_completed, self._last_daily_points))\n";
-            string staminaEntry =
-                "        if (self._yeyu_selected_operations is not None\n" +
-                "                and self.yeyu_operation_enabled('spend-waveplates')):\n" +
-                "            self.yeyu_stage('spend-waveplates', 'started',\n" +
-                "                            'evaluating current stamina condition; used_stamina={}; daily_reward_ready={}'.format(\n" +
-                "                                used_stamina, daily_reward_ready))\n";
-            if (normalized.Contains(marker)) {
-                if (!normalized.Contains(nightmareEntry + nightmareAnchor) ||
-                    !normalized.Contains(staminaEntry + staminaAnchor) ||
-                    normalized.Contains(staminaAction))
-                    throw new InvalidOperationException("ww_conditional_stage_patch_changed");
-                return source;
-            }
-            foreach (string anchor in new[] { nightmareAnchor, staminaAnchor, nightmareAction, staminaAction }) {
-                int first = normalized.IndexOf(anchor, StringComparison.Ordinal);
-                if (first < 0 || normalized.IndexOf(anchor, first + anchor.Length, StringComparison.Ordinal) >= 0)
-                    throw new InvalidOperationException("ww_conditional_stage_source_changed");
-            }
-            // The operation begins at the actual condition evaluation, while
-            // the daily page is still visible. Preserve the upstream terminal
-            // and its condition detail; never synthesize a start from a terminal.
-            normalized = normalized.Replace(nightmareAction, "'farm-nightmare-daily-echo', 'progress',\n")
-                .Replace(staminaAction, "self.yeyu_stage('spend-waveplates', 'progress', 'running configured stamina route')")
-                .Replace(nightmareAnchor, nightmareEntry + nightmareAnchor)
-                .Replace(staminaAnchor, staminaEntry + staminaAnchor);
-            return normalized;
-        }
-        private static void EnsureWwConditionalStageBoundaries(Binding binding) {
-            string path = Path.Combine(Path.GetDirectoryName(binding.InnerEntry), "src", "task", "DailyTask.py");
-            string originalHash = Hash(path);
-            string source = File.ReadAllText(path, Encoding.UTF8);
-            string patched = PatchWwConditionalStageBoundaries(source);
-            if (patched == source) return;
-            string backup = path + ".yeyu-before-conditional-stages-" + originalHash + ".bak";
-            if (!File.Exists(backup)) File.Copy(path, backup, false);
-            if (Hash(path) != originalHash || Hash(backup) != originalHash)
-                throw new InvalidOperationException("ww_conditional_stage_source_changed_during_patch");
-            string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            try {
-                File.WriteAllText(temporary, patched, new UTF8Encoding(false));
-                if (Hash(path) != originalHash)
-                    throw new InvalidOperationException("ww_conditional_stage_source_changed_during_patch");
-                File.Replace(temporary, path, null);
-            } finally {
-                if (File.Exists(temporary)) File.Delete(temporary);
-            }
-            if (File.ReadAllText(path, Encoding.UTF8) != patched)
-                throw new InvalidOperationException("ww_conditional_stage_write_failed");
-        }
-        private static void EnsureWwGuiStreamGuard(Binding binding) {
-            const string marker = "# YEYU_GAMER_GUI_STREAM_GUARD_V1";
-            string source = File.ReadAllText(binding.InnerEntry, Encoding.UTF8);
-            if (source.Contains(marker)) return;
-            if (!source.TrimStart().StartsWith("if __name__ == '__main__':", StringComparison.Ordinal))
-                throw new InvalidOperationException("ww_gui_entry_shape_changed");
-            string guard = marker + "\n" +
-                "import os\n" +
-                "import sys\n" +
-                "\n" +
-                "def _yeyu_guard_gui_stream(name):\n" +
-                "    stream = getattr(sys, name, None)\n" +
-                "    try:\n" +
-                "        if stream is None:\n" +
-                "            raise OSError('missing GUI stream')\n" +
-                "        stream.write('')\n" +
-                "        stream.flush()\n" +
-                "    except (OSError, ValueError, AttributeError):\n" +
-                "        setattr(sys, name, open(os.devnull, 'w', encoding='utf-8'))\n" +
-                "\n" +
-                "_yeyu_guard_gui_stream('stdout')\n" +
-                "_yeyu_guard_gui_stream('stderr')\n" +
-                "\n";
-            File.WriteAllText(binding.InnerEntry, guard + source, new UTF8Encoding(false));
-            if (!File.ReadAllText(binding.InnerEntry, Encoding.UTF8).Contains(marker))
-                throw new InvalidOperationException("ww_gui_stream_guard_write_failed");
-        }
-        private static void EnsureFormalGuiManagerBridge(Binding binding) {
-            const string marker = "# YEYU_GAMER_GUI_RUN_BRIDGE_V2";
-            string source = File.ReadAllText(binding.InnerEntry, Encoding.UTF8);
-            // Remove the V1 manager fragment whose --exit flag caused the
-            // upstream TaskExecutor to terminate both tool and game.
-            source = source.Replace(
-                "        if '--exit' not in _yeyu_sys.argv:\r\n            _yeyu_sys.argv.append('--exit')\r\n", String.Empty)
-                .Replace(
-                "        if '--exit' not in _yeyu_sys.argv:\n            _yeyu_sys.argv.append('--exit')\n", String.Empty);
-            if (source.Contains(marker)) return;
-            string normalized = source.Replace("\r\n", "\n");
-            string anchor = normalized.Contains("if __name__ == '__main__':\n")
-                ? "if __name__ == '__main__':\n"
-                : normalized.Contains("if __name__ == \"__main__\":\n")
-                    ? "if __name__ == \"__main__\":\n"
-                    : null;
-            if (anchor == null) throw new InvalidOperationException("formal_gui_entry_shape_changed");
-            string bridge = marker + "\n" +
-                "import json as _yeyu_json\n" +
-                "import os as _yeyu_os\n" +
-                "import sys as _yeyu_sys\n" +
-                "import time as _yeyu_time\n" +
-                "\n" +
-                "def _yeyu_manager_run_requested():\n" +
-                "    bridge_path = _yeyu_os.path.join(_yeyu_os.path.dirname(__file__), 'configs', 'YeYuGamerRun.json')\n" +
-                "    try:\n" +
-                "        with open(bridge_path, 'r', encoding='utf-8') as bridge_file:\n" +
-                "            bridge = _yeyu_json.load(bridge_file)\n" +
-                "        age = _yeyu_time.time() - float(bridge.get('createdAtUnix', 0))\n" +
-                "        return (bridge.get('schemaVersion') == 1 and bridge.get('active') is True\n" +
-                "                and -300 <= age <= 3600)\n" +
-                "    except Exception:\n" +
-                "        return False\n" +
-                "\n";
-            string guardedAnchor = anchor +
-                "    if _yeyu_manager_run_requested():\n" +
-                "        if '--task' not in _yeyu_sys.argv and '-t' not in _yeyu_sys.argv:\n" +
-                "            _yeyu_sys.argv.extend(['--task', '1'])\n" +
-                "        # The Manager bridge closes only the tool after the run.\n" +
-                "        # PyAppify's --exit path also kills the bound game client.\n";
-            normalized = normalized.Replace(anchor, bridge + guardedAnchor);
-            File.WriteAllText(binding.InnerEntry, normalized, new UTF8Encoding(false));
-            if (!File.ReadAllText(binding.InnerEntry, Encoding.UTF8).Contains(marker))
-                throw new InvalidOperationException("ww_gui_manager_bridge_write_failed");
-        }
-        private static void EnsureWwAccountBridge(Binding binding) {
-            if (!binding.AccountEnabled) return;
-            string resource = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "WwAccountYeYuBridge.py");
-            if (!File.Exists(resource)) throw new AccountBridgeGate("ww_account_bridge_resource_missing");
-            string target = Path.Combine(Path.GetDirectoryName(binding.InnerEntry), "WwAccountYeYuBridge.py");
-            string temporary = target + ".yeyu.tmp";
-            File.WriteAllBytes(temporary, File.ReadAllBytes(resource));
-            if (File.Exists(target)) File.Replace(temporary, target, null); else File.Move(temporary, target);
-            string source = File.ReadAllText(binding.InnerEntry, Encoding.UTF8);
-            string updated = PatchWwAccountEntry(source);
-            if (updated == source) return;
-            string original = binding.InnerEntry + ".pre-ww-account-" + Hash(binding.InnerEntry) + ".txt";
-            if (!File.Exists(original)) File.WriteAllText(original, source, new UTF8Encoding(false));
-            string entryTemporary = binding.InnerEntry + ".yeyu.tmp";
-            File.WriteAllText(entryTemporary, updated, new UTF8Encoding(false));
-            File.Replace(entryTemporary, binding.InnerEntry, null);
-        }
-        private static string PatchWwAccountEntry(string source) {
-            const string marker = "# YEYU_GAMER_WW_ACCOUNT_BRIDGE_V1";
-            if (source.Contains(marker)) return source;
-            string normalized = source.Replace("\r\n", "\n");
-            const string anchor = "    ok = OK(config)\n";
-            if (normalized.Split(new[] { anchor }, StringSplitOptions.None).Length != 2)
-                throw new AccountBridgeGate("ww_account_gui_entry_shape_changed");
-            string patch = "    " + marker + "\n" +
-                "    from WwAccountYeYuBridge import install as _yeyu_install_account_bridge\n" +
-                "    _yeyu_install_account_bridge(config, __file__)\n";
-            return normalized.Replace(anchor, patch + anchor);
-        }
-        private static void SetFormalAutoStart(Binding binding, bool enabled) {
-            IDictionary<string, object> state = Json.DeserializeObject(File.ReadAllText(binding.UpdateState, Encoding.UTF8)) as IDictionary<string, object>;
-            if (state == null) throw new InvalidOperationException("formal_gui_update_state_invalid");
-            state["auto_start"] = enabled;
-            string temporary = binding.UpdateState + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            File.WriteAllText(temporary, Json.Serialize(state), new UTF8Encoding(false));
-            if (File.Exists(binding.UpdateState)) File.Replace(temporary, binding.UpdateState, null);
-            else File.Move(temporary, binding.UpdateState);
-        }
-        private static void EnsureEndfieldManagerBridge(Binding binding) {
-            const string marker = "# YEYU_GAMER_ENDFIELD_BRIDGE_V2";
-            const string preConfigMarker = "# YEYU_GAMER_ENDFIELD_PRECONFIG_BRIDGE_V1";
-            string packaged = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "EndfieldYeYuBridge.py");
-            if (!File.Exists(packaged)) throw new InvalidOperationException("endfield_bridge_package_missing");
-            string patches = Path.Combine(Path.GetDirectoryName(binding.InnerEntry), "src", "patches");
-            if (!Directory.Exists(patches)) throw new InvalidOperationException("endfield_patch_root_missing");
-            string target = Path.Combine(patches, "yeyu_gamer_bridge.py");
-            File.Copy(packaged, target, true);
-
-            string source = File.ReadAllText(binding.InnerEntry, Encoding.UTF8);
-            if (!source.Contains(preConfigMarker)) {
-                string normalized = source.Replace("\r\n", "\n");
-                const string configAnchor = "from src.config import config";
-                if (!normalized.Contains(configAnchor)) throw new InvalidOperationException("endfield_gui_config_anchor_changed");
-                string preConfigBridge = preConfigMarker + "\n" +
-                    "import json as _yeyu_pre_json\n" +
-                    "import os as _yeyu_pre_os\n" +
-                    "import sys as _yeyu_pre_sys\n" +
-                    "import time as _yeyu_pre_time\n" +
-                    "\n" +
-                    "def _yeyu_pre_config_run_requested():\n" +
-                    "    bridge_path = _yeyu_pre_os.path.join(_yeyu_pre_os.path.dirname(__file__), 'configs', 'YeYuGamerRun.json')\n" +
-                    "    try:\n" +
-                    "        with open(bridge_path, 'r', encoding='utf-8') as bridge_file:\n" +
-                    "            bridge = _yeyu_pre_json.load(bridge_file)\n" +
-                    "        age = _yeyu_pre_time.time() - float(bridge.get('createdAtUnix', 0))\n" +
-                    "        return (bridge.get('schemaVersion') == 1 and bridge.get('active') is True\n" +
-                    "                and -300 <= age <= 3600)\n" +
-                    "    except Exception:\n" +
-                    "        return False\n" +
-                    "\n" +
-                    "if _yeyu_pre_config_run_requested():\n" +
-                    "    if '--task' not in _yeyu_pre_sys.argv and '-t' not in _yeyu_pre_sys.argv:\n" +
-                    "        _yeyu_pre_sys.argv.extend(['--task', '1'])\n" +
-                    "\n";
-                normalized = normalized.Replace(configAnchor, preConfigBridge + configAnchor);
-                File.WriteAllText(binding.InnerEntry, normalized, new UTF8Encoding(false));
-                source = normalized;
-            }
-            if (!source.Contains(marker)) {
-                string normalized = source.Replace("\r\n", "\n");
-                const string anchor = "    install_startup_patches()\n";
-                if (!normalized.Contains(anchor)) throw new InvalidOperationException("endfield_gui_entry_shape_changed");
-                string injection = anchor +
-                    "    " + marker + "\n" +
-                    "    from src.patches.yeyu_gamer_bridge import install_yeyu_gamer_bridge\n" +
-                    "    install_yeyu_gamer_bridge()\n";
-                normalized = normalized.Replace(anchor, injection);
-                File.WriteAllText(binding.InnerEntry, normalized, new UTF8Encoding(false));
-            }
-            string verifiedMain = File.ReadAllText(binding.InnerEntry, Encoding.UTF8);
-            string verifiedBridge = File.ReadAllText(target, Encoding.UTF8);
-            if (!verifiedMain.Contains(marker) || !verifiedMain.Contains(preConfigMarker) || !verifiedBridge.Contains("_yeyu_gamer_bridge_v2"))
-                throw new InvalidOperationException("endfield_manager_bridge_write_failed");
-        }
-        private static string FormalRunSidecarPath(Binding binding) {
-            return Path.Combine(Path.GetDirectoryName(binding.DailyConfig), "YeYuGamerRun.json");
-        }
-        private static void WriteFormalRunSidecar(Binding binding, string stageFile, string[] selectedOperations) {
-            string path = FormalRunSidecarPath(binding);
-            Directory.CreateDirectory(Path.GetDirectoryName(path));
-            string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
-            var document = new Dictionary<string, object> {
-                { "schemaVersion", 1 }, { "active", true },
-                { "createdAtUnix", (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds },
-                { "stageFile", Path.GetFullPath(stageFile) },
-                { "selectedOperations", selectedOperations }
-            };
-            if (binding.AccountEnabled) {
-                document["accountId"] = binding.AccountId;
-                document["accountSnapshot"] = binding.AccountSnapshot;
-                document["accountOperation"] = binding.AccountOperation;
-            }
-            File.WriteAllText(temporary, Json.Serialize(document), new UTF8Encoding(false));
-            if (File.Exists(path)) File.Replace(temporary, path, null);
-            else File.Move(temporary, path);
-        }
-        private static void ClearFormalRunSidecars(Binding binding) {
-            var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
-                FormalRunSidecarPath(binding),
-                Path.Combine(binding.ToolRoot, "working", "configs", "YeYuGamerRun.json"),
-                Path.Combine(binding.ToolRoot, "data", "apps", binding.AppName ?? String.Empty,
-                    "working", "configs", "YeYuGamerRun.json")
-            };
-            foreach (string path in paths) {
-                try { if (File.Exists(path)) File.Delete(path); }
-                catch (IOException) { }
-                catch (UnauthorizedAccessException) { }
-            }
-        }
-        private static void RefreshFormalLayout(Binding binding) {
-            if (String.IsNullOrEmpty(binding.AppName)) return;
-            string appRoot = Path.Combine(binding.ToolRoot, "data", "apps", binding.AppName);
-            string updateState = Path.Combine(appRoot, "app.json");
-            string innerPython = Path.Combine(appRoot, "python", "pythonw.exe");
-            string innerEntry = Path.Combine(appRoot, "working", "main.py");
-            string dailyConfig = Path.Combine(appRoot, "working", "configs", "DailyTask.json");
-            if (!File.Exists(updateState) || !File.Exists(innerPython) ||
-                !File.Exists(innerEntry) || !File.Exists(dailyConfig)) return;
-            binding.UpdateState = updateState;
-            binding.InnerPython = innerPython;
-            binding.InnerEntry = innerEntry;
-            binding.DailyConfig = dailyConfig;
-        }
-        private static bool FormalUpdateReady(string path, out string error) {
-            return FormalUpdateReady(ReadFormalUpdateObservation(path), out error);
-        }
-        private static bool FormalUpdateReady(FormalUpdateObservation state, out string error) {
-            error = String.Empty;
-            try {
-                if (state == null || !state.Exists || !state.ValidJson || !state.Installed ||
-                    String.IsNullOrEmpty(state.CurrentVersion) ||
-                    !String.Equals(state.CurrentVersion, state.StartingVersion, StringComparison.Ordinal)) return false;
-                // PyAppify 1.1.6 rewrites app.json without update_state after a
-                // successful update pass.  If the field is present it must be
-                // idle; if it is absent, matching installed/starting versions
-                // plus the fresh formal log below are the completion proof.
-                if (!String.IsNullOrWhiteSpace(state.UpdateState) &&
-                    !String.Equals(state.UpdateState, "idle", StringComparison.OrdinalIgnoreCase)) return false;
-                if (!String.IsNullOrWhiteSpace(state.UpdateError)) {
-                    error = state.UpdateError;
-                    return false;
-                }
-                return true;
-            } catch (Exception) { return false; }
-        }
-        private static bool TryStartGf2FormalApplication(Binding binding, Process formal) {
-            if (binding.GameId != "GF2" || formal == null) return false;
-            try {
-                formal.Refresh();
-                IntPtr window = formal.MainWindowHandle;
-                if (window == IntPtr.Zero) {
-                    foreach (Process candidate in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(binding.Executable))) {
-                        try {
-                            candidate.Refresh();
-                            if (candidate.MainWindowHandle == IntPtr.Zero) continue;
-                            string image = candidate.MainModule.FileName;
-                            if (!String.Equals(Path.GetFullPath(image), Path.GetFullPath(binding.Executable), StringComparison.OrdinalIgnoreCase)) continue;
-                            window = candidate.MainWindowHandle;
-                            break;
-                        } catch { }
-                        finally { candidate.Dispose(); }
-                    }
-                }
-                if (window == IntPtr.Zero) return false;
-                AutomationElement root = AutomationElement.FromHandle(window);
-                foreach (AutomationElement button in root.FindAll(TreeScope.Descendants, Condition.TrueCondition)) {
-                    string name = button.Current.Name == null ? String.Empty : button.Current.Name.Trim();
-                    if (name != "启动应用") continue;
-                    if (!button.Current.IsEnabled || button.Current.IsOffscreen) return false;
-                    int clickCount;
-                    lock (Gf2FormalStartClicks) {
-                        Gf2FormalStartClicks.TryGetValue(window, out clickCount);
-                        if (clickCount >= 2) return true;
-                    }
-                    object rectangle = button.GetCurrentPropertyValue(AutomationElement.BoundingRectangleProperty);
-                    Type rectangleType = rectangle == null ? null : rectangle.GetType();
-                    if (rectangleType != null) {
-                        double left = Convert.ToDouble(rectangleType.GetProperty("Left").GetValue(rectangle, null));
-                        double top = Convert.ToDouble(rectangleType.GetProperty("Top").GetValue(rectangle, null));
-                        double width = Convert.ToDouble(rectangleType.GetProperty("Width").GetValue(rectangle, null));
-                        double height = Convert.ToDouble(rectangleType.GetProperty("Height").GetValue(rectangle, null));
-                        if (width >= 4 && height >= 4) {
-                            ShowWindowAsync(window, SwShow);
-                            SetForegroundWindow(window);
-                            Thread.Sleep(150);
-                            if (SetCursorPos((int)Math.Round(left + width / 2), (int)Math.Round(top + height / 2))) {
-                                mouse_event(MouseLeftDown, 0, 0, 0, UIntPtr.Zero);
-                                Thread.Sleep(60);
-                                mouse_event(MouseLeftUp, 0, 0, 0, UIntPtr.Zero);
-                                lock (Gf2FormalStartClicks) { Gf2FormalStartClicks[window] = clickCount + 1; }
-                                return true;
-                            }
-                        }
-                    }
-                    object pattern;
-                    if (button.TryGetCurrentPattern(InvokePattern.Pattern, out pattern)) {
-                        ((InvokePattern)pattern).Invoke();
-                        lock (Gf2FormalStartClicks) { Gf2FormalStartClicks[window] = clickCount + 1; }
-                        return true;
-                    }
-                    return false;
-                }
-            } catch (ElementNotAvailableException) { }
-            catch (InvalidOperationException) { }
-            catch (System.ComponentModel.Win32Exception) { }
-            return false;
-        }
-        private static bool HasFormalLoaded(Binding binding, DateTime notBeforeUtc) {
-            try {
-                bool loaded = false; bool versionChecked = false; bool latest = false;
-                string logRoot = Path.Combine(binding.ToolRoot, "logs");
-                if (!Directory.Exists(logRoot)) return false;
-                // PyAppify names its rolling file with UTC date on this build;
-                // around Beijing midnight DateTime.Now points at the next name.
-                // Inspect only freshly-written fixed-root app logs.
-                foreach (string log in Directory.GetFiles(logRoot, "app.*")) {
-                    if (File.GetLastWriteTimeUtc(log) < notBeforeUtc.AddSeconds(-1)) continue;
-                    using (var stream = new FileStream(log, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-                    using (var reader = new StreamReader(stream, Encoding.UTF8, true)) {
-                        string line;
-                        while ((line = reader.ReadLine()) != null) {
-                            DateTime loggedAt;
-                            if (line.Length < 23 || !DateTime.TryParseExact(line.Substring(0, 23), "yyyy-MM-dd HH:mm:ss.fff",
-                                System.Globalization.CultureInfo.InvariantCulture,
-                                System.Globalization.DateTimeStyles.AssumeLocal, out loggedAt) ||
-                                loggedAt.ToUniversalTime() < notBeforeUtc.AddSeconds(-1)) continue;
-                            loaded |= line.Contains("Loaded app '" + binding.AppName + "'");
-                            versionChecked |= line.Contains("get_tags_and_current_version done for " + binding.AppName);
-                            latest |= (line.Contains("First load, checking update and auto-start conditions") ||
-                                       line.Contains("First load, checking for auto-start conditions")) &&
-                                      line.Contains("is_latest:true");
-                        }
-                    }
-                }
-                return loaded && versionChecked && latest;
-            } catch (IOException) { }
-            catch (UnauthorizedAccessException) { }
-            return false;
-        }
-        private static void ApplyWwPyAppifyEnvironment(ProcessStartInfo start, Binding binding) {
-            IDictionary<string, object> state = Json.DeserializeObject(File.ReadAllText(binding.UpdateState, Encoding.UTF8)) as IDictionary<string, object>;
-            if (state == null) throw new InvalidOperationException("formal_gui_update_state_invalid");
-            object currentVersion; object startingVersion; object currentProfile;
-            if (state.TryGetValue("current_version", out currentVersion) && currentVersion is string)
-                start.EnvironmentVariables["PYAPPIFY_APP_VERSION"] = (string)currentVersion;
-            if (state.TryGetValue("app_starting_version", out startingVersion) && startingVersion is string)
-                start.EnvironmentVariables["PYAPPIFY_APP_STARTING_VERSION"] = (string)startingVersion;
-            if (state.TryGetValue("current_profile", out currentProfile) && currentProfile is string)
-                start.EnvironmentVariables["PYAPPIFY_APP_PROFILE"] = (string)currentProfile;
-            start.EnvironmentVariables["PYAPPIFY_APP_JSON_PATH"] = binding.UpdateState;
-            start.EnvironmentVariables["PYAPPIFY_EXECUTABLE"] = binding.Executable;
-            start.EnvironmentVariables["PYAPPIFY_UPGRADEABLE"] = "1";
-            start.EnvironmentVariables["PYAPPIFY_LOCALE"] = System.Globalization.CultureInfo.CurrentUICulture.Name;
-            start.EnvironmentVariables["PYAPPIFY_UPDATE_NOTE"] = String.Empty;
-            start.EnvironmentVariables["PYAPPIFY_VERSION"] = FileVersionInfo.GetVersionInfo(binding.Executable).FileVersion ?? String.Empty;
-            start.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
-            start.EnvironmentVariables["PYTHONUNBUFFERED"] = "1";
-            start.EnvironmentVariables["PYTHONNOUSERSITE"] = "1";
-            start.EnvironmentVariables["PYTHONPATH"] = String.Empty;
-        }
-        private static Process FindFormalInner(Binding binding, DateTime notBeforeUtc) {
-            Process match = null;
-            Process[] candidates = Process.GetProcessesByName(Path.GetFileNameWithoutExtension(binding.InnerPython));
-            foreach (Process candidate in candidates) {
-                try {
-                    if (candidate.StartTime.ToUniversalTime() < notBeforeUtc.AddSeconds(-1)) { candidate.Dispose(); continue; }
-                    string image = null;
-                    try { image = candidate.MainModule.FileName; }
-                    catch (System.ComponentModel.Win32Exception) { }
-                    catch (InvalidOperationException) { }
-                    if (!String.IsNullOrEmpty(image) && !Path.GetFullPath(image).StartsWith(
-                        Path.GetFullPath(binding.ToolRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar,
-                        StringComparison.OrdinalIgnoreCase)) {
-                        candidate.Dispose();
-                        continue;
-                    }
-                    if (match != null) {
-                        match.Dispose();
-                        candidate.Dispose();
-                        return null;
-                    }
-                    match = candidate;
-                } catch (InvalidOperationException) { candidate.Dispose(); }
-            }
-            return match;
-        }
         private static void ConfigureToolOutput(ProcessStartInfo start) {
-            start.RedirectStandardOutput = true;
-            start.RedirectStandardError = true;
-            start.StandardOutputEncoding = Encoding.UTF8;
-            start.StandardErrorEncoding = Encoding.UTF8;
+            YeYuGamer.AdapterHost.UpstreamConsoleCapture.Configure(start);
         }
-        private static void DrainToolOutput(Process process) {
-            if (process == null) return;
-            process.OutputDataReceived += delegate { };
-            process.ErrorDataReceived += delegate { };
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
+        private static void DrainToolOutput(Process process, string logPath) {
+            YeYuGamer.AdapterHost.UpstreamConsoleCapture.Drain(process, logPath);
         }
         private static void StopToolProcess(Process process) {
             if (process == null || process.HasExited) return;
@@ -1766,17 +1611,200 @@ namespace YeYuGamer.LocalDailyAdapter
                 string state = record.ContainsKey("state") ? record["state"] as string : null;
                 string detail = record.ContainsKey("detail") ? record["detail"] as string : String.Empty;
                 if (!String.IsNullOrEmpty(operation) && !String.IsNullOrEmpty(state)) {
+                    string account = record.ContainsKey("account") ? record["account"] as string : null;
+                    if (!String.IsNullOrEmpty(account))
+                        detail = "account=" + account + (String.IsNullOrEmpty(detail) ? String.Empty : "; " + detail);
                     onStage(operation, state, detail ?? String.Empty);
-                    if (state == "capture_before" || state == "capture_after" || state == "account_verified" || state.StartsWith("account_capture_", StringComparison.Ordinal)) {
-                        File.WriteAllText(
-                            stageFile + ".capture.ack",
-                            state + "; capturedAt=" + DateTime.UtcNow.ToString("o"),
-                            new UTF8Encoding(false));
-                    }
+
                 }
             }
         }
 
+        private static string NormalizeWwAccount(string account) {
+            if (String.IsNullOrEmpty(account)) return String.Empty;
+            return account.ToLowerInvariant().Replace('0', 'o').Replace(".con", ".com");
+        }
+        private static bool WwAccountsMatch(string left, string right) {
+            string a = NormalizeWwAccount(left);
+            string b = NormalizeWwAccount(right);
+            return !String.IsNullOrEmpty(a) && a == b;
+        }
+        private static void WriteWwInspectionScope(Binding binding, IDictionary<string, object> request,
+            string todoId, string todoAttemptId, string imagePath, string observedAt) {
+            WriteWwVerificationScope(binding, request, todoId, todoAttemptId, imagePath, observedAt, "inspect-daily-progress");
+        }
+        private static void WriteWwVerificationScope(Binding binding, IDictionary<string, object> request,
+            string todoId, string todoAttemptId, string imagePath, string observedAt, string operation) {
+            bool reward = operation == "claim-daily-reward";
+            bool battlePass = operation == "claim-battle-pass";
+            bool allowed = (operation == "inspect-daily-progress" && binding.WwInspectionSupported && binding.WwInspectionOnly)
+                || (reward && binding.WwRewardInspectionSupported && binding.WwRewardInspectionOnly)
+                || (battlePass && binding.WwBattlePassInspectionSupported && binding.WwBattlePassInspectionOnly);
+            allowed |= binding.WwInspectionOperations != null && binding.WwInspectionOperations.Contains(operation)
+                && ((operation == "inspect-daily-progress" && binding.WwInspectionSupported)
+                    || (reward && binding.WwRewardInspectionSupported) || (battlePass && binding.WwBattlePassInspectionSupported));
+            if (!allowed || !binding.AccountEnabled)
+                throw new InvalidDataException("ww_inspection_identity_unconfirmed");
+            string imageStem = Path.GetFileNameWithoutExtension(imagePath);
+            if (!Regex.IsMatch(imageStem, "^ww-recognition-[0-9a-f]{32}_original$"))
+                throw new InvalidDataException("ww_inspection_source_name_invalid");
+            // OfficialStepCapture uses <recognition-id>_original.png and
+            // <recognition-id>.json, not <recognition-id>_original.json.
+            string sourceName = imageStem.Substring(0, imageStem.Length - "_original".Length) + ".json";
+            string sourcePath = Path.Combine(Path.GetDirectoryName(imagePath), sourceName);
+            var recognition = Json.DeserializeObject(File.ReadAllText(sourcePath, Encoding.UTF8)) as IDictionary<string, object>;
+            if (recognition == null || (recognition["operation"] as string) != operation ||
+                (recognition["recognitionType"] as string) != (reward ? "template" : "ocr") || (recognition["coordinateSpace"] as string) != "full-frame" ||
+                (reward && (recognition["template"] as string) != "daily_reward_claimed_check") ||
+                (battlePass && (!recognition.ContainsKey("verificationPage") || !new[] { "tasks", "rewards" }.Contains(recognition["verificationPage"] as string))) ||
+                !WwAccountsMatch(recognition["upstreamConfirmedAccount"] as string, binding.SavedAccountLabel) ||
+                (recognition["observedAt"] as string) != observedAt || (recognition["screenshotSha256"] as string) != Hash(imagePath))
+                throw new InvalidDataException("ww_inspection_source_mismatch");
+            var scope = new Dictionary<string, object> {
+                {"schemaVersion", 1}, {"gameId", "WW"}, {"accountId", binding.AccountId},
+                {"runId", request["runId"]}, {"runAttemptId", request["runAttemptId"]},
+                {"todoInstanceId", todoId}, {"todoAttemptId", todoAttemptId},
+                {"observedAt", observedAt}, {"sourceMetadataFile", sourceName},
+                {"sourceMetadataSha256", Hash(sourcePath)}, {"sha256", Hash(imagePath)},
+                {"kind", reward || battlePass ? "game-ui-reward-verification-raw" : "game-ui-key-step-verification-raw"},
+                {"boundary", battlePass ? "DailyTask.inspect_battle_pass_page" : reward ? "DailyTask.inspect_daily_reward_status" : "DailyTask.inspect_daily_progress"}
+            };
+            if (battlePass) scope["verificationPage"] = recognition["verificationPage"];
+            File.WriteAllText(imagePath + ".recognition.json", Json.Serialize(scope), new UTF8Encoding(false));
+        }
+        private static void AppendWwObservation(string path, string operation, string state, string detail, string account) {
+            if (String.IsNullOrEmpty(path) || String.IsNullOrEmpty(operation) || String.IsNullOrEmpty(state)) return;
+            try {
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                if (state == "step_artifact") {
+                    string fileName = DetailValue(detail, "file");
+                    string staging = Environment.GetEnvironmentVariable("YEYU_GAMER_ADAPTER_STAGING_DIR");
+                    if (String.IsNullOrEmpty(fileName) || fileName != Path.GetFileName(fileName) || String.IsNullOrEmpty(staging)) return;
+                    string source = Path.Combine(staging, fileName);
+                    string destination = Path.Combine(Path.GetDirectoryName(path), fileName);
+                    if (!String.Equals(Path.GetFullPath(source), Path.GetFullPath(destination), StringComparison.OrdinalIgnoreCase))
+                        File.Copy(source, destination, true);
+                }
+                var record = new Dictionary<string, object> {
+                    { "operation", operation }, { "state", state }, { "detail", detail ?? String.Empty },
+                    { "at", DateTime.Now.ToString("o") }
+                };
+                if (!String.IsNullOrEmpty(account)) record["account"] = account;
+                File.AppendAllText(path, Json.Serialize(record) + "\n", new UTF8Encoding(false));
+            } catch (Exception) { }
+        }
+        private static void ImportWwSidecarArtifact(string observationFile, string operation, string state, string detail, Dictionary<string, List<Tuple<string, string, string>>> evidence) {
+            string fileName = DetailValue(detail, "file");
+            if (String.IsNullOrEmpty(observationFile) || String.IsNullOrEmpty(fileName) || fileName != Path.GetFileName(fileName)) return;
+            string sourceDir = Path.GetDirectoryName(observationFile);
+            string staging = Environment.GetEnvironmentVariable("YEYU_GAMER_ADAPTER_STAGING_DIR");
+            if (String.IsNullOrEmpty(sourceDir) || String.IsNullOrEmpty(staging)) return;
+            string source = Path.Combine(sourceDir, fileName);
+            string destination = Path.Combine(staging, fileName);
+            if (!File.Exists(source)) return;
+            try {
+                if (!String.Equals(Path.GetFullPath(source), Path.GetFullPath(destination), StringComparison.OrdinalIgnoreCase))
+                    File.Copy(source, destination, true);
+            } catch (Exception) { return; }
+            string kind = state == "step_artifact" ? DetailValue(detail, "kind") : state == "sidecar_before" ? "game-ui-step-before-raw"
+                : state == "sidecar_after_watermarked" ? "game-ui-step-after-watermarked"
+                : "game-ui-step-after-raw";
+            string capturedAt = DetailValue(detail, "capturedAt");
+            if (String.IsNullOrEmpty(capturedAt) || (!IsStepArtifactKind(kind) &&
+                !(operation == "inspect-daily-progress" && kind == "game-ui-key-step-verification-raw") &&
+                !((operation == "claim-daily-reward" || operation == "claim-battle-pass") && kind == "game-ui-reward-verification-raw"))) return;
+            List<Tuple<string, string, string>> items;
+            if (!evidence.TryGetValue(operation, out items)) {
+                items = new List<Tuple<string, string, string>>();
+                evidence[operation] = items;
+            }
+            if (!items.Any(item => item.Item1 == fileName)) items.Add(Tuple.Create(fileName, kind, capturedAt));
+        }
+        private static bool IsStepArtifactKind(string kind) {
+            // Old artifacts keep their original semantics during replay.
+            // Recognition inputs are process evidence, never automatically
+            // renamed to dedicated reward/key-step verification frames.
+            return new[] { "game-ui-step-before-raw", "game-ui-step-after-raw", "game-ui-step-after-watermarked",
+                "game-ui-daily-reward-before", "game-ui-daily-reward-raw", "game-ui-daily-reward-watermarked",
+                "game-ui-recognition-raw", "game-ui-recognition-replay-raw", "official-recognition-metadata" }.Contains(kind);
+        }
+        private static Tuple<string, string, string> ParseStepArtifactDescriptor(string gameId, bool gf2InspectionOnly, string detail) {
+            string fileName = DetailValue(detail, "file");
+            string kind = DetailValue(detail, "kind");
+            bool inspectionMetadata = gameId == "GF2" && gf2InspectionOnly && kind == "game-ui-recognition-meta";
+            if (String.IsNullOrEmpty(fileName) || Path.GetFileName(fileName) != fileName ||
+                (!IsStepArtifactKind(kind) && !inspectionMetadata)) return null;
+            return Tuple.Create(fileName, kind, inspectionMetadata ? "text/plain" : StepArtifactMimeType(kind));
+        }
+        private static string StepArtifactMimeType(string kind) {
+            return kind == "official-recognition-metadata" ? "text/plain" : "image/png";
+        }
+        private static void ReplayWwOfficialObservations(Binding binding, string observationFile, Action<string, string, string> onStage) {
+            if (String.IsNullOrEmpty(observationFile) || !File.Exists(observationFile) || onStage == null) return;
+            string[] lines;
+            try { lines = ReadSharedLines(observationFile); }
+            catch (IOException) { return; }
+            foreach (string line in lines) {
+                IDictionary<string, object> record;
+                try { record = Json.DeserializeObject(line) as IDictionary<string, object>; }
+                catch (Exception) { continue; }
+                if (record == null) continue;
+                string operation = record.ContainsKey("operation") ? record["operation"] as string : null;
+                string state = record.ContainsKey("state") ? record["state"] as string : null;
+                string detail = record.ContainsKey("detail") ? record["detail"] as string : String.Empty;
+                string account = record.ContainsKey("account") ? record["account"] as string : null;
+                if (String.IsNullOrEmpty(operation) || String.IsNullOrEmpty(state)) continue;
+                if (state == "capture_failed") continue;
+                if (!WwAccountsMatch(account, binding.SavedAccountLabel)) continue;
+                if (!String.IsNullOrEmpty(account))
+                    detail = "account=" + account + (String.IsNullOrEmpty(detail) ? String.Empty : "; " + detail);
+                // A replayed observation re-presents the shared writer run's
+                // physical evidence inside this attempt's own lease. The
+                // writer's capture instant predates this lease, so a verbatim
+                // replay is rejected by the Manager as
+                // artifact_time_out_of_scope. The protocol time describes this
+                // new sealing, while the original observation stays in detail
+                // and the immutable metadata file. Recognition images receive
+                // an explicit replay kind; historical action labels remain.
+                detail = RestampReplayedCaptureTimes(detail);
+                onStage(operation, state, detail ?? String.Empty);
+            }
+        }
+        private static string RestampReplayedCaptureTimes(string detail) {
+            if (String.IsNullOrEmpty(detail)) return detail;
+            string kind = DetailValue(detail, "kind");
+            if (kind == "game-ui-recognition-raw" || kind == "game-ui-recognition-replay-raw" ||
+                kind == "official-recognition-metadata") {
+                string originalObservedAt = DetailValue(detail, "originalObservedAt");
+                if (String.IsNullOrEmpty(originalObservedAt)) {
+                    originalObservedAt = DetailValue(detail, "capturedAt");
+                    if (!String.IsNullOrEmpty(originalObservedAt)) detail += "; originalObservedAt=" + originalObservedAt;
+                }
+                if (kind == "game-ui-recognition-raw")
+                    detail = ReplaceDetailValue(detail, "kind", "game-ui-recognition-replay-raw");
+            }
+            string now = DateTime.Now.ToString("o");
+            // `capturedAt` is a shorter, lower-case sibling of
+            // `launchTimeoutCapturedAt`; the ordinal search keeps them apart.
+            foreach (string key in new[] { "capturedAt", "launchTimeoutCapturedAt" })
+                detail = ReplaceDetailValue(detail, key, now);
+            return detail;
+        }
+        private static string ReplaceDetailValue(string detail, string key, string value) {
+            if (String.IsNullOrEmpty(detail) || String.IsNullOrEmpty(key)) return detail;
+            string marker = key + "=";
+            int search = 0;
+            while (true) {
+                int start = detail.IndexOf(marker, search, StringComparison.Ordinal);
+                if (start < 0) return detail;
+                start += marker.Length;
+                int end = detail.IndexOf(';', start);
+                detail = end < 0
+                    ? detail.Substring(0, start) + value
+                    : detail.Substring(0, start) + value + detail.Substring(end);
+                search = start + value.Length;
+            }
+        }
         private static string[] ReadSharedLines(string path) {
             using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
             using (var reader = new StreamReader(stream, Encoding.UTF8, true))
@@ -1797,77 +1825,97 @@ namespace YeYuGamer.LocalDailyAdapter
                 if (!String.IsNullOrEmpty(detail) && detail.StartsWith(code, StringComparison.Ordinal)) return code;
             return fallback;
         }
-        private static string DetectFormalBlockingState(Binding binding, Process process) {
-            var seen = new HashSet<int>();
-            if (process != null) {
-                try {
-                    seen.Add(process.Id);
-                    string primary = DetectFormalBlockingWindow(binding, process);
-                    if (!String.IsNullOrEmpty(primary)) return primary;
-                } catch (InvalidOperationException) { }
+        private static void ApplySelectedOfficialDailyConfig(Binding binding, string[] selectedOperations) {
+            if (binding.GameId == "WW") {
+                if (!binding.WwInspectionSupported) return;
+                var wwConfig = Json.DeserializeObject(File.ReadAllText(binding.DailyConfig, Encoding.UTF8)) as IDictionary<string, object>;
+                if (wwConfig == null) throw new InvalidOperationException("daily_config_invalid");
+                wwConfig["Daily Progress Inspection Only"] = binding.WwInspectionOnly;
+                if (binding.WwRewardInspectionSupported)
+                    wwConfig["Daily Reward Status Inspection Only"] = binding.WwRewardInspectionOnly;
+                if (binding.WwBattlePassInspectionSupported)
+                    wwConfig["Battle Pass Status Inspection Only"] = binding.WwBattlePassInspectionOnly;
+                wwConfig["Daily Progress Inspection Account"] = (binding.WwInspectionOnly || binding.WwRewardInspectionOnly || binding.WwBattlePassInspectionOnly) ? binding.SavedAccountLabel : String.Empty;
+                File.WriteAllText(binding.DailyConfig, Json.Serialize(wwConfig), new UTF8Encoding(false));
+                return;
             }
-            // A signed PyAppify bootstrap may hand the visible window to a
-            // replacement bootstrap or its fixed inner Python process. Sample
-            // every fixed executable involved in that handoff; otherwise a
-            // visible "continue download" gate can be missed after the first
-            // Process object exits and later degrade into a generic timeout.
-            foreach (string executable in new string[] { binding.Executable, binding.InnerPython }) {
-                if (String.IsNullOrWhiteSpace(executable) || !File.Exists(executable)) continue;
-                string expected = Path.GetFullPath(executable);
-                foreach (Process candidate in Process.GetProcessesByName(Path.GetFileNameWithoutExtension(expected))) {
-                    try {
-                        if (!seen.Add(candidate.Id)) continue;
-                        string image = candidate.MainModule.FileName;
-                        if (String.IsNullOrWhiteSpace(image)) continue;
-                        if (!String.Equals(Path.GetFullPath(image), expected, StringComparison.OrdinalIgnoreCase)) continue;
-                        string state = DetectFormalBlockingWindow(binding, candidate);
-                        if (!String.IsNullOrEmpty(state)) return state;
-                    } catch (System.ComponentModel.Win32Exception) { }
-                    catch (InvalidOperationException) { }
-                    finally { candidate.Dispose(); }
-                }
-            }
-            return String.Empty;
+            var selected = new HashSet<string>(selectedOperations ?? new string[0], StringComparer.Ordinal);
+            IDictionary<string, object> config = Json.DeserializeObject(File.ReadAllText(binding.DailyConfig, Encoding.UTF8)) as IDictionary<string, object>;
+            if (config == null) throw new InvalidOperationException("daily_config_invalid");
+            if (binding.GameId == "Endfield") {
+                // The official plan defaults several omitted switches to true.
+                // A scoped seven-operation run must explicitly disable its
+                // other plan entries; omission would execute unselected work.
+                // Original bytes and all task parameters are restored afterward.
+                foreach (string key in new[] {
+                    "⭐送礼", "⭐帝江号整理", "⭐帝江号一键存放", "⭐简易制作",
+                    "⭐自动送货", "⭐造装备", "⭐买信用商店", "⭐演算",
+                    "⭐传送到帝江号右侧传送点", "⭐执行外部命令"
+                }) config[key] = false;
+                config["⭐地区建设"] = new string[0];
+                config["⭐活动奖励"] = new string[0];
+                config["⭐收邮件"] = selected.Contains("mail");
+                config["⭐刷体力"] = selected.Contains("spend-sanity");
+                config["⭐转交运送委托"] = selected.Contains("delivery-commission");
+                config["⭐收信用"] = selected.Contains("collect-credit");
+                // This official multi-selection is account-configured. Preserve
+                // its current list when selected instead of substituting a
+                // YeYu-defined list; an unselected operation is the only case
+                // that injects the official empty-list disablement.
+                if (!selected.Contains("dijiang-harvest")) config["⭐帝江号收菜"] = new string[0];
+                config["⭐日常奖励"] = selected.Contains("claim-daily-reward");
+                config["Exit After Task"] = false;
+                ApplyEndfieldTaskGroups(binding, selected, config);
+                ApplyEndfieldSplitConfig(binding, selected, config);
+            } else if (binding.GameId == "GF2") {
+                config["邮件"] = selected.Contains("mail");
+                config["情报和战前补给"] = selected.Contains("activity-supply");
+                config["闪耀星愿"] = selected.Contains("star-wish");
+                config["活动自律"] = selected.Contains("event-battle");
+                config["探索领取"] = selected.Contains("exploration-claim");
+                // Legacy GF2 DailyTask combines activity work under this old
+                // switch. It must not inherit a saved true value when only
+                // the compatible seven-operation scope is launched.
+                if (!IsGf2MainSourceBinding(binding)) config["情报补给"] = false;
+                config["活动层"] = false;
+                config["竞技场"] = false;
+                config["购买免费礼包"] = false;
+                config["商店心愿单购买"] = false;
+                config["公共区/调度室"] = selected.Contains("public-area-dispatch");
+                config["自动刷体力"] = selected.Contains("spend-stamina");
+                config["班组"] = selected.Contains("squad-tasks");
+                config["领任务"] = selected.Contains("claim-daily-missions");
+                config["大月卡"] = selected.Contains("battle-pass-free-track");
+                config["Exit After Task"] = false;
+            } else return;
+            string temporary = binding.DailyConfig + ".yeyu." + Guid.NewGuid().ToString("N") + ".tmp";
+            try { File.WriteAllText(temporary, Json.Serialize(config), new UTF8Encoding(false)); ReplaceConfigFile(temporary, binding.DailyConfig); }
+            finally { if (File.Exists(temporary)) File.Delete(temporary); }
         }
-        private static string DetectFormalBlockingWindow(Binding binding, Process process) {
-            if (process == null) return String.Empty;
-            try {
-                process.Refresh();
-                if (process.HasExited || process.MainWindowHandle == IntPtr.Zero) return String.Empty;
-                AutomationElement root = AutomationElement.FromHandle(process.MainWindowHandle);
-                if (root == null) return String.Empty;
-                var text = new StringBuilder(root.Current.Name ?? String.Empty);
-                AutomationElementCollection elements = root.FindAll(TreeScope.Descendants, Condition.TrueCondition);
-                for (int index = 0; index < elements.Count && index < 256 && text.Length < 8192; index++) {
-                    if (elements[index].Current.IsOffscreen) continue;
-                    string name = elements[index].Current.Name;
-                    if (!String.IsNullOrWhiteSpace(name)) text.Append('\n').Append(name);
-                }
-                string visibleText = text.ToString();
-                if (binding.GameId == "Endfield" &&
-                    (visibleText.IndexOf("继续下载", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                     visibleText.IndexOf("Resume Download", StringComparison.OrdinalIgnoreCase) >= 0))
-                    return "launcher_download_required: formal launcher requires the user to continue the download";
-                if (binding.GameId == "GF2" &&
-                    (visibleText.IndexOf("客户端版本已过时", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                     visibleText.IndexOf("版本已过时", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                     visibleText.IndexOf("download the latest client", StringComparison.OrdinalIgnoreCase) >= 0))
-                    return "client_update_required: the game client requires a foreground update";
-            } catch (ElementNotAvailableException) { }
-            catch (InvalidOperationException) { }
-            return String.Empty;
-        }
+
         private static void ApplyOkWWDailyTaskProfile(Binding binding) {
             IDictionary<string, object> profile = binding.DailyTaskProfile;
             var required = new HashSet<string>(StringComparer.Ordinal) {
                 "whichToFarm", "tacetSuppressionNumber", "forgeryChallengeNumber", "materialSelection",
-                "farmNightmareNestForDailyEcho"
+                "farmNightmareNestForDailyEcho", "additionalTasks"
             };
             if (profile == null || profile.Count != required.Count || profile.Keys.Any(key => !required.Contains(key))) throw new InvalidOperationException("ok_ww_daily_profile_invalid");
             string target = profile["whichToFarm"] as string;
             string material = profile["materialSelection"] as string;
             int tacet = PositiveInt(profile["tacetSuppressionNumber"]);
             int forgery = PositiveInt(profile["forgeryChallengeNumber"]);
+            var allowedAdditional = new HashSet<string>(StringComparer.Ordinal) {
+                "Check Weekly Garden", "Auto Farm all Nightmare Nest",
+                "Merge Echo If discarded > 1000", "Teleport and Farm 4C Echo"
+            };
+            IEnumerable rawAdditional = profile["additionalTasks"] as IEnumerable;
+            if (rawAdditional == null || profile["additionalTasks"] is string) throw new InvalidOperationException("ok_ww_daily_profile_invalid");
+            var additional = new List<string>();
+            foreach (object value in rawAdditional) {
+                string item = value as string;
+                if (item == null || !allowedAdditional.Contains(item) || additional.Contains(item)) throw new InvalidOperationException("ok_ww_daily_profile_invalid");
+                additional.Add(item);
+            }
             if ((target != "Tacet Suppression" && target != "Forgery Challenge" && target != "Simulation Challenge") ||
                 (material != "Resonator EXP" && material != "Weapon EXP" && material != "Shell Credit") ||
                 !(profile["farmNightmareNestForDailyEcho"] is bool)) throw new InvalidOperationException("ok_ww_daily_profile_invalid");
@@ -1878,18 +1926,150 @@ namespace YeYuGamer.LocalDailyAdapter
             config["Which Forgery Challenge to Farm"] = forgery;
             config["Material Selection"] = material;
             config["Farm Nightmare Nest for Daily Echo"] = (bool)profile["farmNightmareNestForDailyEcho"];
-            // Never inherit a tool preset here: these options contain weekly,
-            // inventory-mutating, or client-lifecycle actions and are outside
-            // the Manager daily contract.
-            config["Additional Tasks to Run After Daily Task"] = new string[0];
+            config["Additional Tasks to Run After Daily Task"] = additional;
             config["Exit After Task"] = false;
             string temporary = binding.DailyConfig + "." + Guid.NewGuid().ToString("N") + ".tmp";
             try {
                 File.WriteAllText(temporary, Json.Serialize(config), new UTF8Encoding(false));
-                File.Replace(temporary, binding.DailyConfig, null);
+                ReplaceConfigFile(temporary, binding.DailyConfig);
             } finally {
                 if (File.Exists(temporary)) File.Delete(temporary);
             }
+        }
+        // These values are the published OK-EF DailyBattleFeature keys.  This
+        // adapter only supplies a temporary config document; deciding today's
+        // rotation entry and performing the battle remains upstream.
+        private static void ApplyEndfieldDailyTaskProfile(Binding binding) {
+            IDictionary<string, object> profile = binding.DailyTaskProfile;
+            var required = new HashSet<string>(StringComparer.Ordinal) {
+                "staminaStage", "rewardTier", "staminaRotationStartDate", "staminaRotation", "teamSlot"
+            };
+            if (profile == null || profile.Count != required.Count || profile.Keys.Any(key => !required.Contains(key)))
+                throw new InvalidOperationException("endfield_daily_profile_invalid");
+            string staminaStage = profile["staminaStage"] as string;
+            string rewardTier = profile["rewardTier"] as string;
+            string rotationStartDate = profile["staminaRotationStartDate"] as string;
+            string teamSlot = profile["teamSlot"] as string;
+            DateTime parsedRotationStartDate;
+            if (!EndfieldStages.Contains(staminaStage) ||
+                (rewardTier != "保持当前" && rewardTier != "低阶" && rewardTier != "高阶") ||
+                !EndfieldTeamSlots.Contains(teamSlot) ||
+                String.IsNullOrWhiteSpace(rotationStartDate) ||
+                !DateTime.TryParseExact(rotationStartDate, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out parsedRotationStartDate))
+                throw new InvalidOperationException("endfield_daily_profile_invalid");
+            IEnumerable rawRotation = profile["staminaRotation"] as IEnumerable;
+            if (rawRotation == null || profile["staminaRotation"] is string)
+                throw new InvalidOperationException("endfield_daily_profile_invalid");
+            var rotation = new List<string>();
+            foreach (object value in rawRotation) {
+                string stage = value as string;
+                if (!IsEndfieldRotationStage(stage)) throw new InvalidOperationException("endfield_daily_profile_invalid");
+                rotation.Add(stage);
+                if (rotation.Count > 31) throw new InvalidOperationException("endfield_daily_profile_invalid");
+            }
+            string profilePath = IsEndfieldSplitConfig(binding) ? Path.Combine(Path.GetDirectoryName(binding.DailyConfig), "DailyBattleTask.json") : binding.DailyConfig;
+            EnsureDailyConfigForInjection(profilePath);
+            IDictionary<string, object> config = Json.DeserializeObject(File.ReadAllText(profilePath, Encoding.UTF8)) as IDictionary<string, object>;
+            if (config == null) throw new InvalidOperationException("endfield_daily_config_invalid");
+            config["体力本"] = staminaStage;
+            config["体力本奖励档位"] = rewardTier;
+            config["刷体力开始日期"] = rotationStartDate;
+            config["刷本序列"] = rotation.ToArray();
+            config["指定的队伍编号"] = teamSlot;
+            string temporary = profilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try {
+                File.WriteAllText(temporary, Json.Serialize(config), new UTF8Encoding(false));
+                ReplaceConfigFile(temporary, profilePath);
+            } finally {
+                if (File.Exists(temporary)) File.Delete(temporary);
+            }
+        }
+        // GF2 keeps these values in its official DailyTask document.  Every
+        // profile member is optional: an omitted or null member deliberately
+        // leaves the user's official saved value untouched.
+        private static void ApplyGf2DailyTaskProfile(Binding binding) {
+            IDictionary<string, object> profile = binding.DailyTaskProfile;
+            var allowed = new HashSet<string>(StringComparer.Ordinal) {
+                "autoBattleConfirmed", "staminaStage", "extraCreditBattle", "autonomousLoop",
+                "squadDust", "eventStageName", "drinkDurations", "mealDuration", "supplyRewardChoice"
+            };
+            if (profile == null || profile.Keys.Any(key => !allowed.Contains(key)))
+                throw new InvalidOperationException("gf2_daily_profile_invalid");
+
+            object value;
+            if (profile.TryGetValue("autoBattleConfirmed", out value) && value != null && !(value is bool))
+                throw new InvalidOperationException("gf2_daily_profile_invalid");
+            if (profile.TryGetValue("extraCreditBattle", out value) && value != null && !(value is bool))
+                throw new InvalidOperationException("gf2_daily_profile_invalid");
+            if (profile.TryGetValue("autonomousLoop", out value) && value != null && !(value is bool))
+                throw new InvalidOperationException("gf2_daily_profile_invalid");
+            if (profile.TryGetValue("squadDust", out value) && value != null && !(value is bool))
+                throw new InvalidOperationException("gf2_daily_profile_invalid");
+            if (profile.TryGetValue("staminaStage", out value) && value != null &&
+                (!(value is string) || !Gf2StaminaStages.Contains((string)value)))
+                throw new InvalidOperationException("gf2_daily_profile_invalid");
+            ValidateGf2Text(profile, "eventStageName", 128);
+            ValidateGf2Text(profile, "drinkDurations", 64);
+            ValidateGf2Text(profile, "mealDuration", 64);
+            if (profile.TryGetValue("supplyRewardChoice", out value) && value != null) {
+                if (!(value is string) || !Gf2SupplyRewardChoices.Contains((string)value))
+                    throw new InvalidOperationException("gf2_daily_profile_invalid");
+                if (!binding.Gf2SupplyRewardChoiceSupported)
+                    throw new InvalidOperationException("gf2_supply_reward_choice_unsupported");
+            }
+
+            IDictionary<string, object> config = Json.DeserializeObject(File.ReadAllText(binding.DailyConfig, Encoding.UTF8)) as IDictionary<string, object>;
+            if (config == null) throw new InvalidOperationException("gf2_daily_config_invalid");
+            ApplyGf2ConfigValue(profile, config, "autoBattleConfirmed", "已确认启用游戏内全局自动功能");
+            ApplyGf2ConfigValue(profile, config, "staminaStage", "体力本");
+            ApplyGf2ConfigValue(profile, config, "extraCreditBattle", "刷钱本");
+            ApplyGf2ConfigValue(profile, config, "autonomousLoop", "自主循环");
+            ApplyGf2ConfigValue(profile, config, "squadDust", "尘烟");
+            ApplyGf2ConfigValue(profile, config, "eventStageName", "当前物资关卡名称");
+            ApplyGf2ConfigValue(profile, config, "drinkDurations", "喝水");
+            ApplyGf2ConfigValue(profile, config, "mealDuration", "吃饭");
+            ApplyGf2ConfigValue(profile, config, "supplyRewardChoice", "拂晓之光补给包奖励");
+            string temporary = binding.DailyConfig + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try {
+                File.WriteAllText(temporary, Json.Serialize(config), new UTF8Encoding(false));
+                ReplaceConfigFile(temporary, binding.DailyConfig);
+            } finally {
+                if (File.Exists(temporary)) File.Delete(temporary);
+            }
+        }
+        private static void ValidateGf2Text(IDictionary<string, object> profile, string key, int maximumLength) {
+            object value;
+            if (profile.TryGetValue(key, out value) && value != null && (!(value is string) || ((string)value).Length > maximumLength))
+                throw new InvalidOperationException("gf2_daily_profile_invalid");
+        }
+        private static void ApplyGf2ConfigValue(IDictionary<string, object> profile, IDictionary<string, object> config, string profileKey, string configKey) {
+            object value;
+            if (profile.TryGetValue(profileKey, out value) && value != null) config[configKey] = value;
+        }
+        private static readonly HashSet<string> Gf2SupplyRewardChoices = new HashSet<string>(StringComparer.Ordinal) {
+            "", "数据链路", "坍塌晶条", "增域存量条T2", "大容量内存条", "转录导体·序三", "萨狄斯金"
+        };
+        private static readonly HashSet<string> Gf2StaminaStages = new HashSet<string>(StringComparer.Ordinal) {
+            "军备解析", "深度搜索", "决策构象", "定向"
+        };
+        private static readonly HashSet<string> EndfieldStages = new HashSet<string>(StringComparer.Ordinal) {
+            "干员经验", "干员进阶", "钱币收集", "技能提升", "武器经验", "武器进阶", "罗丹", "三位一体", "白垩界卫", "阮一", "聂菲斯",
+            "D96钢", "超距辉映管", "快子遴捡晶格", "象限拟合液", "三相纳米片", "枢纽区", "源石研究园", "试验园区", "矿脉源区", "供能高地", "武陵城", "清波寨", "首墩", "藏剑谷"
+        };
+        private static readonly HashSet<string> EndfieldTieredStages = new HashSet<string>(StringComparer.Ordinal) {
+            "干员经验", "干员进阶", "技能提升", "武器进阶"
+        };
+        private static readonly HashSet<string> EndfieldTeamSlots = new HashSet<string>(StringComparer.Ordinal) {
+            "不换队伍", "1", "2", "3", "4", "5"
+        };
+        private static bool IsEndfieldRotationStage(string value) {
+            if (String.IsNullOrWhiteSpace(value)) return false;
+            if (EndfieldStages.Contains(value)) return true;
+            foreach (string tier in new[] { "低阶", "高阶" }) {
+                if (value.EndsWith(tier, StringComparison.Ordinal))
+                    return EndfieldTieredStages.Contains(value.Substring(0, value.Length - tier.Length));
+            }
+            return false;
         }
         private static int PositiveInt(object value) {
             int number;

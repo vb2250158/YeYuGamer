@@ -33,6 +33,7 @@ from ..domain.models import (
     DiagnosticBundleCreateRequest,
     EventPage,
     EvidenceReviewRequest,
+    ScreenshotUploadRequest,
     GameRunCreateRequest,
     GameRunAliasRequest,
     GameRunRecord,
@@ -67,6 +68,8 @@ from ..domain.models import (
     WorkItemClaimRequest,
 )
 from ..services.manager import ManagerService
+from ..operation_access import operation_write_scope
+from ..launch_policy import LAUNCH_ACTORS, is_launch_request
 from ..store.sqlite_store import StateVersionRequired
 
 
@@ -113,7 +116,9 @@ def artifact_read_context(
 ) -> ArtifactReadContext:
     actor_id = str(getattr(request.state, "actor_id", "anonymous"))
     principal_id = str(getattr(request.state, "principal_id", actor_id))
-    if actor_id in {"webgui", "cli"}:
+    if actor_id in {"webgui", "cli"} or (
+        actor_id == "agent-launch" and "evidence:read" in getattr(request.state, "actor_scopes", ())
+    ):
         return ArtifactReadContext(actor_id=actor_id, principal_id=principal_id)
     if actor_id == "anonymous":
         raise HTTPException(
@@ -173,7 +178,7 @@ def _parse_state_version(value: str | None) -> int | None:
     return int(normalized)
 
 
-def mutation_context(
+async def mutation_context(
     request: Request,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=128)],
     request_id: Annotated[
@@ -200,7 +205,19 @@ def mutation_context(
         )
     path = request.url.path
     scopes = set(getattr(request.state, "actor_scopes", frozenset()))
-    if path.startswith("/api/v1/manager/"):
+    launch = is_launch_request(path, request.method)
+    if path == "/api/v1/capability-invocations" and request.method == "POST":
+        payload = await request.json()
+        launch = isinstance(payload, dict) and payload.get("capability") in {
+            "game.daily.run", "game.weekly.run", "batch.daily.run",
+        }
+    if launch and path in {"/api/v1/batches", "/api/v1/game-runs"}:
+        payload = await request.json()
+        launch = not isinstance(payload, dict) or payload.get("mode", "plan") != "plan"
+    if launch:
+        actor = str(getattr(request.state, "actor_id", "anonymous"))
+        allowed = actor in LAUNCH_ACTORS and bool(scopes & {"control:write", "execution:start"})
+    elif path.startswith("/api/v1/manager/"):
         allowed = "lifecycle:write" in scopes
     elif path == "/api/v1/agent/work-items" and request.method == "POST":
         allowed = bool(scopes & {"agent:write", "agent:dispatch", "control:write"})
@@ -212,6 +229,13 @@ def mutation_context(
         )
     ):
         allowed = bool(scopes & {"agent:write", "control:write"})
+    elif operation_write_scope(path, request.method) is not None:
+        allowed = bool(scopes & {"control:write", operation_write_scope(path, request.method)})
+        if allowed and "control:write" not in scopes and path.endswith("/transitions"):
+            payload = await request.json()
+            transition = TodoTransitionRequest.model_validate(payload)
+            allowed = (transition.status == "review_required"
+                       and not transition.release_technical_blocker and not transition.increment_attempt)
     else:
         allowed = "control:write" in scopes
     if not allowed:
@@ -1259,6 +1283,20 @@ def artifact_content(
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+@api.post("/todo-instances/{todo_id}/evidence-uploads", response_model=CommandReceipt, status_code=202)
+def upload_evidence(
+    todo_id: str, body: ScreenshotUploadRequest, mutation: Mutation,
+    manager: Manager, response: Response,
+) -> CommandReceipt:
+    body = _bind_actor(body, mutation)
+    receipt = manager.upload_todo_screenshot(
+        todo_id, body, idempotency_key=mutation.idempotency_key,
+        request_id=mutation.request_id, expected_state_version=mutation.expected_state_version,
+        path=f"/api/v1/todo-instances/{todo_id}/evidence-uploads",
+    )
+    return _receipt_response(response, receipt)
 
 
 @api.post("/evidence-reviews", response_model=CommandReceipt, status_code=202)

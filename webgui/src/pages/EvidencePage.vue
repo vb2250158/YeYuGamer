@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
 import type { EvidenceArtifact } from '../api/contracts'
 import { useResource } from '../composables/useResource'
 import { useManagerStore } from '../stores/manager'
@@ -9,18 +10,34 @@ import StatusBadge from '../components/StatusBadge.vue'
 import JsonPanel from '../components/JsonPanel.vue'
 import { formatTime } from '../utils/format'
 import { artifactContentPath, evidenceCanBeReviewed } from '../utils/managerResources'
+import { managerApi } from '../api/client'
 
 const manager = useManagerStore()
-const resource = useResource<EvidenceArtifact>('/artifacts')
+const route = useRoute()
+const resource = useResource<EvidenceArtifact>('/artifacts?limit=500')
+const scopedItems = computed(() => resource.items.value.filter((item) =>
+  typeof route.query.runId !== 'string' || item.runId === route.query.runId))
 const selectedId = ref('')
 const note = ref('')
 const busy = ref(false)
 const imageLoadFailed = ref(false)
+const linkedArtifact = ref<EvidenceArtifact>()
 
-watch(resource.items, (items) => {
-  if (!items.some((item) => item.artifactId === selectedId.value)) selectedId.value = items[0]?.artifactId ?? ''
+watch(() => route.query.artifactId, async (artifactId) => {
+  linkedArtifact.value = undefined
+  if (typeof artifactId !== 'string') return
+  selectedId.value = artifactId
+  try {
+    const artifact = await managerApi.get<EvidenceArtifact>(`/artifacts/${encodeURIComponent(artifactId)}`)
+    if (route.query.artifactId === artifactId) linkedArtifact.value = artifact
+  } catch { imageLoadFailed.value = true }
 }, { immediate: true })
-const selected = computed(() => resource.items.value.find((item) => item.artifactId === selectedId.value))
+
+watch(scopedItems, (items) => {
+  if (typeof route.query.artifactId !== 'string' && !items.some((item) => item.artifactId === selectedId.value)) selectedId.value = items[0]?.artifactId ?? ''
+}, { immediate: true })
+const selected = computed(() => scopedItems.value.find((item) => item.artifactId === selectedId.value)
+  ?? (linkedArtifact.value?.artifactId === selectedId.value ? linkedArtifact.value : undefined))
 const reviewable = computed(() => selected.value ? evidenceCanBeReviewed(selected.value) : false)
 const contentSupported = computed(() => manager.supports('/artifacts/{artifactId}/content', 'get'))
 const contentUrl = computed(() => {
@@ -38,7 +55,11 @@ async function review(verdict: 'accepted' | 'rejected'): Promise<void> {
       verdict,
       note: note.value,
     })
-    if (receipt) await resource.load()
+    if (receipt) {
+      const result = receipt.result as { artifact?: EvidenceArtifact } | undefined
+      if (result?.artifact) linkedArtifact.value = result.artifact
+      await resource.load()
+    }
   } finally {
     busy.value = false
   }
@@ -57,17 +78,17 @@ async function review(verdict: 'accepted' | 'rejected'): Promise<void> {
   <ResourceState
     :loading="resource.loading.value"
     :error="resource.error.value"
-    :empty="!resource.items.value.length"
+    :empty="!scopedItems.length && !linkedArtifact"
     empty-title="还没有证据 artifact"
-    empty-detail="空证据列表意味着无法验收完成；请查看运行记录或补充人工复核。"
+    empty-detail="最近 500 项工件中没有匹配记录；截图与工具任务结果分别记录，缺图不代表任务失败。"
     @retry="resource.load"
   >
     <div class="content-grid">
       <v-card class="panel span-5">
-        <div class="panel-title"><h2>证据索引</h2><span class="soft-note">{{ resource.items.value.length }} 项</span></div>
+        <div class="panel-title"><h2>证据索引</h2><span class="soft-note">{{ scopedItems.length }} 项（最近 500 项范围）</span></div>
         <div class="evidence-list">
           <button
-            v-for="artifact in resource.items.value"
+            v-for="artifact in scopedItems"
             :key="artifact.artifactId"
             :class="['evidence-row', { active: artifact.artifactId === selectedId }]"
             @click="selectedId = artifact.artifactId"
@@ -80,7 +101,13 @@ async function review(verdict: 'accepted' | 'rejected'): Promise<void> {
 
       <v-card v-if="selected" class="panel span-7">
         <div class="panel-title"><h2>{{ selected.artifactId }}</h2><StatusBadge :state="selected.verdict ?? 'evidence_pending'" /></div>
-        <div class="panel-body">
+          <div class="panel-body">
+            <v-alert v-if="selected.kind === 'game-ui-account-unconfirmed-before-raw'" type="info" variant="tonal" class="mb-3">
+              官方进入游戏步骤开始时的诊断截图。画面中的账号尚未由官方确认；关联账号仅表示本次执行请求，不能用此图确认该账号已登录或每日完成。
+            </v-alert>
+          <v-alert v-if="selected.kind === 'upstream-error-frame'" type="info" variant="tonal" class="mb-3">
+            官方异常时保存的画面，可能来自缓存；所列时间为文件保存时间，实际采集时间未知。此图不能代表当前状态，原始操作与异常见同轮官方日志。
+          </v-alert>
           <img
             v-if="selected.contentType?.startsWith('image/') && contentSupported && !imageLoadFailed"
             :src="contentUrl"

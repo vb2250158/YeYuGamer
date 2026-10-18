@@ -19,6 +19,9 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import __version__
+from .operation_access import (
+    SCREENSHOT_UPLOAD_BODY_BYTES, SCREENSHOT_UPLOAD_PATH, operation_read_allowed,
+)
 from .api.routes import api, compat
 from .logging_setup import get_logger
 from .services.legacy_adapter import LegacyAdapter
@@ -101,6 +104,10 @@ class MutationBodyLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
+        body_limit = (SCREENSHOT_UPLOAD_BODY_BYTES
+                      if scope.get("method") == "POST" and SCREENSHOT_UPLOAD_PATH.fullmatch(scope.get("path", ""))
+                      else self.max_body_bytes)
+
         declared_length: int | None = None
         for name, value in scope.get("headers", []):
             if name.lower() != b"content-length":
@@ -110,7 +117,7 @@ class MutationBodyLimitMiddleware:
             except (UnicodeDecodeError, ValueError):
                 declared_length = None
             break
-        if declared_length is not None and declared_length > self.max_body_bytes:
+        if declared_length is not None and declared_length > body_limit:
             await self._reject(scope, receive, send)
             return
 
@@ -124,7 +131,7 @@ class MutationBodyLimitMiddleware:
             if message["type"] != "http.request":
                 continue
             total += len(message.get("body", b""))
-            if total > self.max_body_bytes:
+            if total > body_limit:
                 await self._reject(scope, receive, send)
                 return
             if not message.get("more_body", False):
@@ -146,7 +153,7 @@ class MutationBodyLimitMiddleware:
         response = _problem(
             413,
             "Request body too large",
-            "Mutation JSON bodies are limited to 1 MiB.",
+            "Mutation body exceeds the bounded limit for this endpoint.",
             "request_body_too_large",
         )
         await response(scope, receive, send)
@@ -168,6 +175,10 @@ def _persistent_read_allowed(actor_id: str, path: str) -> bool:
 
     if actor_id in {"webgui", "cli"}:
         return True
+    if actor_id == "agent-launch" and operation_read_allowed(path):
+        return True
+    if actor_id in {"agent-launch", "scheduler"}:
+        return path in {"/api/v1/snapshot", "/api/v1/health", "/health", "/api/v1/meta"} or path.startswith("/api/v1/commands/")
     if path in {"/health", "/api/v1/health"}:
         return True
     if actor_id == "tray-lifecycle":

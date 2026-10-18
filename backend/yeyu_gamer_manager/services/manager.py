@@ -49,6 +49,7 @@ from ..domain.models import (
     DiagnosticBundleCreateRequest,
     EntityState,
     EvidenceReviewRequest,
+    ScreenshotUploadRequest,
     EventPage,
     EventRecord,
     EvidenceArtifactRecord,
@@ -3489,7 +3490,7 @@ class ManagerService:
         # Calls wholly inside Manager omit actor_id and retain full access. Every
         # API route supplies it, so an Agent can never turn a bare opaque ID
         # into a cross-work-item artifact read.
-        if actor_id is None or actor_id in {"webgui", "cli"}:
+        if actor_id is None or actor_id in {"webgui", "cli", "agent-launch"}:
             return None
         if actor_id != "agent":
             raise ManagerValidation("actor is not allowed to read Manager artifacts")
@@ -13319,6 +13320,24 @@ class ManagerService:
             operation=operation,
             expected_state_version=expected_state_version,
         )
+
+    def upload_todo_screenshot(
+        self, todo_id: str, request: ScreenshotUploadRequest, *, idempotency_key: str,
+        request_id: str | None, path: str, expected_state_version: int | None,
+    ) -> CommandReceipt:
+        from .screenshot_upload import prepare_review_screenshot
+        identity, operation, created_paths = prepare_review_screenshot(
+            self, todo_id, request, idempotency_key=idempotency_key, request_id=request_id, path=path,
+        )
+        try:
+            return self._idempotent(
+                key=idempotency_key, path=path, request=identity, operation=operation,
+                expected_state_version=expected_state_version,
+            )
+        except BaseException:
+            for destination in created_paths:
+                destination.unlink(missing_ok=True)
+            raise
 
     def review_evidence(
         self,

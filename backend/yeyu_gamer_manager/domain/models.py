@@ -1563,6 +1563,13 @@ class RepairVerificationRequest(ApiModel):
     requested_by: str = Field(default="webgui", min_length=1, max_length=80)
 
 
+class ScreenshotUploadRequest(ApiModel):
+    content_base64: str = Field(min_length=4, max_length=11_184_812)
+    file_name: str = Field(min_length=1, max_length=120, pattern=r"^[^/\\\x00-\x1f]+\.(?:png|jpg|jpeg)$")
+    note: str = Field(min_length=1, max_length=2000)
+    requested_by: str = Field(default="webgui", min_length=1, max_length=80)
+
+
 class EvidenceReviewRequest(ApiModel):
     artifact_id: str = Field(min_length=1, max_length=160)
     verdict: Literal["accepted", "rejected"]

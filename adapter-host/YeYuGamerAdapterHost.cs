@@ -21,23 +21,25 @@ namespace YeYuGamer.AdapterHost
     internal static class Program
     {
         private const string ProtocolVersion = "1.1";
-        private const string HostVersion = "0.3.12";
+        private const string HostVersion = "0.3.100";
         private const string ExecutionPackageId = "legacy-night-rain-gamer";
         private const int MaxRequestBytes = 262144;
         private const int MaxEventBytes = 65536;
         private const int MaxManifestBytes = 65536;
         private const int MaxStderrBytes = 8192;
         private const int CancelGraceSeconds = 5;
+        private const int RunnerExitDrainMilliseconds = 2000;
         private const uint JobObjectLimitKillOnJobClose = 0x00002000;
+        private const uint JobObjectLimitBreakawayOk = 0x00000800;
 
         private static readonly HashSet<string> AllowedGameIds = new HashSet<string>(StringComparer.Ordinal)
         {
             "WW", "PGR", "StarRail", "ZZZ", "Endfield", "GF2",
-            "NTE", "FGO", "NIKKE", "BD2", "CZN"
+            "NTE", "FGO", "NIKKE", "BD2", "CZN", "Genshin"
         };
         private static readonly HashSet<string> AllowedEventTypes = new HashSet<string>(StringComparer.Ordinal)
         {
-            "hello", "todo_attempt_started", "todo_progress", "artifact_staged",
+            "hello", "run_progress", "run_artifact_staged", "todo_attempt_started", "todo_progress", "artifact_staged",
             "todo_terminal", "run_terminal"
         };
         private static readonly HashSet<string> AllowedTodoTerminalStatuses = new HashSet<string>(StringComparer.Ordinal)
@@ -76,6 +78,11 @@ namespace YeYuGamer.AdapterHost
             Console.OpenStandardInput(), new UTF8Encoding(false), false);
         private static readonly TextWriter ProtocolOutput = new StreamWriter(
             Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true };
+        private static readonly TextWriter DiagnosticOutput = TextWriter.Synchronized(new StreamWriter(
+            Console.OpenStandardError(), new UTF8Encoding(false)) { AutoFlush = true });
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool SetDllDirectory(string path);
 
         public static int Main(string[] args)
         {
@@ -87,6 +94,11 @@ namespace YeYuGamer.AdapterHost
             string error;
             try
             {
+                // The frozen desktop's DLL directory is inherited by Windows
+                // children. Reset it in this separate, non-Qt Host so official
+                // tools load their own runtime, without changing the Manager.
+                if (!SetDllDirectory(null))
+                    throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
                 if (!TryParseArguments(args, out parsed, out error))
                 {
                     WriteResult(false, "invalid_request", parsed, error);
@@ -151,11 +163,22 @@ namespace YeYuGamer.AdapterHost
             };
             int stderrBytes = 0;
             int stderrOverflow = 0;
+            int stderrClosed = 0;
             IntPtr runnerJob = IntPtr.Zero;
             runner.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs eventArgs)
             {
-                if (eventArgs.Data != null && Interlocked.Add(ref stderrBytes, Encoding.UTF8.GetByteCount(eventArgs.Data) + 1) > MaxStderrBytes)
+                if (eventArgs.Data == null) {
+                    Interlocked.Exchange(ref stderrClosed, 1);
+                    return;
+                }
+                if (Interlocked.Add(ref stderrBytes, Encoding.UTF8.GetByteCount(eventArgs.Data) + 1) > MaxStderrBytes)
                     Interlocked.Exchange(ref stderrOverflow, 1);
+                else
+                {
+                    // Keep diagnostics separate from protocol stdout and within the
+                    // existing byte limit. Logging must not alter runner results.
+                    try { DiagnosticOutput.WriteLine(eventArgs.Data); } catch (IOException) { }
+                }
             };
             try
             {
@@ -186,6 +209,7 @@ namespace YeYuGamer.AdapterHost
             durableControl.Start();
 
             int nextSequence = 0;
+            JobOwnershipObservation jobObservation = JobOwnershipObservation.TryCreate(request);
             bool helloSeen = false;
             bool terminalSeen = false;
             int declaredExit = Int32.MinValue;
@@ -194,10 +218,12 @@ namespace YeYuGamer.AdapterHost
             var startedTodoIds = new HashSet<string>(StringComparer.Ordinal);
             var completedTodoIds = new HashSet<string>(StringComparer.Ordinal);
             Task<string> pendingRead = null;
+            long runnerExitObservedTicks = 0;
             try
             {
                 while (true)
                 {
+                    if (jobObservation != null) jobObservation.Poll(runnerJob);
                     if (Interlocked.CompareExchange(ref controlState.Failed, 0, 0) != 0)
                     {
                         forcedTerminalReason = "adapter_control_invalid";
@@ -215,8 +241,21 @@ namespace YeYuGamer.AdapterHost
                         forcedTerminalReason = "runner_deadline_exceeded";
                         break;
                     }
+                    int drainRemainingMilliseconds = RunnerExitDrainMilliseconds;
+                    if (runner.HasExited)
+                    {
+                        if (runnerExitObservedTicks == 0) runnerExitObservedTicks = Stopwatch.GetTimestamp();
+                        drainRemainingMilliseconds -= (int)((Stopwatch.GetTimestamp() - runnerExitObservedTicks) * 1000 / Stopwatch.Frequency);
+                        if (drainRemainingMilliseconds <= 0)
+                        {
+                            if (!terminalSeen) forcedTerminalReason = "runner_exited_without_terminal";
+                            Console.Error.WriteLine("adapter_host_root_exit_drain:run=" + request.RunId +
+                                ";runnerPid=" + runner.Id + ";terminalSeen=" + terminalSeen + ";stdoutEof=False");
+                            break;
+                        }
+                    }
                     if (pendingRead == null) pendingRead = runner.StandardOutput.ReadLineAsync();
-                    int waitMilliseconds = (int)Math.Min(1000, Math.Max(1, remaining.TotalMilliseconds));
+                    int waitMilliseconds = (int)Math.Min(Math.Min(1000, drainRemainingMilliseconds), Math.Max(1, remaining.TotalMilliseconds));
                     if (!pendingRead.Wait(waitMilliseconds)) continue;
                     string line = pendingRead.Result;
                     pendingRead = null;
@@ -229,21 +268,38 @@ namespace YeYuGamer.AdapterHost
                         !ValidateRunnerEvent(line, request, ref nextSequence, ref helloSeen, ref terminalSeen,
                             ref declaredExit, startedTodoIds, completedTodoIds))
                     {
+                        Console.Error.WriteLine("adapter_host_event_rejected:run=" + request.RunId +
+                            ";attempt=" + request.RunAttemptId + ";runnerPid=" + runner.Id +
+                            ";expectedSequence=" + nextSequence + ";startedTodoCount=" + startedTodoIds.Count);
                         valid = false;
                         break;
                     }
                     ProtocolOutput.WriteLine(line);
                 }
-                if ((!valid || forcedTerminalReason != null) && !runner.HasExited) runner.Kill();
-                runner.WaitForExit();
-                runner.WaitForExit();
+                if ((!valid || forcedTerminalReason != null) && !runner.HasExited) {
+                    Console.Error.WriteLine("adapter_host_stop:initiator=protocol_host;reason=" +
+                        (forcedTerminalReason ?? "invalid_runner_event") + ";run=" + request.RunId +
+                        ";runnerPid=" + runner.Id + ";startedTodoCount=" + startedTodoIds.Count);
+                    runner.Kill();
+                    Console.Error.WriteLine("adapter_host_stop:runnerPid=" + runner.Id + ";result=kill_requested");
+                }
+                // Parameterless WaitForExit also waits for asynchronous stderr
+                // EOF, which a descendant can retain after the root has exited.
+                if (!runner.WaitForExit(CancelGraceSeconds * 1000)) valid = false;
             }
             catch
             {
                 try { if (!runner.HasExited) runner.Kill(); } catch { }
-                try { runner.WaitForExit(); } catch { }
+                try { runner.WaitForExit(CancelGraceSeconds * 1000); } catch { }
                 valid = false;
             }
+            Stopwatch stderrDrain = Stopwatch.StartNew();
+            while (Interlocked.CompareExchange(ref stderrClosed, 0, 0) == 0 &&
+                stderrDrain.ElapsedMilliseconds < RunnerExitDrainMilliseconds)
+                Thread.Sleep(10);
+            if (Interlocked.CompareExchange(ref stderrClosed, 0, 0) == 0)
+                Console.Error.WriteLine("adapter_host_root_exit_drain:run=" + request.RunId +
+                    ";runnerPid=" + runner.Id + ";stderrEof=False;boundedTail=True");
             bool synthesizeTerminal = valid && helloSeen && !terminalSeen;
             bool synthesizeCancellation = synthesizeTerminal &&
                 Interlocked.CompareExchange(ref controlState.CancelRequested, 0, 0) != 0;
@@ -254,7 +310,7 @@ namespace YeYuGamer.AdapterHost
                         ? "runner_exited_without_terminal"
                         : "runner_output_closed_without_terminal";
                 try { if (!runner.HasExited) runner.Kill(); } catch { }
-                try { runner.WaitForExit(); } catch { }
+                try { runner.WaitForExit(CancelGraceSeconds * 1000); } catch { }
                 string[] attempted = request.ExecutableTodoIds.Where(startedTodoIds.Contains).ToArray();
                 string[] completed = request.ExecutableTodoIds.Where(completedTodoIds.Contains).ToArray();
                 string[] unresolved = request.ExecutableTodoIds.Where(id => !completedTodoIds.Contains(id)).ToArray();
@@ -283,6 +339,7 @@ namespace YeYuGamer.AdapterHost
             // The runner and every automation-tool process it created belong to
             // this per-run job. Closing the handle is the final cleanup fence:
             // a leaked helper cannot survive into the next selected game.
+            if (jobObservation != null) jobObservation.Stop();
             if (runnerJob != IntPtr.Zero) CloseHandle(runnerJob);
             runner.Dispose();
             if (!valid || !helloSeen || !terminalSeen || declaredExit != actualExit ||
@@ -292,13 +349,150 @@ namespace YeYuGamer.AdapterHost
             return actualExit;
         }
 
+        // Observe the existing anonymous Job on its owning thread. No duplicate
+        // handle, extra assignment, thread, or cleanup-lifetime change is made.
+        private sealed class JobOwnershipObservation
+        {
+            private const int MaxMembers = 128;
+            private readonly ExecuteRequest request;
+            private readonly string path;
+            private readonly int adapterPid;
+            private readonly long adapterBirth;
+            private long lastPoll;
+            private bool disabled;
+
+            private JobOwnershipObservation(ExecuteRequest scope, string output)
+            {
+                request = scope;
+                path = output;
+                using (Process current = Process.GetCurrentProcess())
+                {
+                    adapterPid = current.Id;
+                    adapterBirth = current.StartTime.ToUniversalTime().ToFileTimeUtc();
+                }
+            }
+
+            public static JobOwnershipObservation TryCreate(ExecuteRequest scope)
+            {
+                if (Environment.GetEnvironmentVariable("YEYU_GAMER_RECORDING_JOB_OWNERSHIP") != "1") return null;
+                try
+                {
+                    string root = Path.GetFullPath(Environment.GetEnvironmentVariable("YEYU_GAMER_ADAPTER_STAGING_DIR"));
+                    if (root.StartsWith(@"\\", StringComparison.Ordinal) ||
+                        Path.GetFileName(root) != scope.RunAttemptId || !Directory.Exists(root) ||
+                        (File.GetAttributes(root) & FileAttributes.ReparsePoint) != 0)
+                        throw new IOException("invalid_observation_directory");
+                    return new JobOwnershipObservation(scope, Path.Combine(root, "adapter-job-ownership.json"));
+                }
+                catch (Exception error)
+                {
+                    ReportUnavailable("initialization", error.GetType().Name);
+                    return null;
+                }
+            }
+
+            public void Poll(IntPtr job)
+            {
+                long now = Stopwatch.GetTimestamp();
+                if (disabled || (lastPoll != 0 && now - lastPoll < Stopwatch.Frequency)) return;
+                lastPoll = now;
+                int length = 8 + MaxMembers * IntPtr.Size;
+                IntPtr buffer = IntPtr.Zero;
+                try
+                {
+                    // NULL asks Windows about the caller's Job, which is not
+                    // necessarily this attempt's automation Job. Never accept it.
+                    if (job == IntPtr.Zero) throw new IOException("attempt_job_unavailable");
+                    buffer = Marshal.AllocHGlobal(length);
+                    uint returned;
+                    if (!QueryInformationJobObject(job, 3, buffer, (uint)length, out returned))
+                        throw new IOException("job_query_failed_or_overflow");
+                    int assigned = Marshal.ReadInt32(buffer);
+                    int count = Marshal.ReadInt32(buffer, 4);
+                    if (assigned < 0 || assigned > MaxMembers || count < 0 || count > MaxMembers || count != assigned)
+                        throw new IOException("incomplete_job_snapshot");
+                    var members = new List<object>();
+                    for (int index = 0; index < count; index++)
+                    {
+                        long rawPid = Marshal.ReadIntPtr(buffer, 8 + index * IntPtr.Size).ToInt64();
+                        if (rawPid <= 0 || rawPid > Int32.MaxValue) throw new IOException("invalid_job_pid");
+                        IntPtr member = OpenProcess(0x00101000, false, (uint)rawPid);
+                        if (member == IntPtr.Zero) continue;
+                        try
+                        {
+                            // Only QUERY_LIMITED_INFORMATION and SYNCHRONIZE;
+                            // never request a game handle with write/kill rights.
+                            bool belongs;
+                            long birth, exit, kernel, user;
+                            if (WaitForSingleObject(member, 0) != 258 ||
+                                !IsProcessInJob(member, job, out belongs) || !belongs ||
+                                !GetProcessTimes(member, out birth, out exit, out kernel, out user)) continue;
+                            members.Add(new Dictionary<string, object> { { "pid", (int)rawPid }, { "birth", birth } });
+                        }
+                        finally { CloseHandle(member); }
+                    }
+                    var snapshot = new Dictionary<string, object>
+                    {
+                        { "schemaVersion", 1 }, { "runId", request.RunId }, { "runAttemptId", request.RunAttemptId },
+                        { "gameId", request.GameId }, { "adapterPid", adapterPid }, { "adapterBirth", adapterBirth },
+                        { "observedAt", DateTimeOffset.UtcNow.ToString("o") }, { "members", members }
+                    };
+                    string json = Json.Serialize(snapshot);
+                    if (Encoding.UTF8.GetByteCount(json) > 65536) throw new IOException("observation_too_large");
+                    string pending = path + ".pending";
+                    File.WriteAllText(pending, json, new UTF8Encoding(false));
+                    if (File.Exists(path)) File.Replace(pending, path, null);
+                    else File.Move(pending, path);
+                }
+                catch (Exception error)
+                {
+                    disabled = true;
+                    Stop();
+                    ReportUnavailable("snapshot", error.GetType().Name);
+                }
+                finally { if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer); }
+            }
+
+            public void Stop()
+            {
+                try { File.Delete(path); File.Delete(path + ".pending"); }
+                catch (Exception error) { ReportUnavailable("cleanup", error.GetType().Name); }
+            }
+
+            private static void ReportUnavailable(string stage, string errorClass)
+            {
+                // A failed optional observation/log must not change runner results.
+                try { DiagnosticOutput.WriteLine("recording_job_ownership_unavailable:" + stage + ":" + errorClass); }
+                catch { }
+            }
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool QueryInformationJobObject(IntPtr job, int informationClass, IntPtr information,
+            uint length, out uint returnedLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool belongs);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint access, bool inheritHandle, uint processId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetProcessTimes(IntPtr process, out long birth, out long exit,
+            out long kernel, out long user);
+
         private static IntPtr CreateKillOnCloseJob()
         {
             IntPtr job = CreateJobObject(IntPtr.Zero, null);
             if (job == IntPtr.Zero) return IntPtr.Zero;
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION information =
                 new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
-            information.BasicLimitInformation.LimitFlags = JobObjectLimitKillOnJobClose;
+            // Official game launch may explicitly detach its client from the
+            // automation job. Helpers inherit it normally and remain fenced.
+            information.BasicLimitInformation.LimitFlags = JobObjectLimitKillOnJobClose | JobObjectLimitBreakawayOk;
             int length = Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
             IntPtr buffer = Marshal.AllocHGlobal(length);
             try
@@ -468,12 +662,31 @@ namespace YeYuGamer.AdapterHost
 
         private static void GetDurableCancelPaths(ExecuteRequest request, out string pendingPath, out string deliveredPath)
         {
-            string commonValue = Environment.GetEnvironmentVariable("ProgramData");
-            if (String.IsNullOrWhiteSpace(commonValue))
-                commonValue = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
-            if (String.IsNullOrWhiteSpace(commonValue)) throw new InvalidDataException("program_data_unavailable");
-            string common = Path.GetFullPath(commonValue).TrimEnd(Path.DirectorySeparatorChar);
-            string runtime = Path.GetFullPath(Path.Combine(common, "YeYuGamer", "runtime"));
+            string runtimeValue = Environment.GetEnvironmentVariable("YEYU_GAMER_RUNTIME_DIR");
+            if (String.IsNullOrWhiteSpace(runtimeValue))
+            {
+                string commonValue = Environment.GetEnvironmentVariable("ProgramData");
+                if (String.IsNullOrWhiteSpace(commonValue))
+                    commonValue = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+                if (String.IsNullOrWhiteSpace(commonValue)) throw new InvalidDataException("program_data_unavailable");
+                runtimeValue = Path.Combine(commonValue, "YeYuGamer", "runtime");
+            }
+            if (!Path.IsPathRooted(runtimeValue) || runtimeValue.StartsWith("\\\\", StringComparison.Ordinal))
+                throw new InvalidDataException("durable_cancel_runtime_not_local");
+            string runtime = Path.GetFullPath(runtimeValue).TrimEnd(Path.DirectorySeparatorChar);
+            DriveType driveType = new DriveInfo(Path.GetPathRoot(runtime)).DriveType;
+            if (driveType != DriveType.Fixed && driveType != DriveType.Removable)
+                throw new InvalidDataException("durable_cancel_runtime_not_local");
+            // Preserve the path and ACL fences after relocation. The runtime
+            // and every ancestor must be real directories on the local disk.
+            for (DirectoryInfo directory = new DirectoryInfo(runtime); directory != null; directory = directory.Parent)
+            {
+                if (!directory.Exists)
+                    throw new InvalidDataException("durable_cancel_runtime_unavailable");
+                if ((directory.Attributes & FileAttributes.ReparsePoint) != 0)
+                    throw new InvalidDataException("durable_cancel_root_reparse_point");
+            }
+            string common = Directory.GetParent(runtime).FullName;
             string root = Path.GetFullPath(Path.Combine(runtime, "adapter-controls"));
             if (!root.StartsWith(runtime + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException("durable_cancel_root_escaped_runtime");
@@ -622,6 +835,14 @@ namespace YeYuGamer.AdapterHost
                     return false;
                 hello = true;
             }
+            else if (eventType == "run_progress")
+            {
+                if (!HasExactKeys(value, new[] { "schemaVersion", "protocolVersion", "eventType", "sequence",
+                    "runId", "runAttemptId", "fencingToken", "gameId", "at", "operation", "code", "message", "metrics" }) ||
+                    String.IsNullOrWhiteSpace(GetString(value, "operation")) ||
+                    String.IsNullOrWhiteSpace(GetString(value, "code")) ||
+                    GetString(value, "message") == null || !(value["metrics"] is IDictionary<string, object>)) return false;
+            }
             else if (eventType == "run_terminal")
             {
                 long exit;
@@ -635,13 +856,19 @@ namespace YeYuGamer.AdapterHost
                         "fencingToken", "gameId", "at", "status", "transportOutcome",
                         "attemptedTodoInstanceIds", "completedTodoInstanceIds", "unresolvedTodoInstanceIds",
                         "terminalEventDigest", "exitCode"
-                    }) ||
+                    }, new[] { "startupHumanRequiredReason" }) ||
                     !AllowedRunTerminalStatuses.Contains(status) ||
                     !AllowedTransportOutcomes.Contains(GetString(value, "transportOutcome") ?? String.Empty) ||
                     !TryInteger(value, "exitCode", out exit) || exit < Int32.MinValue || exit > Int32.MaxValue ||
                     !TryArray(value, "attemptedTodoInstanceIds", out attempted) ||
                     !TryArray(value, "completedTodoInstanceIds", out completed) ||
                     !TryArray(value, "unresolvedTodoInstanceIds", out unresolved)) return false;
+                if (value.ContainsKey("startupHumanRequiredReason"))
+                {
+                    string startupReason = GetString(value, "startupHumanRequiredReason");
+                    if (status != "human_required" || attempted.Count != 0 ||
+                        String.IsNullOrWhiteSpace(startupReason) || startupReason.Length > 2048) return false;
+                }
                 string[] expectedAttempted = request.ExecutableTodoIds.Where(startedTodoIds.Contains).ToArray();
                 string[] expectedCompleted = request.ExecutableTodoIds.Where(completedTodoIds.Contains).ToArray();
                 string[] expectedUnresolved = request.ExecutableTodoIds.Where(id => !completedTodoIds.Contains(id)).ToArray();
@@ -649,7 +876,6 @@ namespace YeYuGamer.AdapterHost
                     !ArrayEquals(completed, expectedCompleted.ToList()) ||
                     !ArrayEquals(unresolved, expectedUnresolved.ToList()) ||
                     (status == "completed" && expectedUnresolved.Length != 0) ||
-                    (status != "completed" && expectedUnresolved.Length == 0) ||
                     !String.Equals(GetString(value, "terminalEventDigest"),
                         ComputeTerminalDigest(request, status, expectedAttempted, expectedCompleted,
                             expectedUnresolved, (int)exit), StringComparison.Ordinal)) return false;
@@ -686,7 +912,7 @@ namespace YeYuGamer.AdapterHost
                 "cancelAuthority",
                 "gameId", "cadence", "managerStateVersion", "catalogVersion", "policyDigest", "issuedAt", "expiresAt",
                 "timeoutSeconds", "preserveClientOnStop", "executableTodoInstanceIds", "todos"
-            }, new [] { "accountId", "accountSnapshot" })) { error = "Request fields differ from protocol v1.1."; return false; }
+            }, new [] { "accountId", "accountSnapshot", "selectedOperations", "observationOnlyOperations" })) { error = "Request fields differ from protocol v1.1."; return false; }
             if (!ValidAccountScope(value)) { error = "Request account scope is invalid."; return false; }
             long schema;
             long stateVersion;
@@ -752,6 +978,24 @@ namespace YeYuGamer.AdapterHost
                     Risk = GetString(todo, "risk"),
                     CapabilityRef = GetString(todo, "adapterCapabilityRef")
                 });
+            }
+            if (value.ContainsKey("observationOnlyOperations"))
+            {
+                List<object> observations;
+                if ((request.GameId != "PGR" && request.GameId != "StarRail" && request.GameId != "ZZZ" && request.GameId != "GF2") ||
+                    (value.ContainsKey("accountId") && GetString(value, "accountId") != "default") ||
+                    !TryArray(value, "observationOnlyOperations", out observations) ||
+                    observations.Count < 1 || observations.Count > 2)
+                { error = "Readonly observation scope is invalid."; return false; }
+                string observationGameId = request.GameId;
+                foreach (object item in observations)
+                {
+                    string operation = item as string;
+                    if (ObservationCapability(request.GameId, operation) == null || !request.ObservationOnlyOperations.Add(operation) ||
+                        !request.Todos.Any(todo => todo.Operation == operation &&
+                            todo.TodoDefinitionId == "todo.v1." + observationGameId.ToLowerInvariant() + ".daily." + operation))
+                    { error = "Readonly observation differs from its frozen game and Todo scope."; return false; }
+                }
             }
             value.Remove("cancelAuthority");
             request.RunnerRequestJson = Json.Serialize(value);
@@ -868,7 +1112,7 @@ namespace YeYuGamer.AdapterHost
             foreach (string item in Directory.GetFileSystemEntries(root, "*", SearchOption.AllDirectories))
             {
                 if (IsReparse(item)) { error = "Execution package contains a reparse point."; return false; }
-                if (File.Exists(item)) actual.Add(RelativePath(root, item));
+                if (IsExecutionPackageInventoryFile(item)) actual.Add(RelativePath(root, item));
             }
             declared.Add("install-manifest.json");
             if (!actual.SetEquals(declared)) { error = "Execution package contains missing or unexpected files."; return false; }
@@ -898,6 +1142,9 @@ namespace YeYuGamer.AdapterHost
                     !TryBoolean(binding, "supportsResume", out resume) || !TryInteger(binding, "timeoutSeconds", out timeout) || timeout < 1 ||
                     !TryArray(binding, "requiredEvidenceKinds", out evidence) || evidence.Count == 0)
                 { error = "Todo binding differs from its promoted contract."; return false; }
+                if (request.ObservationOnlyOperations.Contains(todo.Operation) &&
+                    !Contains(capabilities, ObservationCapability(request.GameId, todo.Operation)))
+                { error = "Readonly observation is absent from the promoted binding."; return false; }
                 maximumPlanSeconds += timeout;
             }
             if (request.TimeoutSeconds > maximumPlanSeconds)
@@ -1015,10 +1262,44 @@ namespace YeYuGamer.AdapterHost
             foreach (string key in value.Keys) if (!names.Contains(key) && (optional == null || !optional.Contains(key))) return false;
             return true;
         }
+        private static string ObservationCapability(string gameId, string operation)
+        {
+            if (gameId == "GF2" && operation == "claim-daily-missions") return "gf2.daily.reward-status.inspect@1.0";
+            if (gameId == "GF2" && operation == "battle-pass-free-track") return "gf2.battle-pass.reward-status.inspect@1.0";
+            if (gameId == "PGR" && operation == "claim-daily-tasks") return "pgr.daily.reward-status.inspect@1.0";
+            if (gameId == "PGR" && operation == "battle-pass-free-track") return "pgr.battle-pass.reward-status.inspect@1.0";
+            if (gameId == "StarRail" && operation == "claim-daily-training-rewards") return "starrail.daily.reward-status.inspect@1.0";
+            if (gameId == "ZZZ" && operation == "engagement-reward") return "zzz.daily.reward-status.inspect@1.0";
+            if (gameId == "ZZZ" && operation == "city-fund-free-claim") return "zzz.city-fund.reward-status.inspect@1.0";
+            return null;
+        }
+
         private static bool ValidAccountScope(IDictionary<string, object> value)
         {
+            string gameId = GetString(value, "gameId");
+            bool genshin = gameId == "Genshin";
+            // WW freezes its unit selection; BetterGI freezes its independently
+            // selectable official tasks. Neither is an arbitrary command list.
+            if (value.ContainsKey("selectedOperations"))
+            {
+                if (gameId != "WW" && !genshin) return false;
+                object raw;
+                if (!value.TryGetValue("selectedOperations", out raw)) return false;
+                IEnumerable<object> items = raw as IEnumerable<object>;
+                if (items == null) return false;
+                List<string> operations = new List<string>();
+                foreach (object item in items)
+                {
+                    string operation = item as string;
+                    if (String.IsNullOrWhiteSpace(operation) || operation.Length > 64 ||
+                        operations.Contains(operation) || operations.Count >= 32) return false;
+                    if (genshin && !new[] { "claim-mail", "craft-condensed-resin", "auto-domain", "auto-boss",
+                        "auto-stygian-onslaught", "auto-ley-line", "claim-daily-rewards", "claim-serenitea-pot" }.Contains(operation)) return false;
+                    operations.Add(operation);
+                }
+            }
             if (!value.ContainsKey("accountId") && !value.ContainsKey("accountSnapshot")) return true;
-            if (GetString(value, "gameId") != "WW") return false;
+            if (gameId != "WW" && !genshin) return false;
             string accountId = value.ContainsKey("accountId") ? GetString(value, "accountId") : "default";
             if (accountId != "default" && !IsUuid(accountId)) return false;
             if (!value.ContainsKey("accountSnapshot")) return accountId == "default";
@@ -1026,6 +1307,15 @@ namespace YeYuGamer.AdapterHost
             if (snapshot == null) return false;
             if (snapshot.Count == 0) return accountId == "default";
             if (!HasExactKeys(snapshot, new [] { "label", "saved_account_label" })) return false;
+            if (genshin)
+            {
+                string label = GetString(snapshot, "label");
+                // BetterGI has no saved-login selector. The UID is frozen in
+                // the typed installation profile and confirmed by upstream.
+                return GetString(snapshot, "saved_account_label") == String.Empty &&
+                    !String.IsNullOrWhiteSpace(label) && label == label.Trim() && label.Length <= 80 &&
+                    !label.Any(character => Char.IsControl(character) || character == '\\' || character == '/');
+            }
             foreach (string key in new [] { "label", "saved_account_label" }) {
                 string text = GetString(snapshot, key);
                 if (String.IsNullOrWhiteSpace(text) || text != text.Trim() || text.Length > (key == "label" ? 80 : 160) ||
@@ -1126,6 +1416,23 @@ namespace YeYuGamer.AdapterHost
             string prefix = root.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
             return full.Substring(prefix.Length).Replace(Path.DirectorySeparatorChar, '/');
         }
+        private static bool IsExecutionPackageInventoryFile(string path)
+        {
+            // Interpreter bytecode is not declared inventory. Official python
+            // writes it beside sitecustomize during a GameRun.
+            if (!File.Exists(path)) return false;
+            string extension = Path.GetExtension(path);
+            if (String.Equals(extension, ".pyc", StringComparison.OrdinalIgnoreCase) ||
+                String.Equals(extension, ".pyo", StringComparison.OrdinalIgnoreCase))
+                return false;
+            string[] parts = path.Split(new char[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar });
+            for (int i = 0; i < parts.Length; i++)
+            {
+                if (String.Equals(parts[i], "__pycache__", StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+            return true;
+        }
         private static bool IsReparse(string path)
         {
             try { return (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0; }
@@ -1222,7 +1529,9 @@ namespace YeYuGamer.AdapterHost
         }
         private sealed class ExecuteRequest
         {
-            public ExecuteRequest() { ExecutableTodoIds = new List<string>(); Todos = new List<TodoScope>(); }
+            public ExecuteRequest() { ExecutableTodoIds = new List<string>(); Todos = new List<TodoScope>();
+                ObservationOnlyOperations = new HashSet<string>(StringComparer.Ordinal); }
+            public HashSet<string> ObservationOnlyOperations { get; private set; }
             public string RunId { get; set; }
             public string RunAttemptId { get; set; }
             public string FencingToken { get; set; }

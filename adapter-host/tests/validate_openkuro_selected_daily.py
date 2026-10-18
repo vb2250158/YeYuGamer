@@ -1,212 +1,170 @@
-"""Static contract checks for the three fixed OpenKuro daily integrations.
-
-This deliberately does not start a game or a daily tool.  It verifies that the
-Adapter passes a run-scoped selection/event bridge and that each patched
-upstream DailyTask consumes only its supported Manager operations.
-"""
-
+"""Static, no-game checks for the passive OpenKuro adapter contract."""
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "adapter-host" / "openkuro-runner" / "Program.cs"
-WW_DAILY = Path(r"C:\Game\ok-ww\data\apps\ok-ww\working\src\task\DailyTask.py")
-ENDFIELD_DAILY = Path(r"C:\Game\ok-ef\data\apps\ok-ef\working\src\tasks\onetime\DailyTask.py")
-ENDFIELD_BRIDGE = ROOT / "adapter-host" / "openkuro-runner" / "EndfieldYeYuBridge.py"
-GF2_DAILY = Path(r"C:\Game\ok-gf2\working\src\tasks\DailyTask.py")
+WW_OBSERVER = ROOT / "adapter-host" / "openkuro-runner" / "WwYeYuObserver.py"
+WW_BASELINE = ROOT / "vendor-baselines" / "ok-wuthering-waves" / "src" / "task" / "DailyTask.py"
+ENDFIELD_BATTLE_BASELINE = ROOT / "vendor-baselines" / "ok-end-field" / "src" / "tasks" / "daily" / "daily_battle_mixin.py"
+WW_WORKING_MAIN = Path(r"C:\Game\ok-ww\data\apps\ok-ww\working\main.py")
+ENDFIELD_WORKING_MAIN = Path(r"C:\Game\ok-ef\data\apps\ok-ef\working\main.py")
+ENDFIELD_YEYU_PATCH = Path(r"C:\Game\ok-ef\data\apps\ok-ef\working\src\patches\yeyu_gamer_bridge.py")
 
 
-def source(path: Path) -> str:
-    value = path.read_text(encoding="utf-8")
-    if path.suffix == ".py":
-        ast.parse(value, filename=str(path))
-    return value
+def python_source(path: Path) -> str:
+    text = path.read_text(encoding="utf-8")
+    ast.parse(text, filename=str(path))
+    return text
 
 
-def require_operations(text: str, operations: set[str], path: Path) -> None:
-    for operation in operations:
-        assert operation in text, f"{path}: missing mapping for {operation}"
+def require(text: str, values: set[str], path: Path) -> None:
+    for value in values:
+        assert value in text, f"{path}: missing {value!r}"
 
 
 def main() -> None:
-    runner = source(RUNNER)
-    assert 'start.EnvironmentVariables["YEYU_GAMER_STAGE_FILE"]' in runner
-    assert 'start.EnvironmentVariables["YEYU_GAMER_SELECTED_OPERATIONS"]' in runner
-    assert '(skipped || completedStage) ? "completed" : "review_required"' in runner
-    assert 'failed || (!skipped && !completedStage)' in runner
-    assert 'String.IsNullOrWhiteSpace(stageDetail)' in runner
-    assert '"reason", safeStageDetail' in runner
-    # A launched process/window is transport progress, not proof that the game
-    # or its DailyTask bridge became ready.  The runner must wait for scoped
-    # stage telemetry and must not fabricate downstream attempts on failure.
-    assert 'formal GUI launched; waiting for its DailyTask runtime' in runner
-    assert 'if (!attempted.Contains(target.Item1)) return;' in runner
-    assert 'if (seenStageLines.Count == 0)' in runner
-    assert 'telemetry_missing: fixed DailyTask emitted no run-scoped stage event' in runner
-    assert 'WaitForEndfieldClientTransport' not in runner
-    assert 'endfieldGameWindow=ready' not in runner
-    assert 'DetectFormalBlockingState(binding, process)' in runner
-    assert runner.index('var process = Process.Start(start)') < runner.index(
-        'DetectFormalBlockingState(binding, formal)'
-    )
-    assert 'launcher_download_required: formal launcher requires the user to continue the download' in runner
-    assert 'if (elements[index].Current.IsOffscreen) continue;' in runner
-    assert 'new string[] { binding.Executable, binding.InnerPython }' in runner
-    assert 'DetectFormalBlockingWindow(binding, candidate)' in runner
-    assert 'client_update_required: the game client requires a foreground update' in runner
-    assert 'client_update_required: " + updateError' in runner
-    assert 'telemetry_missing:formal_gui_update_check_timeout' in runner
-    assert 'telemetry_missing:formal_gui_inner_bind_timeout' in runner
-    assert 'StopStaleFormalProcesses(binding)' in runner
-    assert 'binding.GameId == "WW" && exitCode == 70 && completed.Count == ids.Length' in runner
-    assert 'CaptureWwRewardEvidence(binding, staging, phase, afterClaim' in runner
-    assert 'state == "capture_before"' in runner
-    assert 'state == "capture_after"' in runner
-    assert 'stageFile + ".capture.ack"' in runner
-    assert '"game-ui-daily-reward-before"' in runner
-    assert '"game-ui-daily-reward-raw"' in runner
-    assert '"game-ui-daily-reward-watermarked"' in runner
-    assert '"game-ui-daily-activity-100"' in runner
-    assert 'daily_activity_points=' in runner
-    assert 'wwDailyActivityPoints >= 100' in runner
-    assert 'completion_contract_failed' in runner
-    assert 'DateTime.UtcNow.AddHours(8).ToString("yyyy-MM-dd HH:mm:ss")' in runner
-    assert '"transportOutcome", cancelled ? "cancelled" : (transportClean ? "clean" : "crashed")' in runner
-    assert 'Path.Combine(root, "ok-ww.exe")' in runner
-    assert 'Path.Combine(root, "ok-ef.exe")' in runner
-    assert 'String.Empty, Path.Combine(working, "configs", "DailyTask.json")' in runner
-    assert '"-t 1 -e"' in runner
-    assert 'Path.Combine(working, "configs", "DailyTask.json"), dailyTaskProfile, root)' in runner
-    assert 'WaitForFormalUpdateAndStartInner' in runner
-    assert 'FormalUpdateReady' in runner
-    assert 'YEYU_GAMER_FORMAL_UPDATE_CHECK_SECONDS' in runner
-    assert 'YEYU_GAMER_FORMAL_UPDATE_IDLE_SECONDS' in runner
-    assert 'YEYU_GAMER_FORMAL_UPDATE_HARD_CAP_SECONDS' in runner
-    assert 'formal_gui_update_deadline_extended' in runner
-    assert 'SupportsFormalUpdateRetry(binding.GameId)' in runner
-    assert '"game-ui-launch-timeout"' in runner
-    assert 'CaptureLaunchTimeoutEvidence(binding' in runner
-    assert 'UseShellExecute = useShellExecute' in runner
-    assert 'binding.GameId == "WW" || binding.GameId == "Endfield" || binding.GameId == "GF2"' in runner
-    assert "bool useShellExecute = shellLaunchedFormal" in runner
-    assert 'if (!shellLaunchedFormal) DrainToolOutput(process)' in runner
-    assert 'WriteFormalRunSidecar(binding, stageFile, selectedOperations)' in runner
-    assert 'ClearFormalRunSidecars(binding)' in runner
-    assert 'YeYuGamerRun.json' in runner
-    assert 'ConfigureToolOutput(start)' in runner
-    assert 'DrainToolOutput(process)' in runner
-    assert 'FindFormalInner(binding, formalStartedAtUtc)' in runner
-    assert 'EnsureWwGuiStreamGuard(binding)' in runner
-    assert 'EnsureFormalGuiManagerBridge(binding)' in runner
-    assert 'EnsureEndfieldManagerBridge(binding)' in runner
-    assert 'EndfieldYeYuBridge.py' in runner
-    assert 'YEYU_GAMER_GUI_STREAM_GUARD_V1' in runner
-    assert 'YEYU_GAMER_GUI_RUN_BRIDGE_V2' in runner
-    assert "_yeyu_sys.argv.extend(['--task', '1'])" in runner
-    assert "_yeyu_sys.argv.append('--exit')" in runner
-    assert "_yeyu_guard_gui_stream('stdout')" in runner
-    assert "_yeyu_guard_gui_stream('stderr')" in runner
-    assert 'DateTime.UtcNow.AddSeconds(180)' in runner
-    assert 'formalGuiAutoStart=true; innerGuiBound=true' in runner
-    assert 'Process.GetProcessesByName(Path.GetFileNameWithoutExtension(binding.InnerPython))' in runner
-    assert 'formalGuiUpdate=checked' in runner
-    assert 'AttemptNumber(target.Item2)' in runner
-    assert 'todo["priorAttempts"]' in runner
-    assert 'Path.Combine(appRoot, "python", "pythonw.exe")' in runner
-    assert 'EnsureGf2FormalEntry(root, workingDirectory)' in runner
-    assert 'Path.Combine(root, "ok-gf2.exe")' in runner
-    assert 'PyAppify resolves app.json beside its signed bootstrap EXE' in runner
-    assert 'null, root)' in runner
-    assert 'formal_gui_entry_restore_failed' in runner
-    assert 'formal_gui_profile_state_invalid' in runner
-    assert "FileShare.ReadWrite | FileShare.Delete" in runner
-    assert 'Path.Combine(toolRoot, "working", "main.py")' in runner
-    assert 'configured_gui_entry_missing' in runner
-    assert '-m ok.cli run_task' not in runner
-    assert "unsafe_daily_config_monthly_card" not in runner
+    runner = RUNNER.read_text(encoding="utf-8")
+    # Both login diagnostics and the run-end whole-round upstream archive must
+    # satisfy the existing run-artifact protocol; omission previously caused the
+    # Host to discard the execution stream.
+    diagnostics = re.findall(r'"run_artifact_staged", sequence\+\+, new Dictionary<string, object> \{(.*?)\n\s*\}\)\);', runner, re.S)
+    assert len(diagnostics) == 4
+    assert all('"todoInstanceId"' in frame for frame in diagnostics)
+    # A run which never started a configured Todo (a multi-account task failing
+    # before official account identity, for example) must still archive its raw
+    # upstream log.  Otherwise that evidence stays in the staging inbox and the
+    # failed round can only be diagnosed from the Manager's own records.
+    archive_start = runner.index("// A run which never started one of the configured Todos")
+    archive_end = runner.index("// A normal process exit does not erase an official task failure.")
+    assert archive_start < archive_end
+    archive_block = runner[archive_start:archive_end]
+    assert '"run_artifact_staged"' in archive_block
+    assert '"kind", "tool-log-upstream"' in archive_block
+    assert '"-upstream-*.jsonl"' in archive_block
+    assert 'stagedUpstreamLogs' in archive_block
+    assert archive_start < runner.index('"run_terminal", sequence++')
+    # The official Python entrypoint receives only official CLI arguments;
+    # candidate PYTHONPATH supplies observation modules without source writes.
+    require(runner, {
+        '" --task 1 --exit"',
+        '" --task 7 "',
+        'YEYU_GAMER_WW_MULTI_OBSERVATION_FILE',
+        'YEYU_GAMER_STAGE_FILE',
+        'YEYU_GAMER_SELECTED_OPERATIONS',
+        'YEYU_GAMER_UPSTREAM_LOG_FILE',
+        'AppDomain.CurrentDomain.BaseDirectory + ";" + binding.WorkingDirectory',
+        'PYTHONDONTWRITEBYTECODE',
+        'upstream_task_succeeded',
+        'upstream_observation_missing',
+    }, RUNNER)
+    require(runner, {
+        '"game-ui-recognition-raw"',
+        '"game-ui-recognition-replay-raw"',
+        '"official-recognition-metadata"',
+        'StepArtifactMimeType(kind)',
+        'DetailValue(stageDetail, "accountAttribution") == "unconfirmed"',
+    }, RUNNER)
+    assert 'terminalTodo(operation, "skipped", "upstream DailyTask completed without an observable call for this operation")' not in runner
+    assert 'terminalTodo(operation, "review_required", "upstream DailyTask completed without an observable child-task terminal for this operation")' not in runner
+    assert 'onStage("official-tool-start", "tool_started"' in runner
+    ww = python_source(WW_OBSERVER)
+    require(ww, {
+        'src.task.DailyTask', 'src.task.BaseWWTask',
+        'src.task.NightmareNestTask', 'src.task.TacetTask',
+        'src.task.ForgeryTask', 'src.task.SimulationTask',
+        'attach-world', 'inspect-daily-progress', 'farm-nightmare-daily-echo',
+        'spend-waveplates', 'claim-daily-reward', 'claim-mail',
+        'claim-battle-pass', 'upstream-daily-task',
+        'from upstream_logging import install as install_logging',
+        'from src.task.MultiAccountDailyTask import MultiAccountDailyTask',
+        'from OfficialStepCapture import install_recognition_observers, recognition_scope',
+        'except Exception:\n        pass',
+    }, WW_OBSERVER)
+    assert 'AccountBridgeGate' not in runner
+    assert 'YEYU_GAMER_ACCOUNT_LABEL' not in runner
+    assert 'WwAccountYeYuBridge' not in runner
+    assert 'TargetDoneSet' not in runner
+    # The baseline, rather than any locally modified installation, is the
+    # authority for the configuration/call ordering that the observer follows.
+    baseline = python_source(WW_BASELINE)
+    require(baseline, {
+        "'Farm Nightmare Nest for Daily Echo'", "'Which to Farm'",
+        'self.claim_daily()', 'self.claim_mail()', 'self.claim_battle_pass()',
+    }, WW_BASELINE)
 
-    ww = source(WW_DAILY)
-    assert "def yeyu_stage" in ww
-    assert "YEYU_GAMER_STAGE_FILE" in ww
-    assert "YEYU_GAMER_SELECTED_OPERATIONS" in ww
-    assert "def _load_yeyu_run_bridge" in ww
-    assert "createdAtUnix" in ww
-    assert "YeYuGamerRun.json" in ww
-    assert "def yeyu_capture_stage" in ww
-    assert "'capture_before'" in ww
-    assert "'capture_after'" in ww
-    assert "'.capture.ack'" in ww
-    assert "manager_requires_nightmare = (" in ww
-    assert "manager_requires_nightmare and self._last_nightmare_daily_present" in ww
-    assert "and not self._last_nightmare_daily_completed" in ww
-    assert "daily activity is {} (<100); refusing to claim or report completion" in ww
-    ww_main = source(Path(r"C:\Game\ok-ww\data\apps\ok-ww\working\main.py"))
-    assert "YEYU_GAMER_GUI_RUN_BRIDGE_V1" in ww_main
-    assert "sys.argv.extend(['--task', '1'])" in ww_main
-    assert "sys.argv.append('--exit')" in ww_main
-    # The very first real DailyTask action is waiting for the game world.  It
-    # must be visible to YeYu Gamer before the upstream one-time setup can
-    # block on a connection/login screen.
-    assert ww.index("self.yeyu_stage('attach-world', 'started'") < ww.index("WWOneTimeTask.run(self)")
-    require_operations(
-        ww,
-        {
-            "attach-world",
-            "inspect-daily-progress",
-            "farm-nightmare-daily-echo",
-            "spend-waveplates",
-            "claim-daily-reward",
-            "claim-mail",
-            "claim-battle-pass",
-        },
-        WW_DAILY,
-    )
+    endfield_baseline = python_source(ENDFIELD_BATTLE_BASELINE)
+    require(endfield_baseline, {
+        'CFG_STAGE_REWARD_TIER = "体力本奖励档位"',
+        'CFG_STAMINA_START_DATE = "刷体力开始日期"',
+        'CFG_PRE_ENTER_TEAM_SWITCH = "指定的队伍编号"',
+        '"刷本序列"', '_resolve_stage_from_sequence',
+        'if stage_name in self.REWARD_TIER_STAGE_SET',
+        'stage_options_with_tiers.append(f"{stage}{self.REWARD_TIER_LOW}")',
+        'stage_options_with_tiers.append(f"{stage}{self.REWARD_TIER_HIGH}")',
+    }, ENDFIELD_BATTLE_BASELINE)
+    # The runner maps the complete Manager profile to these published keys.
+    # Its suffix rule mirrors the official parser: only its four tiered stages
+    # accept an immediate `低阶` or `高阶` suffix.
+    require(runner, {
+        'ApplyEndfieldDailyTaskProfile(binding)',
+        '"staminaStage", "rewardTier", "staminaRotationStartDate", "staminaRotation", "teamSlot"',
+        'config["体力本"] = staminaStage',
+        'config["体力本奖励档位"] = rewardTier',
+        'config["刷体力开始日期"] = rotationStartDate',
+        'config["刷本序列"] = rotation.ToArray()',
+        'config["指定的队伍编号"] = teamSlot',
+        '"干员经验", "干员进阶", "技能提升", "武器进阶"',
+        'value.EndsWith(tier, StringComparison.Ordinal)',
+    }, RUNNER)
+    # GF2 profile values are official DailyTask keys. Null or omitted members
+    # preserve the existing official setting, while false remains a real value.
+    require(runner, {
+        'ApplyGf2DailyTaskProfile(binding)',
+        '"autoBattleConfirmed", "staminaStage", "extraCreditBattle", "autonomousLoop"',
+        '"squadDust", "eventStageName", "drinkDurations", "mealDuration"',
+        '"autoBattleConfirmed", "已确认启用游戏内全局自动功能"',
+        '"staminaStage", "体力本"',
+        '"extraCreditBattle", "刷钱本"',
+        '"autonomousLoop", "自主循环"',
+        '"squadDust", "尘烟"',
+        '"eventStageName", "当前物资关卡名称"',
+        '"drinkDurations", "喝水"',
+        '"mealDuration", "吃饭"',
+        'value != null',
+        'Gf2StaminaStages',
+        'config["情报和战前补给"] = selected.Contains("activity-supply")',
+        'config["闪耀星愿"] = selected.Contains("star-wish")',
+        'config["活动自律"] = selected.Contains("event-battle")',
+        'config["探索领取"] = selected.Contains("exploration-claim")',
+        'if (!IsGf2MainSourceBinding(binding)) config["情报补给"] = false',
+        'config["活动层"] = false',
+        'config["竞技场"] = false',
+        'config["购买免费礼包"] = false',
+        'config["商店心愿单购买"] = false',
+        'gf2_main_source_required',
+        'Gf2MainOnlyOperationsSelected(todosByOperation.Keys)',
+        'IsGf2MainSourceBinding(binding)',
+    }, RUNNER)
+    assert runner.index('Gf2MainOnlyOperationsSelected(todosByOperation.Keys)') < runner.index('RunDaily(binding, todosByOperation.Keys.ToArray()')
+    assert 'from src.patches.yeyu_gamer_bridge import install_yeyu_gamer_bridge' not in runner
+    if WW_WORKING_MAIN.is_file():
+        ww_main = WW_WORKING_MAIN.read_text(encoding="utf-8")
+        for token in ("yeyu", "YeYu", "YEYU_GAMER"):
+            assert token not in ww_main, f"WW working main.py still contains {token!r}"
+    if ENDFIELD_WORKING_MAIN.is_file():
+        ef_main = ENDFIELD_WORKING_MAIN.read_text(encoding="utf-8")
+        for token in ("yeyu", "YeYu", "YEYU_GAMER", "yeyu_gamer_bridge"):
+            assert token not in ef_main, f"Endfield working main.py still contains {token!r}"
+        assert "install_startup_patches()" in ef_main
+        assert "ok.start()" in ef_main
+    assert not ENDFIELD_YEYU_PATCH.exists(), "Endfield HUD/input insurance patch must not remain in the official working tree"
 
-    endfield = source(ENDFIELD_DAILY)
-    endfield_bridge = source(ENDFIELD_BRIDGE)
-    assert "src.tasks.onetime.DailyTask" in endfield_bridge
-    assert "协议空间[·・]高阶培养IV" in endfield_bridge
-    assert "扩装铳械塔" in endfield_bridge
-    assert "current reflection-tube icon changed" in endfield_bridge
-    assert "_load_run_bridge" in endfield_bridge
-    assert "skip opening a local summary file" in endfield_bridge
-    assert 're.compile(r"月卡剩余天数")' in endfield_bridge
-    assert "current monthly-card page confirmed by OCR" in endfield_bridge
-    assert "PostMessage(\n                    proxy_hwnd" not in endfield_bridge
-    require_operations(
-        endfield_bridge,
-        {
-            "attach-world",
-            "mail",
-            "spend-sanity",
-            "delivery-commission",
-            "collect-credit",
-            "dijiang-harvest",
-            "claim-daily-reward",
-        },
-        ENDFIELD_DAILY,
-    )
-
-    gf2 = source(GF2_DAILY)
-    assert "build_yeyu_gamer_tasks" in gf2
-    assert "Manager run requires a pre-confirmed in-game global auto setting" in gf2
-    assert "航线解锁|解锁|升级|购买|充值|补差价|￥|¥" in gf2
-    require_operations(
-        gf2,
-        {
-            "attach-home",
-            "mail",
-            "public-area-dispatch",
-            "spend-stamina",
-            "squad-tasks",
-            "claim-daily-missions",
-        },
-        GF2_DAILY,
-    )
-    print("openkuro selected-daily contract: passed")
+    print("openkuro passive observer contract: passed")
 
 
 if __name__ == "__main__":

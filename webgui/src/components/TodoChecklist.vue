@@ -2,6 +2,7 @@
 import { computed } from 'vue'
 import type { AutomationAssessment, TodoAttempt, TodoInstance } from '../api/contracts'
 import StatusBadge from './StatusBadge.vue'
+import ManualEvidenceReview from './ManualEvidenceReview.vue'
 import {
   completedTodo,
   dispatchDispositionLabel,
@@ -138,6 +139,7 @@ function productMessage(item: TodoInstance): string {
             <p v-else class="missing-source">未登记来源引用</p>
           </div>
         </details>
+        <ManualEvidenceReview v-if="!compact && item.status !== 'in_progress'" :todo="item" />
         <p v-if="!productMode && !compact && item.evidenceRefs.length" class="todo-refs">证据：{{ item.evidenceRefs.join(' · ') }}</p>
         <details v-if="!productMode && !compact && attemptsFor(item.todoInstanceId).length" class="attempt-history">
           <summary>展开 {{ attemptsFor(item.todoInstanceId).length }} 次尝试</summary>

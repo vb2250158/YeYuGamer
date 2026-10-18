@@ -12,12 +12,22 @@ export function readOKWWProfile(value: unknown): OKWWProfile {
   const tacet = raw.tacetSuppressionNumber ?? raw.tacet_suppression_number
   const forgery = raw.forgeryChallengeNumber ?? raw.forgery_challenge_number
   const echo = raw.farmNightmareNestForDailyEcho ?? raw.farm_nightmare_nest_for_daily_echo
+  const additional = raw.additionalTasks ?? raw.additional_tasks
+  const allowedAdditional = new Set([
+    'Check Weekly Garden',
+    'Auto Farm all Nightmare Nest',
+    'Merge Echo If discarded > 1000',
+    'Teleport and Farm 4C Echo',
+  ])
   return {
     whichToFarm: farm === 'Forgery Challenge' || farm === 'Simulation Challenge' ? farm : 'Tacet Suppression',
     tacetSuppressionNumber: typeof tacet === 'number' ? tacet : 1,
     forgeryChallengeNumber: typeof forgery === 'number' ? forgery : 1,
     materialSelection: material === 'Resonator EXP' || material === 'Weapon EXP' ? material : 'Shell Credit',
     farmNightmareNestForDailyEcho: typeof echo === 'boolean' ? echo : true,
+    additionalTasks: Array.isArray(additional)
+      ? additional.filter((item): item is OKWWProfile['additionalTasks'][number] => typeof item === 'string' && allowedAdditional.has(item))
+      : [],
   }
 }
 

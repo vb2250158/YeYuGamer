@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "candidates": [
+    {
+      "candidateKind": "isolated-official-gf2-source",
+      "repository": "https://github.com/AliceJump/ok-gf2.git",
+      "commit": "0fae94eb01621c00fba7078bb3e7316a95185c5d",
+      "tag": "v1.2.81",
+      "files": {}
+    },
+    {
+      "candidateKind": "isolated-local-gf2-source-patch-with-formal-runtime-binding",
+      "repository": "https://github.com/AliceJump/ok-gf2.git",
+      "commit": "f70efd718b220d8b86085f7652b340e1124bae80",
+      "officialBaseCommit": "6b2a194b7f6371b5d8d2b33ed62809272f481db3",
+      "tag": null,
+      "files": {
+        "src/core/BaseGfTask.py": "c45b4a5a408e0c92894c8327997b231024d0448756e233fa1af8ed88afddaccf",
+        "src/core/resource_update.py": "41bf90345749240f626b60924e0ff3c2bc9ab85dc0ac3c67cc80ed00e0c8dddd",
+        "tests/TestResourceUpdate.py": "7e750f3e8e81ed15cc19921e67e7656fb08e4257957e1df425786233d918892d"
+      }
+    },
+    {
+      "candidateKind": "isolated-local-gf2-source-patch-with-formal-runtime-binding",
+      "repository": "https://github.com/AliceJump/ok-gf2.git",
+      "commit": "a0cdfa7951e03bfd5c8a5ff807e037bfb72ebd38",
+      "officialBaseCommit": "14c907e0370ca015e4389afdb5a3863fa24ccb1c",
+      "tag": null,
+      "inspectionVersion": "gf2.reward-status.inspect@1.0",
+      "files": {
+        "src/config.py": "bc658bc90e4f55c8c91d08323d1dcd2768f74e8d4691542448415cf87196d59d",
+        "src/tasks/RewardStatusInspectionTask.py": "5afd4881512578e3ae23fbde6c77bea2b204a40069ac7c814bca9301efdf9fb3",
+        "tests/TestRewardStatusInspection.py": "796d1f2b921bad1e42a1ebcda0597fd6901f521c433d6b56b8f5affe0f120ee5",
+        "src/core/BaseGfTask.py": "c45b4a5a408e0c92894c8327997b231024d0448756e233fa1af8ed88afddaccf",
+        "src/core/resource_update.py": "41bf90345749240f626b60924e0ff3c2bc9ab85dc0ac3c67cc80ed00e0c8dddd",
+        "tests/TestResourceUpdate.py": "7e750f3e8e81ed15cc19921e67e7656fb08e4257957e1df425786233d918892d"
+      }
+    },
+    {
+      "candidateKind": "isolated-local-gf2-source-patch-with-formal-runtime-binding",
+      "repository": "https://github.com/AliceJump/ok-gf2.git",
+      "commit": "2db9c13866c78aee2e1ba4d64031f8d2d0926331",
+      "officialBaseCommit": "14c907e0370ca015e4389afdb5a3863fa24ccb1c",
+      "tag": null,
+      "inspectionVersion": "gf2.reward-status.inspect@1.0",
+      "files": {
+        "src/config.py": "bc658bc90e4f55c8c91d08323d1dcd2768f74e8d4691542448415cf87196d59d",
+        "src/tasks/RewardStatusInspectionTask.py": "8158d5053fed0077899777c3d88f6009224e23abf9c5f9aa4dcee7185af32150",
+        "tests/TestRewardStatusInspection.py": "4441b076ea6bde71d2582afec17ac3e5cddb02962239c8db813b8f56e7d47f32",
+        "src/core/BaseGfTask.py": "c45b4a5a408e0c92894c8327997b231024d0448756e233fa1af8ed88afddaccf",
+        "src/core/resource_update.py": "41bf90345749240f626b60924e0ff3c2bc9ab85dc0ac3c67cc80ed00e0c8dddd",
+        "tests/TestResourceUpdate.py": "7e750f3e8e81ed15cc19921e67e7656fb08e4257957e1df425786233d918892d",
+        "main.py": "8350e12a28e44516a30edc99c06c174a45f9af80076a7c24614cf7862795add8",
+        "requirements.txt": "7564035a8df1a1e4e7287bcea0130b322a72301cc2a112dfa567781c21e132d7",
+        "src/tasks/DailyTask.py": "34382b5e4ce70b42f6a8b6d6e394439fcee6bc28f918c12cce20a4fe2ae42e30",
+        "src/tasks/daily/daily_activity_mixin.py": "bd3870b80f7375ec33b18991d890625b5c3042be085d7f325ee096e6523fbe8b",
+        "src/tasks/daily/daily_reward_mixin.py": "297e94c699100f64e0979cea63b711241a55765febeb54c170fffbb22a5407c0",
+        "src/interaction/Mouse.py": "b6d37798111ef76ff3311994afbf4166e733ad9e1b59d1110d63d06328d47cc4",
+        "tests/TestOptionalRewardInspection.py": "a5a96a370302848306a2a5e96b565235f9b7d4fd4969f811b2a1673cc53dc7b7",
+        "tests/TestRewardTrackNavigation.py": "9fb040d30f36a3126dd08098ce392cfbd3ebc9281218833da3ee564bc9e90247",
+        "docs/reward-status-inspection-candidate.md": "61bee778612b23f726577affa01095ff93c33ce3f54e5c16b645fe8062c86db0"
+      }
+    }
+  ]
+}
