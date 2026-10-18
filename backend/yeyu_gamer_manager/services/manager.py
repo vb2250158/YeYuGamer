@@ -2542,8 +2542,12 @@ class ManagerService:
             todo_items=todo_instances,
             runs=runs,
         )
-        daily_todo_summary = self._todo_summary_from_items(todo_instances, "daily")
-        weekly_todo_summary = self._todo_summary_from_items(todo_instances, "weekly")
+        daily_todo_summary = self._todo_summary_from_items(
+            [item for item in todo_instances if item.cadence == "daily"], "daily"
+        )
+        weekly_todo_summary = self._todo_summary_from_items(
+            [item for item in todo_instances if item.cadence == "weekly"], "weekly"
+        )
         controller_leases = self.store.list_controller_leases(
             run_id=(current.run_id if current else None), limit=20
         ) if current else []

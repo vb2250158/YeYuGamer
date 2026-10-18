@@ -45,7 +45,9 @@ class OperatorEvidenceUploadTests(unittest.TestCase):
                 self.assertNotIn("default", {todo.account_id for todo in todos})
                 detail = manager.get_game_detail("WW")
                 self.assertEqual(len(detail["todoInstances"]), len(todos))
-                self.assertEqual(detail["todoSummary"]["daily"], manager._todo_summary_from_items(todos, "daily"))
+                for cadence in ("daily", "weekly"):
+                    scoped = [todo for todo in todos if todo.cadence == cadence]
+                    self.assertEqual(detail["todoSummary"][cadence], manager._todo_summary_from_items(scoped, cadence))
 
     def setUp(self):
         self.fixture = contract_support.ManagerContractTests()
