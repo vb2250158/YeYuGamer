@@ -12,6 +12,41 @@ import test_contract as contract_support
 
 
 class OperatorEvidenceUploadTests(unittest.TestCase):
+    def test_game_detail_aggregates_accounts_without_requiring_default(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from fastapi.testclient import TestClient
+        from yeyu_gamer_manager.app import create_app
+        from yeyu_gamer_manager.domain.models import ConfigPatchRequest
+        from yeyu_gamer_manager.settings import Settings
+
+        with tempfile.TemporaryDirectory(prefix="yeyu-detail-") as directory:
+            settings = Settings.for_test(Path(directory))
+            settings.legacy_root.mkdir(parents=True)
+            (settings.legacy_root / "daily-gui-config.json").write_text(json.dumps({
+                "enabled": {"WW": True}, "order": ["WW"], "dailyScheduleEnabled": False,
+            }), encoding="utf-8")
+            (settings.legacy_root / "game-automation-policy.json").write_text(json.dumps({
+                "schemaVersion": 2, "forbiddenActions": [], "games": {"WW": {}},
+            }), encoding="utf-8")
+            with TestClient(create_app(settings)) as client:
+                manager = client.app.state.manager
+                manager.patch_config(
+                    ConfigPatchRequest(game_accounts={"WW": [
+                        {"label": "first", "enabled": True},
+                        {"label": "second", "enabled": True},
+                    ]}), idempotency_key="two-accounts", request_id=None,
+                    path="/api/v1/config", expected_state_version=None,
+                )
+                todos = manager.list_todo_instances(game_id="WW", current=True, limit=1000)
+                self.assertEqual(len({todo.account_id for todo in todos}), 2)
+                self.assertNotIn("default", {todo.account_id for todo in todos})
+                detail = manager.get_game_detail("WW")
+                self.assertEqual(len(detail["todoInstances"]), len(todos))
+                self.assertEqual(detail["todoSummary"]["daily"], manager._todo_summary_from_items(todos, "daily"))
+
     def setUp(self):
         self.fixture = contract_support.ManagerContractTests()
         self.fixture.setUp()
