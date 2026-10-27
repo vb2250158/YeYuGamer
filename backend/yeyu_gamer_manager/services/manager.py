@@ -9,6 +9,8 @@ import secrets
 import stat
 import threading
 from .snapshot_coalescer import SnapshotCoalescer
+from .queue_parking import attempt_parking_record, parking_record, park_human_gate, unresolved_parking_record
+from .queue_timeout_budget import load_queue_timeout_budget
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -253,7 +255,7 @@ class ManagerService:
     # A pending Agent completion review may delay the batch seal (and the round
     # mail) for at most this long.  After that the machine adjudication seals
     # the batch; unreviewed runs stay review_required.
-    COMPLETION_REVIEW_BARRIER_SECONDS = 15 * 60
+    COMPLETION_REVIEW_BARRIER_SECONDS = load_queue_timeout_budget({}).completion_review_seconds
     COMPLETION_REVIEW_WATCHDOG_POLL_SECONDS = 60.0
     COMPLETION_REVIEW_RECOVERY_BACKOFF_SECONDS = 30 * 60
     BATCH_CANCEL_MAX_DELIVERY_ATTEMPTS = 3
@@ -1730,6 +1732,8 @@ class ManagerService:
         now = utc_now()
         for membership in memberships:
             run_id = str(membership["run_id"])
+            if parking_record(self, run_id) is not None:
+                continue
             run = self.store.get_game_run(run_id)
             if not run["todo_instance_ids"]:
                 return False
@@ -5308,6 +5312,11 @@ class ManagerService:
         existing = self.store.get_batch(batch_id)
         if existing.get("result", {}).get("sealVersion") is not None:
             return existing
+        if state != EntityState.CANCELLED and any(
+            unresolved_parking_record(self, str(member["run_id"])) is not None
+            for member in self.store.list_batch_run_memberships(batch_id=batch_id, limit=5000)
+        ):
+            raise ManagerConflict("Unresolved parked GameRuns must remain in their original unsealed Batch")
         frozen_candidate_ids = [
             str(value)
             for value in initial_result.get(
@@ -6075,7 +6084,7 @@ class ManagerService:
                         "schemaVersion": 1,
                         "status": "awaiting",
                         "barrierStartedAt": utc_now().isoformat(),
-                        "barrierSeconds": self.COMPLETION_REVIEW_BARRIER_SECONDS,
+                        "barrierSeconds": load_queue_timeout_budget(self.store.get_config()["values"]).completion_review_seconds,
                         "frozenFinalContext": frozen_context,
                     },
                 },
@@ -6222,7 +6231,7 @@ class ManagerService:
         seconds = (
             float(bound)
             if isinstance(bound, (int, float)) and not isinstance(bound, bool)
-            else float(self.COMPLETION_REVIEW_BARRIER_SECONDS)
+            else load_queue_timeout_budget(self.store.get_config()["values"]).completion_review_seconds
         )
         return (utc_now() - started).total_seconds() >= seconds
 
@@ -7217,6 +7226,11 @@ class ManagerService:
         manifest: ExecutionPackageManifest | None = None,
         capture_pids: frozenset[int] | None = None,
     ) -> None:
+        parked = attempt_parking_record(self, plan.run_attempt_id)
+        if parked is not None:
+            self.store.append_event("queue.parking.late-event", "run-attempt", plan.run_attempt_id,
+                                    {"eventType": event.event_type, "businessCompleted": False})
+            return
         if event.event_type in {"artifact_staged", "run_artifact_staged"} and manifest is None:
             raise ManagerValidation(
                 "artifact persistence requires the verified execution manifest"
@@ -7685,6 +7699,11 @@ class ManagerService:
         command_id: str | None = None,
         manager_control_outcome: str | None = None,
     ) -> AdapterRunResult | None:
+        parked = attempt_parking_record(self, plan.run_attempt_id)
+        if parked is not None:
+            self.store.append_event("queue.parking.late-result", "run-attempt", plan.run_attempt_id,
+                                    {"status": result.status, "code": result.code, "businessCompleted": False})
+            return None
         if manager_control_outcome not in {None, "human_required", "cancelled"}:
             raise ValueError("Manager control may only preserve a human or cancellation boundary")
         result_document = {
@@ -8096,6 +8115,10 @@ class ManagerService:
             self._close_attempt_log(plan.run_attempt_id)
 
         def _finished(result: AdapterRunResult) -> None:
+            if attempt_parking_record(self, plan.run_attempt_id) is not None:
+                self.store.append_event("queue.parking.late-result", "run-attempt", plan.run_attempt_id,
+                                        {"status": result.status, "code": result.code, "businessCompleted": False})
+                return
             effective_result = result
             manager_control_outcome: str | None = None
             _log.info(
@@ -8158,6 +8181,13 @@ class ManagerService:
                 _log.exception("attempt.persistence_failed %s", failure)
                 try:
                     attempt = self.store.get_run_attempt(plan.run_attempt_id)
+                    latest = self.store.list_run_attempts(run_id=plan.run_id, limit=1)
+                    if (attempt_parking_record(self, plan.run_attempt_id) is not None
+                            or not latest or latest[0]["run_attempt_id"] != plan.run_attempt_id):
+                        effective_result = None
+                        self.store.append_event("queue.parking.late-callback-failure", "run-attempt", plan.run_attempt_id,
+                                                {"errorClass": type(error).__name__, "businessCompleted": False})
+                        return
                     if attempt["state"] in {"starting", "running", "cancelling"}:
                         self.store.update_run_attempt(
                             plan.run_attempt_id,
@@ -8636,6 +8666,13 @@ class ManagerService:
                 "The queue has no valid frozen game scope; preserve clients and inspect its scope.",
             )
         other_game_ids = [game_id for game_id in candidates if game_id != plan.game_id]
+        protected_parked_game_ids = set()
+        for owner in self.store.list_unsealed_batches():
+            for member in owner.get("run_memberships", []):
+                parked = parking_record(self, str(member["run_id"]))
+                if parked is not None:
+                    protected_parked_game_ids.add(parked["document"]["gameId"])
+        other_game_ids = [game_id for game_id in other_game_ids if game_id not in protected_parked_game_ids]
         report: dict[str, Any] = {
             "batchId": batch_id,
             "currentGameId": plan.game_id,
@@ -8677,6 +8714,8 @@ class ManagerService:
                     continue
                 for member in owner.get("run_memberships", []):
                     protected = self.store.get_game_run(str(member["run_id"]))
+                    if parking_record(self, str(member["run_id"])) is not None:
+                        continue
                     if protected["game_id"] not in other_game_ids:
                         continue
                     has_human_blocker = any(
@@ -9124,17 +9163,16 @@ class ManagerService:
             finished = threading.Event()
             outcome: dict[str, AdapterRunResult] = {}
 
-            def complete(result: AdapterRunResult) -> None:
+            def complete(result: AdapterRunResult, outcome=outcome, finished=finished, expected_run_id=run_id) -> None:
+                if result.run_id != expected_run_id:
+                    return
                 outcome["result"] = result
                 finished.set()
 
             try:
                 plan, _ = self._start_game_run(run_id, complete)
-                wait_seconds = (
-                    plan.timeout_seconds
-                    + (2 * self.adapter_host.CANCEL_GRACE_SECONDS)
-                    + 30
-                )
+                budget = load_queue_timeout_budget(self.store.get_config()["values"])
+                wait_seconds = plan.timeout_seconds + budget.callback_overhead_seconds
                 if not finished.wait(wait_seconds):
                     timed_out = True
                     attempt = self.store.get_run_attempt(plan.run_attempt_id)
@@ -9150,7 +9188,7 @@ class ManagerService:
                             result={"code": "manager_batch_wait_timeout"},
                             completed=False,
                         )
-                    finished.wait(self.adapter_host.CANCEL_GRACE_SECONDS + 10)
+                    finished.wait(budget.callback_cancel_grace_seconds)
                 result = outcome.get("result")
                 if result is None:
                     attempt = self.store.get_run_attempt(plan.run_attempt_id)
@@ -9230,6 +9268,17 @@ class ManagerService:
                         ),
                     )
             if self.store.get_game_run(run_id)["state"] == EntityState.HUMAN_REQUIRED:
+                try:
+                    parked = park_human_gate(self, batch_id, run_id, utc_now)
+                except Exception as error:
+                    parked = False
+                    self.store.append_event("queue.parking.failed", "game-run", run_id,
+                                            {"batchId": batch_id, "errorClass": type(error).__name__})
+                if parked:
+                    completed = [item for item in completed if item != run_id]
+                    if run_id not in failures:
+                        failures.append(run_id)
+                    continue
                 if self.store.get_active_batch_cancel_request(batch_id) is not None:
                     break
                 # A real human gate owns the desktop until explicit release.
@@ -9376,6 +9425,19 @@ class ManagerService:
                 "failed",
                 "Batch stopped before every queued member ran; a typed resume request is required.",
             )
+            return
+        parked_run_ids = [str(member["run_id"]) for member in memberships
+                          if parking_record(self, str(member["run_id"])) is not None]
+        if parked_run_ids:
+            current = self.store.get_batch(batch_id)
+            self.store.update_batch(batch_id, state=EntityState.REVIEW_REQUIRED, result={
+                **dict(current["result"]), "currentGameId": None,
+                "parkedRunIds": parked_run_ids, "acceptedDone": False,
+                "completedRunIds": completed, "failedRunIds": failures,
+                "recoveryPhase": {"schemaVersion": 1, "status": "ready_for_resume",
+                                  "parkedReview": True, "affectedRunIds": parked_run_ids},
+            })
+            self._complete_command(command_id, "failed", "Queue dispatched all available members; parked GameRuns remain incomplete.")
             return
         outcomes = self._batch_run_outcome_sets(memberships)
         final_state = (
@@ -12652,6 +12714,10 @@ class ManagerService:
                 ],
             },
         )
+        parked = parking_record(self, run["run_id"])
+        if parked is not None:
+            self.store.update_resource("queue-parking", parked["resource_id"], state="parked",
+                                       document={**parked["document"], "humanReleaseId": release_id})
         return release, resolved
 
     def create_run_control_request(
@@ -12688,6 +12754,7 @@ class ManagerService:
                 current["state"] == "human_required"
                 or active_human_blocker
                 or active_takeover_resource
+                or parking_record(self, run_id) is not None
             ):
                 raise ManagerConflict("the run has no active human takeover to release")
 
@@ -12696,6 +12763,10 @@ class ManagerService:
         def operation() -> dict[str, Any]:
             latest = self.store.get_game_run(run_id)
             if action == "takeover":
+                parked = parking_record(self, run_id)
+                if parked is not None:
+                    self.store.update_resource("queue-parking", parked["resource_id"], state="reclaimed",
+                                               document={**parked["document"], "ownershipReleased": False})
                 active_attempt = next(
                     (
                         item
@@ -12784,6 +12855,9 @@ class ManagerService:
             predecessor_attempts = self.store.list_run_attempts(
                 run_id=run_id, limit=1
             )
+            unresolved_parking = unresolved_parking_record(self, run_id)
+            if unresolved_parking is not None:
+                raise ManagerConflict("parked_run_reconciliation_required: explicit release, fresh observation, binding and checkpoint validation must precede a successor")
             if (
                 latest["state"] == EntityState.HUMAN_REQUIRED
                 and predecessor_attempts

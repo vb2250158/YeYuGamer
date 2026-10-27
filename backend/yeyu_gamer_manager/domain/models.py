@@ -1475,10 +1475,20 @@ class ConfigPatchRequest(ApiModel):
     skip_blocked_on_run_all: bool | None = None
     execution_strategy: Literal["continue", "stop"] | None = None
     step_timeout_seconds: int | None = Field(default=None, ge=600, le=7200)
+    queue_timeout_budget: dict[str, Any] | None = None
     todo_reset_policy: TodoResetPolicyConfig | None = None
     game_paths: dict[str, GamePathConfig] | None = None
     daily_tool_profiles: DailyToolProfilesConfig | None = None
     daily_todo_selection: dict[str, list[str]] | None = None
+
+    @field_validator("queue_timeout_budget")
+    @classmethod
+    def validate_queue_timeout_budget(cls, value):
+        if value is not None:
+            from ..services.queue_timeout_budget import load_queue_timeout_budget
+
+            load_queue_timeout_budget({"queue_timeout_budget": value})
+        return value
 
 
 class TodoTransitionRequest(ApiModel):

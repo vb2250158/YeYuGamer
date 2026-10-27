@@ -7049,6 +7049,7 @@ class SqliteStore:
             "adapter-promotion-receipt",
             "diagnostic-bundle",
             "run-control-request",
+            "queue-parking",
             "notification",
             "config-validation",
             "automation-assessment",

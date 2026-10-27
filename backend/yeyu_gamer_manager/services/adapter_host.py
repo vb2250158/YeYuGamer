@@ -1263,6 +1263,12 @@ class ManagerAdapterHost:
                 }
         return self.compatibility_adapter.active_execution()
 
+    def release_terminal_owner(self, run_attempt_id: str) -> bool:
+        with self._execution_lock:
+            if self._active_process is None:
+                return self.compatibility_adapter.active_execution() is None
+            return False
+
     def _verified_execution_manifest(self, game_id: str) -> ExecutionPackageManifest:
         try:
             return self._verify_promoted_package(

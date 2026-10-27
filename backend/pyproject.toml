@@ -25,6 +25,9 @@ yeyu-gamer-manager = "yeyu_gamer_manager.__main__:main"
 where = ["."]
 include = ["yeyu_gamer_manager*"]
 
+[tool.setuptools.package-data]
+yeyu_gamer_manager = ["services/resources/queue_timeout_budgets.json", "services/resources/queue_timeout_limits.json"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
