@@ -162,15 +162,17 @@ function Test-WwHardcapCohortSource($Working, $Record) {
             '6c5938976094c7423de808d7ce323df2cc39c2d3' { if ((Hash (Join-Path $Working 'src/task/DailyTask.py')) -ceq '51337ab585f5c56a1063d75544756f8a699afbbd553f4434f231cb80e2d062df') { '60d11cd8fe15719fcacbd42729eb8c9cb180e187afb1c7be4847470b164d86f6' } }
             '20d2a0fbd5cbe257d80cc2de5f70d369ba25d07f' { if ((Hash (Join-Path $Working 'src/task/DailyTask.py')) -ceq '51337ab585f5c56a1063d75544756f8a699afbbd553f4434f231cb80e2d062df') { '8269e9e4e0499ef895213998c9fe45319efc103e42b2a084ea7aeecca79b0aaa' } }
             '88a67e6a1719315954f5120aaf9d6a7819b28d78' { if ((Hash (Join-Path $Working 'src/task/DailyTask.py')) -ceq 'b1966a153c49f718f42a157de81431ec10d2f9de16427b72974106fe987a3041') { '351acc3af398c0e118b2e57649ea45343cd1901855ab0934c4b1fe2dcf7eca99' } }
+            '63186ed17abab2fb808f9f98ff310bdf3144c57b' { if ((Hash (Join-Path $Working 'src/task/DailyTask.py')) -ceq 'b1966a153c49f718f42a157de81431ec10d2f9de16427b72974106fe987a3041') { '4d286e79ba2ab3746489b86248861d7a3b45cf5b7ceb382e4a61582cdb00095c' } }
         }
         if (-not $sourceIndex) { return $false }
-        $sourceCount = if ($Record.source.commit -ceq '88a67e6a1719315954f5120aaf9d6a7819b28d78') { 316 } elseif ($Record.source.commit -ceq '20d2a0fbd5cbe257d80cc2de5f70d369ba25d07f') { 304 } else { 303 }
-        return ($Record.source.commit -cnotin @('ca8dd9b96f1ecf0c5e02e61c9ef4a3ed60d9776a', '814eddb3e1acd05bc06f7fad212214e6d872a668', '6c5938976094c7423de808d7ce323df2cc39c2d3', '20d2a0fbd5cbe257d80cc2de5f70d369ba25d07f', '88a67e6a1719315954f5120aaf9d6a7819b28d78') -or
+        $sourceCount = if ($Record.source.commit -ceq '63186ed17abab2fb808f9f98ff310bdf3144c57b') { 318 } elseif ($Record.source.commit -ceq '88a67e6a1719315954f5120aaf9d6a7819b28d78') { 316 } elseif ($Record.source.commit -ceq '20d2a0fbd5cbe257d80cc2de5f70d369ba25d07f') { 304 } else { 303 }
+        $templateIndex = if ($Record.source.commit -ceq '63186ed17abab2fb808f9f98ff310bdf3144c57b') { '7191c36bdea641b9d6361a1c23b263cc48d7c19070b4754673b7b6d21ea5baa8' } else { 'ca1d7d95b077c5517d5b6d515d35200ccb42e043aa333a18fd5421fae358b001' }
+        return ($Record.source.commit -cnotin @('ca8dd9b96f1ecf0c5e02e61c9ef4a3ed60d9776a', '814eddb3e1acd05bc06f7fad212214e6d872a668', '6c5938976094c7423de808d7ce323df2cc39c2d3', '20d2a0fbd5cbe257d80cc2de5f70d369ba25d07f', '88a67e6a1719315954f5120aaf9d6a7819b28d78', '63186ed17abab2fb808f9f98ff310bdf3144c57b') -or
             (Test-WwOcrCacheOwnership (Split-Path -Parent (Split-Path -Parent $Working)))) -and
             $templates.repository -ceq 'https://github.com/ok-oldking/ok-wuthering-waves-coco-labeling.git' -and
             $templates.commit -ceq '438526eafcf4b1caf78c1dea68ef36b42e81e3c4' -and $templates.directory -ceq 'WW/source/ok_templates' -and
             (Test-WwCohortBlobTree $Working $Record.source.blobs $sourceCount $sourceIndex $true) -and
-            (Test-WwCohortBlobTree (Join-Path $Working 'ok_templates') $templates.blobs 165 'ca1d7d95b077c5517d5b6d515d35200ccb42e043aa333a18fd5421fae358b001' $false)
+            (Test-WwCohortBlobTree (Join-Path $Working 'ok_templates') $templates.blobs 165 $templateIndex $false)
     } catch { return $false }
 }
 function Test-EndfieldInspectionV2Source($Root, $Working, $SourceRecord, $Policy) {
@@ -297,7 +299,7 @@ if (Test-Path -LiteralPath $wwCandidateManifestPath -PathType Leaf) {
         $wwCandidateSource.officialBaseCommit -ceq '6ffaa7f0b0b7f3140367de96c8eacba533c96894' -and
         (Test-WwHardcapCohortSource $wwWorking $wwCandidateManifest) -and
         (Hash (Join-Path $wwWorking 'src/task/StaminaBudget.py')) -ceq 'd9d6e44c6a25be00069873779f50b1db7c6747dd62a98d00d949dba1cb5f7ccf' -and
-        (Hash (Join-Path $wwWorking 'src/task/MultiAccountDailyTask.py')) -cin @('7d2c193e8c978014977b653457e689766e1cc444d43bd9609b73e1e5deaceac3', 'ddb61a0e23c72c54d0690ef15e71adefa0263c75afbfde1493cb74266a1d299d', 'd7430d3fc268c7abd473ba1cecf46da904714928087be97be37d06d3dd7446af', '890d2fe4eea471cc54ae651da6545d27e079db289875eee77833ae37061ed9a6', '34f0b3e96102fdddf4610fa7de3ff6e56acd24ee438d84c2e7a7062738cb7fff') -and
+        (Hash (Join-Path $wwWorking 'src/task/MultiAccountDailyTask.py')) -cin @('7d2c193e8c978014977b653457e689766e1cc444d43bd9609b73e1e5deaceac3', 'ddb61a0e23c72c54d0690ef15e71adefa0263c75afbfde1493cb74266a1d299d', 'd7430d3fc268c7abd473ba1cecf46da904714928087be97be37d06d3dd7446af', '890d2fe4eea471cc54ae651da6545d27e079db289875eee77833ae37061ed9a6', '34f0b3e96102fdddf4610fa7de3ff6e56acd24ee438d84c2e7a7062738cb7fff', '669796536ef5215e206779bdc3ee2ebd435b4ecc176d1683aca17ec1dcc54673') -and
         (Hash (Join-Path $wwWorking 'src/task/BaseWWTask.py')) -ceq '88969a22399518128bb9e67e5c7356305dc3eecfd1cb4bd9defe3d67e9598006' -and
         (Hash (Join-Path $wwWorking 'src/task/DomainTask.py')) -ceq '14d553b5547dfaab3cb8fa70734ae4a9701b35484a03b2ff39bdd286699adb44' -and
         (Hash (Join-Path $wwWorking 'src/task/TacetTask.py')) -ceq '7625dd0e8420c9ad0a41ac7dc150be277f58f1f8dd3b4b0d106c1353a3f24d36' -and

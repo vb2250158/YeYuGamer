@@ -1119,11 +1119,14 @@ private static bool IsWwHardcapCohortSource(string working, IDictionary<string, 
                 commit == "20d2a0fbd5cbe257d80cc2de5f70d369ba25d07f" && dailyHash == "51337ab585f5c56a1063d75544756f8a699afbbd553f4434f231cb80e2d062df" ?
                 "8269e9e4e0499ef895213998c9fe45319efc103e42b2a084ea7aeecca79b0aaa" :
                 commit == "88a67e6a1719315954f5120aaf9d6a7819b28d78" && dailyHash == "b1966a153c49f718f42a157de81431ec10d2f9de16427b72974106fe987a3041" ?
-                "351acc3af398c0e118b2e57649ea45343cd1901855ab0934c4b1fe2dcf7eca99" : null;
+                "351acc3af398c0e118b2e57649ea45343cd1901855ab0934c4b1fe2dcf7eca99" :
+                commit == "63186ed17abab2fb808f9f98ff310bdf3144c57b" && dailyHash == "b1966a153c49f718f42a157de81431ec10d2f9de16427b72974106fe987a3041" ?
+                "4d286e79ba2ab3746489b86248861d7a3b45cf5b7ceb382e4a61582cdb00095c" : null;
             if (sourceIndex == null) return false;
-            int sourceCount = commit == "88a67e6a1719315954f5120aaf9d6a7819b28d78" ? 316 : (commit == "20d2a0fbd5cbe257d80cc2de5f70d369ba25d07f" ? 304 : 303);
+            int sourceCount = commit == "63186ed17abab2fb808f9f98ff310bdf3144c57b" ? 318 : commit == "88a67e6a1719315954f5120aaf9d6a7819b28d78" ? 316 : (commit == "20d2a0fbd5cbe257d80cc2de5f70d369ba25d07f" ? 304 : 303);
+            string templateIndex = commit == "63186ed17abab2fb808f9f98ff310bdf3144c57b" ? "7191c36bdea641b9d6361a1c23b263cc48d7c19070b4754673b7b6d21ea5baa8" : "ca1d7d95b077c5517d5b6d515d35200ccb42e043aa333a18fd5421fae358b001";
                 return source != null && templates != null &&
-                    (!new[] { "ca8dd9b96f1ecf0c5e02e61c9ef4a3ed60d9776a", "814eddb3e1acd05bc06f7fad212214e6d872a668", "6c5938976094c7423de808d7ce323df2cc39c2d3", "20d2a0fbd5cbe257d80cc2de5f70d369ba25d07f", "88a67e6a1719315954f5120aaf9d6a7819b28d78" }.Contains(commit) ||
+                    (!new[] { "ca8dd9b96f1ecf0c5e02e61c9ef4a3ed60d9776a", "814eddb3e1acd05bc06f7fad212214e6d872a668", "6c5938976094c7423de808d7ce323df2cc39c2d3", "20d2a0fbd5cbe257d80cc2de5f70d369ba25d07f", "88a67e6a1719315954f5120aaf9d6a7819b28d78", "63186ed17abab2fb808f9f98ff310bdf3144c57b" }.Contains(commit) ||
                         IsAuditedWwOcrCachePatch(Path.GetDirectoryName(Path.GetDirectoryName(working)))) &&
                     (templates["repository"] as string) == "https://github.com/ok-oldking/ok-wuthering-waves-coco-labeling.git" &&
                     (templates["commit"] as string) == "438526eafcf4b1caf78c1dea68ef36b42e81e3c4" &&
@@ -1131,7 +1134,7 @@ private static bool IsWwHardcapCohortSource(string working, IDictionary<string, 
                     AuditedWwBlobTree(working, source["blobs"] as object[], sourceCount,
                         sourceIndex, true) &&
                     AuditedWwBlobTree(Path.Combine(working, "ok_templates"), templates["blobs"] as object[], 165,
-                        "ca1d7d95b077c5517d5b6d515d35200ccb42e043aa333a18fd5421fae358b001", false);
+                        templateIndex, false);
             } catch { return false; }
         }
 
