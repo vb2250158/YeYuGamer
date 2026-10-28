@@ -373,6 +373,8 @@ class AdapterExecutionPlan:
     preserve_client_on_stop: bool = True
     account_id: str = "default"
     account_snapshot: dict[str, str] = field(default_factory=dict)
+    selected_operations: tuple[str, ...] = ()
+    observation_only_operations: tuple[str, ...] = ()
 
     @classmethod
     def from_document(cls, document: object) -> "AdapterExecutionPlan":
@@ -516,6 +518,8 @@ class AdapterExecutionPlan:
         )
 
     def to_document(self) -> dict[str, Any]:
+        if self.selected_operations or self.observation_only_operations:
+            raise AdapterProtocolError("unsupported_operation_scope", "This protocol baseline cannot transport operation-scope overrides")
         document = {
             "schemaVersion": SCHEMA_VERSION,
             "protocolVersion": PROTOCOL_VERSION,

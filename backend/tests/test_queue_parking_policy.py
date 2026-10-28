@@ -1,25 +1,13 @@
 from __future__ import annotations
 
 import unittest
-from dataclasses import dataclass
 from unittest import mock
 
 import test_manager_adapter_execution as fixtures
-from yeyu_gamer_manager.services.adapter_protocol import AdapterExecutionPlan
 from yeyu_gamer_manager.domain.models import ConfigPatchRequest, RunControlRequest
 from yeyu_gamer_manager.services.adapter_protocol import AdapterRunResult
 from yeyu_gamer_manager.services.game_launcher import GameLaunchHumanRequired, GameLaunchReceipt
 from yeyu_gamer_manager.services.queue_parking import parking_record
-
-
-@dataclass(frozen=True)
-class IsolatedNonWwPlan(AdapterExecutionPlan):
-    selected_operations: tuple[str, ...] = ()
-    observation_only_operations: tuple[str, ...] = ()
-
-    def __post_init__(self):
-        if self.selected_operations or self.game_id == "WW":
-            raise ValueError("baseline protocol prerequisite is missing; WW cannot be isolated")
 
 
 class QueueParkingPolicyTests(unittest.TestCase):
@@ -31,11 +19,6 @@ class QueueParkingPolicyTests(unittest.TestCase):
         self.manager = self.fixture.manager
         self.store = self.fixture.store
         self.store.update_config({"queue_timeout_budget": {"human_takeover_seconds": 0}})
-
-        for module in ("manager", "adapter_protocol"):
-            prerequisite = mock.patch(f"yeyu_gamer_manager.services.{module}.AdapterExecutionPlan", IsolatedNonWwPlan)
-            prerequisite.start()
-            self.addCleanup(prerequisite.stop)
 
     def runs(self):
         first = self.fixture._create_run([self.fixture._todo_id(fixtures.EXECUTE_ALPHA)])

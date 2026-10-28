@@ -9,7 +9,7 @@ import secrets
 import stat
 import threading
 from .snapshot_coalescer import SnapshotCoalescer
-from .queue_parking import attempt_parking_record, parking_record, park_human_gate, unresolved_parking_record
+from .queue_parking import attempt_parking_record, parking_record, park_human_gate, park_review_gate, review_gate_released, unresolved_parking_record
 from .queue_timeout_budget import load_queue_timeout_budget
 from .orphan_pending_execution import fail_resume_successor, recover_orphan_pending_executions, validate_resume_intent
 from .daily_queue_priority import order_daily_queue
@@ -9303,6 +9303,35 @@ class ManagerService:
                             f"{type(error).__name__}: {error}"
                         ),
                     )
+            if self.store.get_game_run(run_id)["state"] == EntityState.REVIEW_REQUIRED:
+                terminal_attempts = self.store.list_run_attempts(run_id=run_id, limit=1)
+                if terminal_attempts and self.store.get_controller_lease_for_attempt(terminal_attempts[0]["run_attempt_id"], active_only=True) is not None:
+                    try:
+                        review_parked = park_review_gate(self, batch_id, run_id, utc_now)
+                    except Exception as error:
+                        review_parked = False
+                        self.store.append_event("queue.parking.failed", "game-run", run_id,
+                                                {"batchId": batch_id, "errorClass": type(error).__name__})
+                    if review_parked:
+                        completed = [item for item in completed if item != run_id]
+                        if run_id not in failures:
+                            failures.append(run_id)
+                        continue
+                    if self.store.get_active_batch_cancel_request(batch_id) is not None:
+                        break
+                    if review_gate_released(self, batch_id, run_id, terminal_attempts[0]["run_attempt_id"], utc_now):
+                        membership = self.store.get_batch_run_membership(batch_id, run_id)
+                        if membership.get("terminal_outcome") == "completed":
+                            failures = [item for item in failures if item != run_id]
+                            if run_id not in completed:
+                                completed.append(run_id)
+                    else:
+                        self._fence_batch_for_reconciliation(batch_id=batch_id, affected_run_ids=[run_id],
+                            run_attempt_ids=[terminal_attempts[0]["run_attempt_id"]], requested_by="manager-review-lease-timeout",
+                            note="Terminal review could not prove an idle previous owner before handing off the queue.",
+                            requirements=["attempt_outcome_reconciliation", "fresh_observation"])
+                        self._complete_command(command_id, "failed", "Review lease remains owned; durable reconciliation is required.")
+                        return
             if self.store.get_game_run(run_id)["state"] == EntityState.HUMAN_REQUIRED:
                 try:
                     parked = park_human_gate(self, batch_id, run_id, utc_now)
