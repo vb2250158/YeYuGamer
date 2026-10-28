@@ -1,0 +1,29 @@
+--- a/backend/yeyu_gamer_manager/store/sqlite_store.py
++++ b/backend/yeyu_gamer_manager/store/sqlite_store.py
+@@ -7344,9 +7344,22 @@
+-    def serial_observation_execution_blockers(self, owned_run_id: str | None = None) -> dict[str, bool]:
+-        """Complete current ownership across cadences; only this child is exempt."""
++    def serial_observation_execution_blockers(self, owned_run_id: str | None = None,
++                                             *, owned_pgr_resume: dict[str, Any] | None = None) -> dict[str, bool]:
+         with self._lock:
++            exempt_intent_id = None
++            if owned_pgr_resume is not None and owned_run_id is not None:
++                intent_id = owned_pgr_resume.get('resume_intent_id')
++                try:
++                    current = self.get_resume_intent(intent_id)
++                except KeyError:
++                    current = None
++                if (current == owned_pgr_resume and current is not None
++                        and current['run_id'] == owned_run_id
++                        and current['decision'].get('kind') == 'pgr-daily-step'
++                        and current['state'] in {'successor_pending', 'successor_dispatched'}):
++                    exempt_intent_id = intent_id
+             row = self.connection.execute("""SELECT
+                 EXISTS(SELECT 1 FROM run_attempts WHERE state IN ('starting','running','cancelling')
+                     AND (? IS NULL OR run_id <> ?)) AS attempts,
+-                EXISTS(SELECT 1 FROM resume_intents WHERE state IN ('successor_pending','successor_dispatched')) AS resumes
+-                """, (owned_run_id, owned_run_id)).fetchone()
++                EXISTS(SELECT 1 FROM resume_intents WHERE state IN ('successor_pending','successor_dispatched')
++                    AND (? IS NULL OR resume_intent_id <> ?)) AS resumes
++                """, (owned_run_id, owned_run_id, exempt_intent_id, exempt_intent_id)).fetchone()
+         return {key: bool(row[key]) for key in ('attempts', 'resumes')}

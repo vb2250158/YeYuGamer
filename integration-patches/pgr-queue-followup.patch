@@ -1,0 +1,207 @@
+--- a/backend/yeyu_gamer_manager/services/serial_observation_recovery.py
++++ b/backend/yeyu_gamer_manager/services/serial_observation_recovery.py
+@@ -37,7 +37,7 @@
+         raise ManagerConflict('observation_chain_' + reason)
+ 
+ 
+-def _current_ownership(manager, *, child_run_id, allow_stopped):
++def _current_ownership(manager, *, child_run_id, allow_stopped, allow_queued_siblings=False):
+     from .zzz_launcher_observation import require_observation_idle
+     require_observation_idle(manager.store)
+     intent = manager.daily_execution.read()
+@@ -57,22 +57,33 @@
+     owners = manager.store.daily_stop_owned_run_ids()
+     require(not any(run_id != child_run_id for run_id in owners), 'execution_owned')
+     owned = manager._latest_batch_for_run(child_run_id) if child_run_id else None
+-    require(not any(manager.store.serial_observation_execution_blockers(child_run_id).values()), 'execution_owned')
+-    active = manager.store.active_execution_summary()
++    if allow_queued_siblings and child_run_id is not None:
++        from .pgr_daily_admission import owned_resume
++        with manager.store.atomic():
++            blockers = manager.store.serial_observation_execution_blockers(
++                child_run_id, owned_pgr_resume=owned_resume(manager, child_run_id))
++    else:
++        blockers = manager.store.serial_observation_execution_blockers(child_run_id)
++    require(not any(blockers.values()), 'execution_owned')
++    active = (manager.execution_occupancy(
++        owned_batch_id=(owned or {}).get('batch_id'), current_run_id=child_run_id)
++        if allow_queued_siblings else manager.store.active_execution_summary())
+     require(not any(row['runId'] != child_run_id for row in active['gameRuns'])
+             and not any(row['batchId'] != (owned or {}).get('batch_id') for row in active['batches']), 'execution_active')
+     return intent, batches, owned
+ 
+ 
+-def guard(manager, *, child_run_id=None, allow_stopped=False):
+-    intent, batches, owned = _current_ownership(manager, child_run_id=child_run_id, allow_stopped=allow_stopped)
++def guard(manager, *, child_run_id=None, allow_stopped=False, allow_queued_siblings=False):
++    intent, batches, owned = _current_ownership(manager, child_run_id=child_run_id,
++        allow_stopped=allow_stopped, allow_queued_siblings=allow_queued_siblings)
+     from .historical_execution_occupancy import blocking_batches
+     require(not blocking_batches(manager, batches, owned_batch_id=(owned or {}).get('batch_id')),
+             'other_batch_active')
+     # Historical proof can wait for the shared Store lock. It proves obsolete
+     # process occupancy, never that the earlier Stop/Host/lease view is current.
+     latest, latest_batches, latest_owned = _current_ownership(
+-        manager, child_run_id=child_run_id, allow_stopped=allow_stopped)
++        manager, child_run_id=child_run_id, allow_stopped=allow_stopped,
++        allow_queued_siblings=allow_queued_siblings)
+     require(latest['generation'] == intent['generation'], 'generation_changed')
+     require((latest_owned or {}).get('batch_id') == (owned or {}).get('batch_id'), 'batch_ownership_changed')
+     def peers(rows, owner):
+--- a/backend/yeyu_gamer_manager/services/pgr_daily_admission.py
++++ b/backend/yeyu_gamer_manager/services/pgr_daily_admission.py
+@@ -10,6 +10,7 @@
+ from . import serial_observation_recovery as chain
+ from .pgr_daily_selection import KIND, TYPE, require
+ from .pgr_daily_step_contract import native_seconds
++from .ww_reward_observation import reward_observation_cleanup_confirmed
+ 
+ 
+ def proof_for(manager,run):
+@@ -31,6 +32,89 @@
+ def expected_environment(proof,current):
+     return {**proof['environment'],'capabilityRef':'pgr.daily.'+current['operation']+'.'+current['phase']+'@1.0',
+             'timeoutSeconds':native_seconds(current['operation'],current['phase'])}
++
++
++def owned_resume(manager, run_id):
++    store=manager.store;run=store.get_game_run(run_id)
++    batch,proof=proof_for(manager,run)
++    if proof is None:return None
++    history=store.list_resume_intents(run_id=run_id,limit=ledger.MAX_STEPS+1)
++    require(len(history)<=ledger.MAX_STEPS,'resume_history_incomplete')
++    active=[item for item in history if item['state'] in {'successor_pending','successor_dispatched'}]
++    if not active:
++        value=store.get_resource(TYPE,proof['admissionId'])['document']['dailyLedger']
++        if history:
++            latest=max(history,key=lambda item:(item['created_at'],item['resume_intent_id']))
++            require(latest['state'] in {'terminal','successor_terminal'},'resume_missing_active_intent')
++        if value['state'] in {'ready','preparing'} and any(item.get('permitIssued') is True for item in value['steps']):
++            require(False,'resume_missing_active_intent')
++        return None
++    require(len(active)==1 and active[0]==max(history,key=lambda item:(item['created_at'],item['resume_intent_id'])),
++            'resume_not_unique_latest')
++    intent=active[0];member=store.get_batch_run_membership(batch['batch_id'],run_id)
++    row=store.get_resource(TYPE,proof['admissionId']);doc=row['document'];value=doc['dailyLedger']
++    require(run['game_id']=='PGR' and run['account_id']=='default' and run['cadence']=='daily'
++        and run['mode']=='execute' and run['todo_instance_ids']==run['completion_todo_instance_ids']==proof['completionTodoInstanceIds']
++        and doc['proof']==proof and doc['runId']==run_id and doc['batchId']==batch['batch_id']
++        and member['resume_intent_id']==intent['resume_intent_id'] and not batch['result'].get('sealVersion')
++        and batch['state']=='running' and not store.get_active_batch_cancel_request(batch['batch_id']), 'resume_owner_changed')
++    ledger.guard(value,[store.get_todo_instance(item) for item in proof['completionTodoInstanceIds']],
++        run_id=run_id,generation=manager.daily_execution.read()['generation'],account_digest=chain.digest(run['account_snapshot']))
++    ready=value['state']=='ready' and value['active'] is None
++    if ready:
++        require(row['state']=='reserved' and bool(value['pending']) and intent['state']=='successor_pending'
++            and intent['successor_run_attempt_id'] is None and member['state']=='resume_pending', 'resume_not_pristine_pending')
++        index=len(value['steps']);current=value['pending'][0]
++    else:
++        require(row['state']=='dispatched' and value['state'] in {'preparing','dispatched'}
++            and type(value['active']) is int and value['active']==len(value['steps'])-1, 'resume_step_not_current')
++        index=value['active'];current=value['steps'][index]
++        require(member['state'] in {'active','terminal'} and member['latest_run_attempt_id']==current['runAttemptId'],
++            'resume_successor_changed')
++        successor=store.get_run_attempt(current['runAttemptId'])
++        leases=store.list_controller_leases(run_id=run_id,active_only=True,limit=2)
++        require(successor['run_id']==run_id and successor['state'] in {'starting','running','completed'}
++            and len(leases)<=1 and all(item['runAttemptId']==current['runAttemptId'] for item in leases),
++            'resume_successor_effect_changed')
++        if intent['state']=='successor_pending':
++            require(value['state']=='preparing' and current['state']=='preparing' and current['permitIssued'] is False
++                and intent['successor_run_attempt_id'] is None and member['state']=='active', 'resume_pending_effect_unknown')
++        else:
++            require(intent['successor_run_attempt_id']==current['runAttemptId'],'resume_successor_changed')
++        if value['state']=='preparing':
++            preparation=successor['plan'].get('pgrPreparation',{})
++            require(preparation.get('nativeKind')=='daily' and preparation.get('runId')==run_id
++                and preparation.get('runAttemptId')==current['runAttemptId']
++                and preparation.get('operation')==current['operation'] and preparation.get('mode')==current['phase']
++                and preparation.get('todoInstanceId')==value['scope']['obligations'][current['operation']]
++                and preparation.get('nativePermitIssued') is False and preparation.get('resourceActionsAllowed') is False
++                and not successor['plan'].get('pgrDailyStep'),'resume_preparation_unproven')
++        else:
++            permit=successor['plan'].get('pgrDailyStep',{})
++            require(current['permitIssued'] is True and permit.get('runId')==run_id
++                and permit.get('runAttemptId')==current['runAttemptId'] and permit.get('reservationId')==proof['admissionId']
++                and permit.get('stepIndex')==index and permit.get('operation')==current['operation']
++                and permit.get('phase')==current['phase'],'resume_permit_changed')
++    require(0<index<ledger.MAX_STEPS,'resume_index_invalid')
++    previous=value['steps'][index-1];predecessor=store.get_run_attempt(previous['runAttemptId'])
++    require(previous['state']=='terminal' and previous['permitIssued'] is True
++        and doc.get('lastClosedRunAttemptId')==previous['runAttemptId']==intent['predecessor_run_attempt_id']
++        and predecessor['run_id']==run_id and predecessor['state']=='completed' and predecessor['completed_at']
++        and predecessor['exit_code']==0 and predecessor['result'].get('protocolValid') is True
++        and predecessor['result'].get('transportOutcome')=='clean','resume_predecessor_changed')
++    require(reward_observation_cleanup_confirmed('PGR',predecessor['result']),'resume_predecessor_cleanup_unproven')
++    require(intent['decision']=={'kind':'pgr-daily-step','batchId':batch['batch_id'],'reservationId':proof['admissionId'],
++        'nextStepIndex':index,'operation':current['operation'],'phase':current['phase'],
++        'eligibleTodoInstanceIds':[value['scope']['obligations'][current['operation']]],'observationOnlyOperations':[],
++        'sourceRunAttemptId':previous['runAttemptId']},'resume_decision_changed')
++    attempts=store.list_run_attempts(run_id=run_id,limit=ledger.MAX_STEPS+1)
++    require(len(attempts)==len(value['steps']) and len(attempts)<=ledger.MAX_STEPS
++        and {item['run_attempt_id'] for item in attempts}=={item['runAttemptId'] for item in value['steps']}, 'resume_attempt_changed')
++    if ready:
++        require(member['latest_run_attempt_id']==previous['runAttemptId']
++            and all(item['completed_at'] and item['state']=='completed' for item in attempts)
++            and not store.list_controller_leases(run_id=run_id,active_only=True,limit=1),'resume_effect_owned')
++    return intent
+ 
+ 
+ def guard_dispatch(manager,run,*,todo_ids=None,reserve_attempt_id=None,dispatch_attempt_id=None,
+@@ -46,7 +130,7 @@
+     require(run['game_id']=='PGR' and run['account_id']=='default' and run['cadence']=='daily'
+         and run['todo_instance_ids']==ids and run['completion_todo_instance_ids']==ids,'frozen_scope_changed')
+     rows=[manager.store.get_todo_instance(i) for i in ids]
+-    generation=chain.guard(manager,child_run_id=run['run_id'])
++    generation=chain.guard(manager,child_run_id=run['run_id'],allow_queued_siblings=True)
+     ledger.guard(value,rows,run_id=run['run_id'],generation=generation,
+                  account_digest=chain.digest(run['account_snapshot']))
+     require(not batch['result'].get('sealVersion') and not manager.store.get_active_batch_cancel_request(batch['batch_id']),
+--- a/backend/yeyu_gamer_manager/services/pgr_unused_reservation.py
++++ b/backend/yeyu_gamer_manager/services/pgr_unused_reservation.py
+@@ -36,18 +36,31 @@
+         and cancel.get('requestedBy') == 'manager'
+         and isinstance(result.get('cancelRequestId'), str) and bool(result['cancelRequestId'])
+         and cancel.get('cancelRequestId') == result['cancelRequestId'])
+-    require((batch['state'] == 'blocked' or resource_cancelled)
++    operator_cancelled = False
++    if (batch['state'] == 'cancelled' and result.get('cancelRequestedBy') in {'webgui', 'operator'}
++            and isinstance(result.get('cancelRequestId'), str) and result['cancelRequestId']):
++        try:
++            request = store.get_batch_cancel_request(result['cancelRequestId'])
++        except KeyError:
++            request = {}
++        operator_cancelled = (request.get('batch_id') == batch['batch_id']
++            and request.get('state') == 'sealed' and request.get('active_run_attempt_ids') == []
++            and request.get('requested_by') == result['cancelRequestedBy']
++            and bool(request.get('reason')) and request['reason'] == result.get('cancelReason'))
++    require((batch['state'] == 'blocked' or resource_cancelled or operator_cancelled)
+             and batch['mode'] == 'execute' and batch['cadence'] == 'daily'
+             and type(batch['result'].get('sealVersion')) is int and batch['result']['sealVersion'] > 0,
+             'batch_not_sealed_blocked')
+     ids = [row['todo_instance_id'] for row in rows]
+     require(run['run_id'] == doc['runId'] and run['game_id'] == 'PGR' and run['account_id'] == 'default'
+-            and run['mode'] == 'execute' and run['cadence'] == 'daily' and run['state'] == 'failed'
++            and run['mode'] == 'execute' and run['cadence'] == 'daily'
++            and (run['state'] == 'failed' or operator_cancelled and run['state'] == 'cancelled')
+             and run['todo_instance_ids'] == ids and run['completion_todo_instance_ids'] == ids,
+             'run_scope_changed')
+     members = store.list_batch_run_memberships(batch_id=batch['batch_id'], limit=1000)
+     owners = [m for m in members if m['run_id'] == run['run_id']]
+-    require(0 < len(members) < 1000 and len(owners) == 1 and owners[0]['state'] == 'terminal'
++    require(0 < len(members) < 1000 and len(owners) == 1
++            and (owners[0]['state'] == 'terminal' or operator_cancelled and owners[0]['state'] == 'cancelled')
+             and owners[0]['latest_run_attempt_id'] is None, 'membership_unknown')
+     require(not store.list_run_attempts(run_id=run['run_id'], limit=1), 'attempt_exists')
+     history = store.list_game_runs(limit=5000)
+--- a/backend/yeyu_gamer_manager/services/pgr_daily_successor.py
++++ b/backend/yeyu_gamer_manager/services/pgr_daily_successor.py
+@@ -42,7 +42,7 @@
+         try:
+             require(native_source.marker(manager,current['operation'],current['phase'])==
+                     native_source.marker_facts(expected_environment(proof,current)), 'profile_or_source_not_restored')
+-            generation=chain.guard(manager,child_run_id=plan.run_id)
++            generation=chain.guard(manager,child_run_id=plan.run_id,allow_queued_siblings=True)
+             rows=[store.get_todo_instance(i) for i in run['completion_todo_instance_ids']]
+             ledger.guard(value,rows,run_id=plan.run_id,generation=generation,
+                          account_digest=chain.digest(run['account_snapshot']))
