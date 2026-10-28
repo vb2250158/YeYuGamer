@@ -168,6 +168,7 @@ from .capability_catalog import build_capability_registry
 from .manager_errors import ExecutionUnavailable, ManagerConflict, ManagerValidation
 from .manager_todos import ManagerTodosService
 from .adapter_protocol import (
+    RUN_TERMINAL_STATUSES,
     AdapterEvent,
     AdapterExecutionPlan,
     AdapterRunResult,
@@ -293,6 +294,7 @@ class ManagerService:
         self.adapter_host = ManagerAdapterHost(
             adapter,
             promotion_receipt_resolver=self._resolve_adapter_promotion_receipt,
+            queue_timeout_budget_resolver=lambda: load_queue_timeout_budget(self.store.get_config()["values"]),
         )
         self.manager_todos = ManagerTodosService(
             store=store,
@@ -8143,12 +8145,35 @@ class ManagerService:
                 _log.warning("attempt.cleanup.failed error=%s: %s", type(error).__name__, error)
                 return GameCloseReceipt("close-failed", (), ()), None
 
-        def finished(result: AdapterRunResult) -> None:
+        completion_result: AdapterRunResult | None = None
+        completion_ack_blocked = False
+
+        def finished(result: AdapterRunResult, *, handoff: Callable[[], bool] | None = None) -> None:
+            nonlocal completion_result, completion_ack_blocked
+            completion_result = None
+            completion_ack_blocked = False
             with bind_log_context(**log_fields, phase="finish"):
                 _finished(result)
             self._close_attempt_log(plan.run_attempt_id)
+            if completion_ack_blocked:
+                _log.error("attempt.handoff.unconfirmed reason=persistence_recovery_incomplete")
+                return
+            if handoff is not None:
+                persisted = self.store.get_run_attempt(plan.run_attempt_id)
+                if (persisted["run_id"] != plan.run_id or persisted["game_id"] != plan.game_id
+                        or persisted["state"] not in RUN_TERMINAL_STATUSES or not persisted["completed_at"]):
+                    _log.error("attempt.handoff.unconfirmed reason=terminal_not_committed")
+                    return
+                if handoff() is not True:
+                    return
+            elif self.adapter_host.active_execution() is not None:
+                _log.error("attempt.handoff.unconfirmed reason=missing_host_handoff")
+                return
+            if completed_callback is not None and completion_result is not None:
+                completed_callback(completion_result)
 
         def _finished(result: AdapterRunResult) -> None:
+            nonlocal completion_result, completion_ack_blocked
             if attempt_parking_record(self, plan.run_attempt_id) is not None:
                 self.store.append_event("queue.parking.late-result", "run-attempt", plan.run_attempt_id,
                                         {"status": result.status, "code": result.code, "businessCompleted": False})
@@ -8211,47 +8236,53 @@ class ManagerService:
                     manager_control_outcome=manager_control_outcome,
                 )
             except Exception as error:  # defensive persistence boundary
+                completion_ack_blocked = True
                 failure = f"Adapter result persistence failed: {type(error).__name__}"
                 _log.exception("attempt.persistence_failed %s", failure)
                 try:
-                    attempt = self.store.get_run_attempt(plan.run_attempt_id)
-                    latest = self.store.list_run_attempts(run_id=plan.run_id, limit=1)
-                    if (attempt_parking_record(self, plan.run_attempt_id) is not None
-                            or not latest or latest[0]["run_attempt_id"] != plan.run_attempt_id):
-                        effective_result = None
-                        self.store.append_event("queue.parking.late-callback-failure", "run-attempt", plan.run_attempt_id,
-                                                {"errorClass": type(error).__name__, "businessCompleted": False})
-                        return
-                    if attempt["state"] in {"starting", "running", "cancelling"}:
-                        self.store.update_run_attempt(
-                            plan.run_attempt_id,
-                            state="failed",
+                    with self.store.atomic():
+                        attempt = self.store.get_run_attempt(plan.run_attempt_id)
+                        latest = self.store.list_run_attempts(run_id=plan.run_id, limit=1)
+                        if (attempt_parking_record(self, plan.run_attempt_id) is not None
+                                or not latest or latest[0]["run_attempt_id"] != plan.run_attempt_id):
+                            effective_result = None
+                            self.store.append_event("queue.parking.late-callback-failure", "run-attempt", plan.run_attempt_id,
+                                                    {"errorClass": type(error).__name__, "businessCompleted": False})
+                            return
+                        if attempt["state"] in {"starting", "running", "cancelling"}:
+                            self.store.update_run_attempt(
+                                plan.run_attempt_id,
+                                state="failed",
+                                exit_code=effective_result.exit_code,
+                                result={"code": "manager_persistence_failed", "message": failure},
+                                completed=True,
+                            )
+                        self.store.update_game_run(
+                            plan.run_id,
+                            state=EntityState.FAILED,
                             exit_code=effective_result.exit_code,
-                            result={"code": "manager_persistence_failed", "message": failure},
-                            completed=True,
+                            message=failure,
                         )
-                    self.store.update_game_run(
-                        plan.run_id,
-                        state=EntityState.FAILED,
-                        exit_code=effective_result.exit_code,
-                        message=failure,
+                        self._end_controller_lease(
+                            plan.run_attempt_id,
+                            state=LeaseState.REVOKED,
+                            reason_code="manager_persistence_failed",
+                            reason=failure,
+                        )
+                        self._terminalize_unsealed_batch_memberships(
+                            run_id=plan.run_id,
+                            run_attempt_id=plan.run_attempt_id,
+                            outcome="failed",
+                        )
+                    effective_result = replace(
+                        result, status="failed", transport_outcome="failed", protocol_valid=False,
+                        completed_todo_instance_ids=(), code="manager_persistence_failed", message=failure,
                     )
-                    self._end_controller_lease(
-                        plan.run_attempt_id,
-                        state=LeaseState.REVOKED,
-                        reason_code="manager_persistence_failed",
-                        reason=failure,
-                    )
-                    self._terminalize_unsealed_batch_memberships(
-                        run_id=plan.run_id,
-                        run_attempt_id=plan.run_attempt_id,
-                        outcome="failed",
-                    )
+                    completion_ack_blocked = False
                 except Exception:
                     pass
             finally:
-                if completed_callback is not None and effective_result is not None:
-                    completed_callback(effective_result)
+                completion_result = effective_result
 
         observation_path, observation_mode = self._ww_official_multi_observation(
             run, owning_batch

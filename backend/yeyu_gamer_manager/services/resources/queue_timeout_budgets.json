@@ -4,5 +4,6 @@
   "callback_overhead_seconds": 40,
   "callback_cancel_grace_seconds": 15,
   "poll_seconds": 1,
-  "orphan_pending_seconds": 120
+  "orphan_pending_seconds": 120,
+  "host_stop_grace_seconds": 5
 }

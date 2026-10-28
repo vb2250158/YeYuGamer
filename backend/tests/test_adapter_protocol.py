@@ -34,6 +34,7 @@ from yeyu_gamer_manager.services.adapter_protocol import (
     verify_execution_package,
 )
 from yeyu_gamer_manager.services.legacy_adapter import LegacyAdapter
+from yeyu_gamer_manager.services.queue_timeout_budget import load_queue_timeout_budget
 
 
 RUN_ID = "11111111-1111-4111-8111-111111111111"
@@ -1228,8 +1229,9 @@ class AdapterHostSupervisorTests(unittest.TestCase):
         completed: list[object] = []
         signalled = threading.Event()
 
-        def complete(result: object) -> None:
+        def complete(result: object, *, handoff) -> None:
             completed.append(result)
+            self.assertIs(handoff(), True)
             signalled.set()
 
         with mock.patch.dict(
@@ -1295,8 +1297,9 @@ class AdapterHostSupervisorTests(unittest.TestCase):
         events = []
         signalled = threading.Event()
 
-        def complete(result):
+        def complete(result, *, handoff):
             completed.append(result)
+            self.assertIs(handoff(), True)
             signalled.set()
 
         with self._patched_popen(script):
@@ -1363,7 +1366,7 @@ class AdapterHostSupervisorTests(unittest.TestCase):
         )
         callback_entered = threading.Event()
 
-        def fail_completion(_result: object) -> None:
+        def fail_completion(_result: object, *, handoff) -> None:
             callback_entered.set()
             raise RuntimeError("fixture terminal persistence failure")
 
@@ -1416,8 +1419,9 @@ class AdapterHostSupervisorTests(unittest.TestCase):
         seen_event_types: list[str] = []
         signalled = threading.Event()
 
-        def complete(result: object) -> None:
+        def complete(result: object, *, handoff) -> None:
             completed.append(result)
+            self.assertIs(handoff(), True)
             signalled.set()
 
         with self._patched_popen(script):
@@ -1465,8 +1469,9 @@ class AdapterHostSupervisorTests(unittest.TestCase):
         completed: list[object] = []
         signalled = threading.Event()
 
-        def complete(result: object) -> None:
+        def complete(result: object, *, handoff) -> None:
             completed.append(result)
+            self.assertIs(handoff(), True)
             signalled.set()
 
         with self._patched_popen(script):
@@ -1497,12 +1502,14 @@ class AdapterHostSupervisorTests(unittest.TestCase):
         document = plan_document(timeoutSeconds=1)
         plan = AdapterExecutionPlan.from_document(document)
         script = self._fake_host_script("time.sleep(10)\n")
-        self.host_service.CANCEL_GRACE_SECONDS = 0.1
+        self.host_service._queue_timeout_budget_resolver = lambda: load_queue_timeout_budget(
+            {"queue_timeout_budget": {"host_stop_grace_seconds": 0.1}})
         completed: list[object] = []
         signalled = threading.Event()
 
-        def complete(result: object) -> None:
+        def complete(result: object, *, handoff) -> None:
             completed.append(result)
+            self.assertIs(handoff(), True)
             signalled.set()
 
         started = time.monotonic()
@@ -1524,12 +1531,14 @@ class AdapterHostSupervisorTests(unittest.TestCase):
             "json.loads(sys.stdin.readline())\n"
             "time.sleep(10)\n"
         )
-        self.host_service.CANCEL_GRACE_SECONDS = 0.1
+        self.host_service._queue_timeout_budget_resolver = lambda: load_queue_timeout_budget(
+            {"queue_timeout_budget": {"host_stop_grace_seconds": 0.1}})
         completed: list[object] = []
         signalled = threading.Event()
 
-        def complete(result: object) -> None:
+        def complete(result: object, *, handoff) -> None:
             completed.append(result)
+            self.assertIs(handoff(), True)
             signalled.set()
 
         started = time.monotonic()

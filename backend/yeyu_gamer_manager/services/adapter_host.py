@@ -37,6 +37,7 @@ from .adapter_protocol import (
     verify_execution_package,
 )
 from .legacy_adapter import LegacyAdapter
+from .queue_timeout_budget import QueueTimeoutBudget, load_queue_timeout_budget
 from .private_runtime_acl import (
     PrivateRuntimeAclError,
     assert_private_runtime_acl,
@@ -98,7 +99,6 @@ class ManagerAdapterHost:
     MAX_STDOUT_BYTES = 64 * 1024
     MAX_STDERR_BYTES = 8 * 1024
     CANARY_TIMEOUT_SECONDS = 10
-    CANCEL_GRACE_SECONDS = 5
     CONTROL_AUTHORITY_DIRECTORY = "adapter-control-authorities"
     DURABLE_CONTROL_DIRECTORY = "adapter-controls"
     MAX_CONTROL_FILE_BYTES = MAX_EVENT_BYTES
@@ -126,6 +126,7 @@ class ManagerAdapterHost:
         promotion_receipt_resolver: (
             Callable[[str], Mapping[str, Any]] | None
         ) = None,
+        queue_timeout_budget_resolver: Callable[[], QueueTimeoutBudget] | None = None,
     ) -> None:
         self.compatibility_adapter = compatibility_adapter
         self.runtime_dir = compatibility_adapter.runtime_dir
@@ -135,6 +136,7 @@ class ManagerAdapterHost:
         self._active_plan: AdapterExecutionPlan | None = None
         self._cancel_sent = False
         self._promotion_receipt_resolver = promotion_receipt_resolver
+        self._queue_timeout_budget_resolver = queue_timeout_budget_resolver or (lambda: load_queue_timeout_budget({}))
 
     @staticmethod
     def adapter_id(game_id: str) -> str:
@@ -1751,8 +1753,8 @@ class ManagerAdapterHost:
                 ):
                     continue
                 path.unlink(missing_ok=True)
-            except (OSError, RuntimeError):
-                pass
+            except (OSError, RuntimeError) as error:
+                _log.warning("adapter.controls.cleanup_pending directory=%s errorClass=%s", directory, type(error).__name__)
 
     def _watch_execution(
         self,
@@ -1762,9 +1764,10 @@ class ManagerAdapterHost:
         manifest: ExecutionPackageManifest,
         host_probe: dict[str, Any],
         on_event: Callable[[AdapterEvent, ExecutionPackageManifest], None] | None,
-        on_complete: Callable[[AdapterRunResult], None],
+        on_complete: Callable[..., None],
         installation_binding_path: Path | None = None,
         transcript: AttemptLogSession | None = None,
+        timeout_budget: QueueTimeoutBudget | None = None,
     ) -> None:
         with bind_log_context(
             run=plan.run_id, attempt=plan.run_attempt_id, game=plan.game_id, phase="tool-run"
@@ -1778,6 +1781,7 @@ class ManagerAdapterHost:
                 on_complete=on_complete,
                 installation_binding_path=installation_binding_path,
                 transcript=transcript,
+                timeout_budget=timeout_budget,
             )
 
     def _watch_execution_bound(
@@ -1788,17 +1792,21 @@ class ManagerAdapterHost:
         manifest: ExecutionPackageManifest,
         host_probe: dict[str, Any],
         on_event: Callable[[AdapterEvent, ExecutionPackageManifest], None] | None,
-        on_complete: Callable[[AdapterRunResult], None],
+        on_complete: Callable[..., None],
         installation_binding_path: Path | None = None,
         transcript: AttemptLogSession | None = None,
+        timeout_budget: QueueTimeoutBudget | None = None,
     ) -> None:
+        budget = timeout_budget if timeout_budget is not None else self._queue_timeout_budget_resolver()
+        stop_grace_seconds = budget.host_stop_grace_seconds
         _log.info(
-            "adapter.watch.begin pid=%s timeoutSeconds=%s package=%s@%s digest=%s",
+            "adapter.watch.begin pid=%s timeoutSeconds=%s package=%s@%s digest=%s hostStopGraceSeconds=%s",
             process.pid,
             plan.timeout_seconds,
             manifest.package_root.name,
             manifest.package_version,
             manifest.package_digest[:16],
+            stop_grace_seconds,
         )
         stream = AdapterEventStream(
             plan,
@@ -1946,25 +1954,23 @@ class ManagerAdapterHost:
                         ),
                     )
                 try:
-                    exit_code = process.wait(timeout=self.CANCEL_GRACE_SECONDS)
+                    exit_code = process.wait(timeout=stop_grace_seconds)
                 except subprocess.TimeoutExpired:
                     # Only the fixed Host process is terminated. The game client
                     # and an arbitrary descendant tree are deliberately preserved.
                     process.terminate()
                     try:
-                        exit_code = process.wait(timeout=self.CANCEL_GRACE_SECONDS)
+                        exit_code = process.wait(timeout=stop_grace_seconds)
                     except subprocess.TimeoutExpired:
                         process.kill()
-                        exit_code = process.wait()
+                        exit_code = process.wait(timeout=stop_grace_seconds)
             else:
-                exit_code = process.wait()
-            if process.stdin is not None:
-                try:
-                    process.stdin.close()
-                except OSError:
-                    pass
-            stdout_thread.join(timeout=self.CANCEL_GRACE_SECONDS)
-            stderr_thread.join(timeout=self.CANCEL_GRACE_SECONDS)
+                exit_code = process.wait(timeout=stop_grace_seconds)
+            stdout_thread.join(timeout=stop_grace_seconds)
+            stderr_thread.join(timeout=stop_grace_seconds)
+            if stdout_thread.is_alive() or stderr_thread.is_alive():
+                _log.error("adapter.watch.handoff_retained reason=reader_drain_timeout graceSeconds=%s", stop_grace_seconds)
+                return
 
             with failure_lock:
                 protocol_failure = failures[0] if failures else None
@@ -2021,44 +2027,54 @@ class ManagerAdapterHost:
                 message=f"Adapter watcher failed: {type(error).__name__}",
                 process_exit_code=process.poll() if process.poll() is not None else -1,
             )
-        for pipe in (process.stdout, process.stderr):
+        if process.poll() is None or stdout_thread.is_alive() or stderr_thread.is_alive():
+            _log.error("adapter.watch.handoff_retained reason=host_exit_or_reader_drain_unconfirmed")
+            return
+        for pipe in (process.stdin, process.stdout, process.stderr):
             if pipe is not None:
                 try:
                     pipe.close()
                 except OSError:
                     pass
-        if installation_binding_path is not None:
-            try:
-                installation_binding_path.unlink(missing_ok=True)
-            except OSError:
-                # The binding is confined to this run's staging directory;
-                # an eventual staging cleanup can safely remove a stale file.
-                pass
+        handed_off = False
+        handoff_open = True
+
+        def handoff() -> bool:
+            nonlocal handed_off
+            with self._execution_lock:
+                if not handoff_open or handed_off or self._active_process is not process or self._active_plan is not plan:
+                    return False
+                self._active_process = None
+                self._active_plan = None
+                self._cancel_sent = False
+                handed_off = True
+                return True
+
         try:
-            on_complete(result)
+            on_complete(result, handoff=handoff)
         except Exception:
             # Manager owns callback persistence and recovery. Never invoke a
             # completion callback twice after an exception.
             _log.exception("adapter.on_complete.failed")
-        else:
-            # The authority and durable cancel file are recovery material until
-            # Manager has committed the terminal attempt.  A callback failure
-            # must leave them available for restart reconciliation.
-            self._cleanup_attempt_controls(plan)
         finally:
             with self._execution_lock:
-                if self._active_process is process:
-                    # Keep ownership until the completion callback returned so a
-                    # second execution cannot overlap Manager persistence.
-                    self._active_process = None
-                    self._active_plan = None
-                    self._cancel_sent = False
+                handoff_open = False
+                collect_controls = handed_off
+            if collect_controls:
+                self._cleanup_attempt_controls(plan)
+                if installation_binding_path is not None:
+                    try:
+                        installation_binding_path.unlink(missing_ok=True)
+                    except OSError:
+                        _log.warning("adapter.watch.binding_cleanup_pending")
+            else:
+                _log.error("adapter.watch.handoff_retained reason=completion_not_acknowledged")
 
     def execute(
         self,
         run_id: str,
         game_id: str,
-        on_complete: Callable[[AdapterRunResult], None],
+        on_complete: Callable[..., None],
         *,
         plan: AdapterExecutionPlan | dict[str, Any] | None = None,
         on_event: Callable[[AdapterEvent, ExecutionPackageManifest], None] | None = None,
@@ -2072,12 +2088,18 @@ class ManagerAdapterHost:
         deferred, blocked, review-required, or already completed Todos is sealed
         before any Host process starts.  ``transcript`` receives the raw Host
         stdout/stderr for post-mortem diagnostics.
+
+        The completion consumer receives a one-use ``handoff`` callback. It
+        must confirm its durable terminal Attempt before invoking that callback,
+        and notify the queue only after the callback returns True. No ACK retains
+        Host ownership and recovery material. This is not a Job quiescence proof.
         """
         self.validate_game_id(game_id)
         if plan is None:
             error = NoExecutableTodos()
             raise AdapterExecutionRejected(error.code, str(error)) from error
         execution_plan = self.validate_execution_request(plan)
+        timeout_budget = self._queue_timeout_budget_resolver()
         request_payload = serialize_execute_request(execution_plan)
         if execution_plan.run_id != run_id or execution_plan.game_id != game_id:
             raise AdapterExecutionRejected(
@@ -2113,7 +2135,7 @@ class ManagerAdapterHost:
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         with self._execution_lock:
             active = self._active_process
-            if active is not None and active.poll() is None:
+            if active is not None:
                 raise AdapterExecutionRejected(
                     "adapter_busy", "Another Adapter execution is already active"
                 )
@@ -2160,7 +2182,7 @@ class ManagerAdapterHost:
                 process.stdin.flush()
             except (BrokenPipeError, OSError, ValueError) as error:
                 process.terminate()
-                process.wait(timeout=self.CANCEL_GRACE_SECONDS)
+                process.wait(timeout=timeout_budget.host_stop_grace_seconds)
                 self._active_process = None
                 self._active_plan = None
                 binding_path.unlink(missing_ok=True)
@@ -2180,6 +2202,7 @@ class ManagerAdapterHost:
                 "on_complete": on_complete,
                 "installation_binding_path": binding_path,
                 "transcript": transcript,
+                "timeout_budget": timeout_budget,
             },
             name=f"yeyu-adapter-watch-{execution_plan.run_attempt_id[:8]}",
             daemon=True,

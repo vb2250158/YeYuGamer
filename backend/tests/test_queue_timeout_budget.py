@@ -26,6 +26,7 @@ class QueueTimeoutBudgetTests(unittest.TestCase):
             "callback_cancel_grace_seconds": 15,
             "poll_seconds": 1,
             "orphan_pending_seconds": 120,
+            "host_stop_grace_seconds": 5,
         }
         self.assertEqual(json.loads(resource_path.read_text(encoding="utf-8")), expected)
         self.assertEqual(asdict(load_queue_timeout_budget({})), expected)
@@ -48,7 +49,7 @@ class QueueTimeoutBudgetTests(unittest.TestCase):
         }})
         self.assertEqual(budget.human_takeover_seconds, 0)
         self.assertEqual(budget.completion_review_seconds, 0)
-        for name in ("callback_overhead_seconds", "callback_cancel_grace_seconds", "poll_seconds"):
+        for name in set(asdict(load_queue_timeout_budget({}))) - {"human_takeover_seconds", "completion_review_seconds"}:
             with self.subTest(name=name), self.assertRaises(ValueError):
                 load_queue_timeout_budget({"queue_timeout_budget": {name: 0}})
 

@@ -18,6 +18,7 @@ class QueueTimeoutBudget:
     callback_cancel_grace_seconds: float
     poll_seconds: float
     orphan_pending_seconds: float
+    host_stop_grace_seconds: float
 
 
 @lru_cache(maxsize=1)
