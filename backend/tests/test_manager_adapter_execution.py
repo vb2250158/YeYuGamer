@@ -2942,12 +2942,13 @@ class ManagerAdapterExecutionTests(unittest.TestCase):
             [run["run_id"]],
         )
 
-    def test_stop_strategy_freezes_unstarted_members_outside_completion_review(
+    def test_legacy_stop_strategy_does_not_truncate_later_members(
         self,
     ) -> None:
         beta = self._todo_id(EXECUTE_BETA)
         first = self._create_run([beta])
-        second = self._create_run([beta])
+        alpha = self._todo_id(EXECUTE_ALPHA)
+        second = self._create_run([alpha])
         batch = self._create_batch_with_runs([first, second])
         self.store.update_config({"execution_strategy": "stop"})
 
@@ -2966,15 +2967,15 @@ class ManagerAdapterExecutionTests(unittest.TestCase):
                     run_id=run_id,
                     run_attempt_id=plan.run_attempt_id,
                     game_id=game_id,
-                    status="blocked",
+                    status="blocked" if run_id == first["run_id"] else "completed",
                     transport_outcome="clean",
-                    attempted_todo_instance_ids=(beta,),
-                    completed_todo_instance_ids=(),
-                    unresolved_todo_instance_ids=(beta,),
-                    exit_code=20,
+                    attempted_todo_instance_ids=(beta,) if run_id == first["run_id"] else (alpha,),
+                    completed_todo_instance_ids=() if run_id == first["run_id"] else (alpha,),
+                    unresolved_todo_instance_ids=(beta,) if run_id == first["run_id"] else (),
+                    exit_code=20 if run_id == first["run_id"] else 0,
                     protocol_valid=True,
                     code="fixture_blocked",
-                    message="stop after first member",
+                    message="isolated member result",
                 )
             )
             return 43210
@@ -2995,20 +2996,20 @@ class ManagerAdapterExecutionTests(unittest.TestCase):
         memberships = {
             item["run_id"]: item for item in current["run_memberships"]
         }
-        self.assertEqual(execute.call_count, 1)
+        self.assertEqual(execute.call_count, 2)
         self.assertEqual(
             memberships[second["run_id"]]["terminal_outcome"],
-            "not_started_stop_strategy",
+            "completed",
         )
         self.assertEqual(
-            current["result"]["finalGameRunIds"], [first["run_id"]]
+            current["result"]["finalGameRunIds"], [first["run_id"], second["run_id"]]
         )
         self.assertEqual(
             current["result"]["allCandidateRunIds"],
             [first["run_id"], second["run_id"]],
         )
         self.assertEqual(
-            current["result"]["notStartedRunIds"], [second["run_id"]]
+            current["result"]["notStartedRunIds"], []
         )
 
     def test_default_daily_strategy_continues_after_a_failed_game(self) -> None:

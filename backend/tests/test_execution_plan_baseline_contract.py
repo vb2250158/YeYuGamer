@@ -7,6 +7,7 @@ import test_manager_adapter_execution as fixtures
 from yeyu_gamer_manager.services.adapter_protocol import (
     AdapterExecutionPlan, AdapterProtocolError, parse_execute_request, serialize_execute_request,
 )
+from yeyu_gamer_manager.services.adapter_host import ExecutionPackageUnavailable
 
 
 class ExecutionPlanBaselineContractTests(unittest.TestCase):
@@ -41,6 +42,24 @@ class ExecutionPlanBaselineContractTests(unittest.TestCase):
         self.assertEqual(fixture.store.get_run_attempt(plan.run_attempt_id)["state"], "starting")
         self.assertIsNotNone(fixture.store.get_controller_lease_for_attempt(plan.run_attempt_id, active_only=True))
         fixture.manager.game_launcher.ensure_started.assert_not_called()
+
+    def test_non_ww_start_reaches_real_host_without_unsupported_environment_keyword(self):
+        fixture = fixtures.ManagerAdapterExecutionTests(methodName="runTest")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.addCleanup(fixture.tearDown)
+        run = fixture._create_run([fixture._todo_id(fixtures.EXECUTE_BETA)])
+        host = fixture.manager.adapter_host
+        with mock.patch("subprocess.Popen", side_effect=AssertionError("No process in Host signature regression")), \
+                mock.patch.object(host, "probe", return_value={"hostHealthy": False}) as probe:
+            with self.assertRaisesRegex(ExecutionPackageUnavailable, "Manager Adapter Host is unavailable"):
+                fixture.manager._start_game_run(run["run_id"], lambda result: None)
+        probe.assert_called_once()
+        attempt = fixture.store.list_run_attempts(run_id=run["run_id"], limit=1)[0]
+        self.assertEqual(attempt["state"], "failed")
+        self.assertEqual(attempt["result"]["code"], "adapter_start_failed")
+        self.assertIn("Manager Adapter Host is unavailable", attempt["result"]["message"])
+        self.assertNotIn("TypeError", attempt["result"]["message"])
 
 
 if __name__ == "__main__":

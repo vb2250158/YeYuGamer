@@ -8356,7 +8356,7 @@ class ManagerService:
                     ),
                     installation_binding=installation_binding,
                     transcript=attempt_log,
-                    extra_environment=extra_environment,
+                    **({"extra_environment": extra_environment} if extra_environment is not None else {}),
                 )
                 _log.info("attempt.launch.adapter_host_started pid=%s", pid)
                 attempt = self.store.get_run_attempt(plan.run_attempt_id)
@@ -9140,9 +9140,9 @@ class ManagerService:
         failures: list[str] = list(prior_outcomes["failedRunIds"])
         not_started: list[str] = []
         timed_out = False
-        strategy = str(
-            self.store.get_config()["values"].get("execution_strategy", "continue")
-        )
+        if self.store.get_config()["values"].get("execution_strategy") == "stop":
+            self.store.append_event("batch.legacy-stop-strategy-ignored", "batch", batch_id,
+                                    {"reasonCode": "individual_failure_must_not_truncate_queue"})
         for index, run in enumerate(runs):
             current_batch = self.store.get_batch(batch_id)
             if current_batch.get("result", {}).get("sealVersion") is not None:
@@ -9383,28 +9383,6 @@ class ManagerService:
                         "resolve the same GameRun before resuming queued members.",
                     )
                 return
-            if (failures or not_started) and strategy == "stop":
-                for remaining in runs[index + 1 :]:
-                    remaining_id = str(remaining["runId"])
-                    if remaining_id not in not_started:
-                        not_started.append(remaining_id)
-                    membership = self.store.get_batch_run_membership(
-                        batch_id, remaining_id
-                    )
-                    if membership["state"] in {"queued", "resume_pending"}:
-                        self.store.update_batch_run_membership(
-                            batch_id,
-                            remaining_id,
-                            state="terminal",
-                            terminal_outcome="not_started_stop_strategy",
-                        )
-                    self.store.update_game_run(
-                        remaining_id,
-                        state=EntityState.BLOCKED,
-                        message="not started because the batch stop strategy fenced later games",
-                    )
-                break
-
             if self.store.get_active_batch_cancel_request(batch_id) is not None:
                 break
 
