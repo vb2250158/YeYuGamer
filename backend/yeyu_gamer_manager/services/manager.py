@@ -11,6 +11,8 @@ import threading
 from .snapshot_coalescer import SnapshotCoalescer
 from .queue_parking import attempt_parking_record, parking_record, park_human_gate, unresolved_parking_record
 from .queue_timeout_budget import load_queue_timeout_budget
+from .orphan_pending_execution import fail_resume_successor, recover_orphan_pending_executions, validate_resume_intent
+from .daily_queue_priority import order_daily_queue
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -385,6 +387,7 @@ class ManagerService:
             self._reconcile_pending_resume_intents()
         )
         self.recovered_active_batch_count = self._recover_active_batches()
+        self.recovered_orphan_pending_run_ids = recover_orphan_pending_executions(self, utc_now())
         self._attempt_logs: dict[str, AttemptLogSession] = {}
         self._attempt_logs_lock = threading.Lock()
         _log.info(
@@ -2521,6 +2524,17 @@ class ManagerService:
 
     def get_game(self, game_id: str) -> GameSummary:
         return self._game_projection(self.store.get_game(game_id))
+
+    def daily_execution_games(self) -> list[GameSummary]:
+        return order_daily_queue(self.list_games(), self.store.get_config()["values"], game_id=lambda game: game.game_id)
+
+    def execution_occupancy(self, *, owned_batch_id=None, current_run_id=None):
+        host = self.adapter_host.active_execution()
+        return self.store.active_execution_summary(
+            host_verified_idle=host is None,
+            host_owner_run_id=host.get("runId") if isinstance(host, dict) else None,
+            owned_batch_id=owned_batch_id, current_run_id=current_run_id,
+        )
 
     def get_game_detail(self, game_id: str) -> dict[str, Any]:
         game = self.get_game(game_id)
@@ -5140,7 +5154,7 @@ class ManagerService:
         if not entries:
             return False, ""
         if all(entry["allRequiredCompleted"] for entry in entries) and not any(
-            self.store.active_execution_summary().values()
+            self.execution_occupancy().values()
         ):
             return True, "all_required_completed"
         return False, ""
@@ -6326,7 +6340,7 @@ class ManagerService:
         removed_log_days = prune_run_logs(self.settings)
         vacuumed = False
         if allow_vacuum:
-            active = self.store.active_execution_summary()
+            active = self.execution_occupancy()
             if not any(active.values()):
                 vacuumed = self.store.vacuum_if_fragmented()
         after = self.store.ledger_size_report()
@@ -6348,6 +6362,7 @@ class ManagerService:
 
     def _recover_completion_review_phases(self) -> None:
         now = utc_now()
+        recover_orphan_pending_executions(self, now)
         for batch in self.store.list_batches(1000):
             result = dict(batch.get("result", {}))
             if (
@@ -6395,6 +6410,11 @@ class ManagerService:
     ]:
         """Persist one classified batch after the execute preflight succeeds."""
 
+        if cadence == Cadence.DAILY and requested_by == "manager-daily":
+            config = self.store.get_config()["values"]
+            candidate_game_ids = order_daily_queue(candidate_game_ids, config)
+            if requested_targets is not None:
+                requested_targets = order_daily_queue(requested_targets, config, game_id=lambda target: target.game_id)
         if mode == RequestMode.EXECUTE and any(
             self._current_human_batch(batch) for batch in self.store.list_batches(1000)
         ):
@@ -6548,7 +6568,7 @@ class ManagerService:
             configured_selection = config_values.get("daily_todo_selection", {})
             requested_game_ids = [
                 game.game_id
-                for game in self.list_games()
+                for game in self.daily_execution_games()
                 if game.enabled
                 and (bool(daily_account_targets(config_values, ["WW"])) if game.game_id == "WW"
                      else isinstance(configured_selection.get(game.game_id), list)
@@ -6880,6 +6900,7 @@ class ManagerService:
         *,
         todo_instance_ids: list[str] | None = None,
         attempt_ordinal: int | None = None,
+        resume_intent_id: str | None = None,
     ) -> AdapterExecutionPlan:
         plan = self._build_execution_plan(
             run, todo_instance_ids=todo_instance_ids
@@ -6933,6 +6954,14 @@ class ManagerService:
         )
         grant_controller_lease(candidate, existing, at=issued_at)
         with self.store.atomic():
+            latest_run = self.store.get_game_run(run["run_id"])
+            if latest_run["state"] == EntityState.CANCELLED or latest_run["state"] != run["state"]:
+                raise GameLaunchCancelled("GameRun changed before controller lease commit")
+            if resume_intent_id is not None:
+                intent = validate_resume_intent(self, resume_intent_id, run["run_id"])
+                latest_attempt = self.store.list_run_attempts(run_id=run["run_id"], limit=1)
+                if not latest_attempt or latest_attempt[0]["run_attempt_id"] != intent["predecessor_run_attempt_id"]:
+                    raise GameLaunchCancelled("Resume predecessor changed before controller lease commit")
             safe_plan = self._safe_execution_plan_document(plan)
             runtime_bindings = {
                 str(binding["operation"]): binding
@@ -7007,6 +7036,9 @@ class ManagerService:
                     "expires_at": candidate.expires_at.isoformat(),
                 }
             )
+            if resume_intent_id is not None:
+                self.store.update_resume_intent(resume_intent_id, state="successor_pending",
+                                                successor_run_attempt_id=plan.run_attempt_id)
             for membership in self.store.list_batch_run_memberships(
                 run_id=plan.run_id, limit=5000
             ):
@@ -7885,6 +7917,7 @@ class ManagerService:
         command_id: str | None = None,
         todo_instance_ids: list[str] | None = None,
         attempt_ordinal: int | None = None,
+        resume_intent_id: str | None = None,
     ) -> tuple[AdapterExecutionPlan, int]:
         run = self.store.get_game_run(run_id)
         self._validate_run_account_identity(run)
@@ -8053,6 +8086,7 @@ class ManagerService:
             run,
             todo_instance_ids=todo_instance_ids,
             attempt_ordinal=attempt_ordinal,
+            resume_intent_id=resume_intent_id,
         )
         attempt_log = self._open_attempt_log(
             game_id=str(run["game_id"]), run_attempt_id=plan.run_attempt_id
@@ -8306,6 +8340,8 @@ class ManagerService:
                 game_launch.as_result() if game_launch is not None else None,
             )
             with self._execution_handoff_lock:
+                if resume_intent_id is not None:
+                    validate_resume_intent(self, resume_intent_id, run_id, successor_id=plan.run_attempt_id)
                 if self._launch_cancel_requested(plan.run_attempt_id):
                     raise GameLaunchCancelled(
                         "Manager cancellation won the game-launch to Adapter handoff"
@@ -11651,7 +11687,7 @@ class ManagerService:
                     if account["account_id"] not in {item.get("account_id") for item in accounts}
                 }
                 if removed:
-                    active = self.store.active_execution_summary()
+                    active = self.execution_occupancy()
                     for item in active["batches"]:
                         batch = self.store.get_batch(item["batchId"])
                         if any((target["gameId"], target.get("accountId", "default")) in removed
@@ -12188,17 +12224,17 @@ class ManagerService:
 
         def operation() -> dict[str, Any]:
             latest = self.store.get_game_run(run_id)
-            if latest["state"] == EntityState.RUNNING:
-                active_attempt = next(
-                    (
-                        item
-                        for item in self.store.list_run_attempts(
-                            run_id=run_id, limit=20
-                        )
-                        if item["state"] in {"starting", "running", "cancelling"}
-                    ),
-                    None,
-                )
+            active_attempt = next((item for item in self.store.list_run_attempts(run_id=run_id, limit=5000)
+                                   if item["state"] in {"starting", "running", "cancelling"}), None)
+            cancellation_pending = latest["state"] in {EntityState.RUNNING, EntityState.CANCELLING} or (
+                latest["state"] == EntityState.PENDING_EXECUTION and active_attempt is not None
+            )
+            if latest["state"] == EntityState.PENDING_EXECUTION and not cancellation_pending:
+                host = self.adapter_host.active_execution()
+                if ((host is not None and (not isinstance(host, dict) or not host.get("runId") or host.get("runId") == run_id))
+                        or self.store.list_controller_leases(run_id=run_id, active_only=True, limit=1)):
+                    raise ManagerConflict("pending GameRun still has an owned Host or controller lease; cooperative reconciliation is required")
+            if cancellation_pending:
                 if active_attempt is not None:
                     self._end_controller_lease(
                         active_attempt["run_attempt_id"],
@@ -12241,12 +12277,16 @@ class ManagerService:
                         "is being resolved"
                     ),
                 )
-            elif latest["state"] in {EntityState.QUEUED, EntityState.PLANNED}:
+            elif latest["state"] in {EntityState.QUEUED, EntityState.PLANNED, EntityState.PENDING_EXECUTION}:
                 record = self.store.update_game_run(
                     run_id,
                     state=EntityState.CANCELLED,
                     message=str(request.get("reason", "operator-request")),
                 )
+                if latest["state"] == EntityState.PENDING_EXECUTION:
+                    for intent in self.store.list_resume_intents(run_id=run_id, limit=5000):
+                        if intent["state"] in {"successor_pending", "successor_dispatched"}:
+                            self.store.update_resume_intent(intent["resume_intent_id"], state="successor_failed")
             else:
                 raise ManagerConflict("terminal GameRun cannot be cancelled again")
             return self._receipt(
@@ -12256,15 +12296,15 @@ class ManagerService:
                 status_url=f"/api/v1/game-runs/{run_id}",
                 message=(
                     "运行中的取消意图已持久化，正在中止当前受管阶段。"
-                    if latest["state"] == EntityState.RUNNING
+                    if cancellation_pending
                     else "未运行的游戏请求已取消。"
                 ),
                 result={
                     "gameRun": _dump(GameRunRecord.model_validate(record)),
-                    "cancellationPending": latest["state"] == EntityState.RUNNING,
+                    "cancellationPending": cancellation_pending,
                     "activeRunAttemptId": (
                         str(active_attempt["run_attempt_id"])
-                        if latest["state"] == EntityState.RUNNING
+                        if cancellation_pending
                         and active_attempt is not None
                         else None
                     ),
@@ -13274,6 +13314,7 @@ class ManagerService:
                     command_id=str(receipt.command_id),
                     todo_instance_ids=resume_launch["eligibleTodoInstanceIds"],
                     attempt_ordinal=resume_launch["successorAttemptOrdinal"],
+                    resume_intent_id=resume_launch["intentId"],
                 )
                 current_intent = self.store.get_resume_intent(
                     resume_launch["intentId"]
@@ -13285,9 +13326,7 @@ class ManagerService:
                         successor_run_attempt_id=plan.run_attempt_id,
                     )
             except Exception as error:
-                self.store.update_resume_intent(
-                    resume_launch["intentId"], state="successor_failed"
-                )
+                fail_resume_successor(self, resume_launch["intentId"], utc_now())
                 self._complete_command(
                     str(receipt.command_id),
                     "failed",
@@ -13488,7 +13527,7 @@ class ManagerService:
 
         def operation() -> dict[str, Any]:
             if action == "promotion":
-                active_now = self.store.active_execution_summary()
+                active_now = self.execution_occupancy()
                 if (
                     active_now["batches"]
                     or active_now["gameRuns"]
@@ -13956,7 +13995,7 @@ class ManagerService:
             raise ManagerValidation("unsupported lifecycle action")
 
         def operation() -> dict[str, Any]:
-            active = self.store.active_execution_summary()
+            active = self.execution_occupancy()
             adapter_active = self.adapter_host.active_execution()
             if active["batches"] or active["gameRuns"] or adapter_active is not None:
                 raise ManagerConflict(

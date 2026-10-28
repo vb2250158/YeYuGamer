@@ -6073,6 +6073,12 @@ class SqliteStore:
             ).fetchall()
         return [self._resume_intent(row) for row in rows]
 
+    def latest_resume_intent(self, run_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self.connection.execute("""SELECT * FROM resume_intents WHERE run_id=?
+                ORDER BY created_at DESC, resume_intent_id DESC LIMIT 1""", (run_id,)).fetchone()
+        return None if row is None else self._resume_intent(row)
+
     def update_resume_intent(
         self,
         resume_intent_id: str,
@@ -6789,7 +6795,41 @@ class SqliteStore:
             ).fetchone()[0]
         return int(value)
 
-    def active_execution_summary(self) -> dict[str, list[dict[str, str]]]:
+    def orphan_pending_execution_candidates(self, run_id: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self.connection.execute(
+                """
+                WITH candidates AS (
+                    SELECT r.run_id, r.updated_at,
+                        (SELECT a.run_attempt_id FROM run_attempts a WHERE a.run_id = r.run_id
+                         ORDER BY a.created_at DESC, a.run_attempt_id DESC LIMIT 1) AS attempt_id,
+                        (SELECT a.state FROM run_attempts a WHERE a.run_id = r.run_id
+                         ORDER BY a.created_at DESC, a.run_attempt_id DESC LIMIT 1) AS attempt_state,
+                        (SELECT i.resume_intent_id FROM resume_intents i WHERE i.run_id = r.run_id
+                         ORDER BY i.created_at DESC, i.resume_intent_id DESC LIMIT 1) AS intent_id,
+                        (SELECT i.state FROM resume_intents i WHERE i.run_id = r.run_id
+                         ORDER BY i.created_at DESC, i.resume_intent_id DESC LIMIT 1) AS intent_state
+                    FROM game_runs r
+                    WHERE r.state = 'pending_execution' AND (? IS NULL OR r.run_id = ?)
+                        AND NOT EXISTS (SELECT 1 FROM run_attempts a WHERE a.run_id = r.run_id
+                                        AND a.state IN ('starting','running','cancelling'))
+                        AND NOT EXISTS (SELECT 1 FROM controller_leases l WHERE l.run_id = r.run_id AND l.state = 'active')
+                        AND NOT EXISTS (SELECT 1 FROM batch_run_memberships m WHERE m.run_id = r.run_id
+                                        AND m.state NOT IN ('terminal','cancelled'))
+                        AND NOT EXISTS (SELECT 1 FROM resume_intents i WHERE i.run_id = r.run_id
+                                        AND i.state IN ('successor_pending','successor_dispatched'))
+                )
+                SELECT * FROM candidates WHERE intent_state = 'successor_failed'
+                    AND attempt_state IN ('failed','blocked','review_required','human_required','cancelled','completed')
+                ORDER BY updated_at, run_id
+                """, (run_id, run_id),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def active_execution_summary(self, *, host_verified_idle: bool = False,
+                                 host_owner_run_id: str | None = None,
+                                 owned_batch_id: str | None = None,
+                                 current_run_id: str | None = None) -> dict[str, list[dict[str, str]]]:
         """Return durable executions that make Manager shutdown unsafe.
 
         A ``queued`` game run is reported only while its Batch can still
@@ -6810,6 +6850,31 @@ class SqliteStore:
         active_states = ("pending_execution", "queued", "running", "cancelling")
         placeholders = ",".join("?" for _ in active_states)
         with self._lock:
+            orphan_ids = set()
+            host_owner_known = isinstance(host_owner_run_id, str) and bool(host_owner_run_id)
+            if host_verified_idle is True or host_owner_known:
+                orphan_ids = {row["run_id"] for row in self.orphan_pending_execution_candidates()
+                              if host_verified_idle is True or row["run_id"] != host_owner_run_id}
+            sibling_reservations = set()
+            if owned_batch_id is not None and current_run_id is not None:
+                owned = self.connection.execute("""SELECT b.result_json FROM batch_run_memberships m JOIN batches b ON b.batch_id=m.batch_id
+                    WHERE m.batch_id=? AND m.run_id=? AND m.state IN ('queued','resume_pending','active')
+                    AND b.state IN ('pending_execution','queued','running','cancelling')
+                    AND NOT EXISTS (SELECT 1 FROM batch_run_memberships other WHERE other.run_id=m.run_id
+                                    AND other.batch_id<>m.batch_id AND other.state NOT IN ('terminal','cancelled'))""",
+                    (owned_batch_id, current_run_id)).fetchone()
+                if owned is not None and _decode(owned["result_json"], {}).get("sealVersion") is None:
+                    siblings = self.connection.execute("""SELECT r.run_id FROM game_runs r
+                        JOIN batch_run_memberships m ON m.run_id=r.run_id
+                        WHERE m.batch_id=? AND r.run_id<>? AND m.state='queued' AND r.state='queued'
+                        AND NOT EXISTS (SELECT 1 FROM run_attempts a WHERE a.run_id=r.run_id)
+                        AND NOT EXISTS (SELECT 1 FROM controller_leases l WHERE l.run_id=r.run_id AND l.state='active')
+                        AND NOT EXISTS (SELECT 1 FROM resume_intents i WHERE i.run_id=r.run_id
+                                        AND i.state IN ('successor_pending','successor_dispatched'))
+                        AND NOT EXISTS (SELECT 1 FROM batch_run_memberships other WHERE other.run_id=r.run_id
+                                        AND other.batch_id<>m.batch_id AND other.state NOT IN ('terminal','cancelled'))""",
+                        (owned_batch_id, current_run_id)).fetchall()
+                    sibling_reservations = {row["run_id"] for row in siblings}
             batches = self.connection.execute(
                 f"SELECT batch_id, state FROM batches WHERE state IN ({placeholders}) "
                 "ORDER BY created_at",
@@ -6843,11 +6908,12 @@ class SqliteStore:
             "gameRuns": [
                 {"runId": str(row["run_id"]), "state": str(row["state"])}
                 for row in runs
+                if str(row["run_id"]) not in orphan_ids
             ]
             + [
                 {"runId": str(row["run_id"]), "state": str(row["state"])}
                 for row in queued
-                if str(row["run_id"]) not in parked_ids
+                if str(row["run_id"]) not in parked_ids and str(row["run_id"]) not in sibling_reservations
             ],
         }
 

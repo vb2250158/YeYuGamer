@@ -26,7 +26,7 @@ where = ["."]
 include = ["yeyu_gamer_manager*"]
 
 [tool.setuptools.package-data]
-yeyu_gamer_manager = ["services/resources/queue_timeout_budgets.json", "services/resources/queue_timeout_limits.json"]
+yeyu_gamer_manager = ["services/resources/queue_timeout_budgets.json", "services/resources/queue_timeout_limits.json", "services/resources/daily_queue_priority.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

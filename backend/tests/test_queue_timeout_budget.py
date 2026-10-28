@@ -25,6 +25,7 @@ class QueueTimeoutBudgetTests(unittest.TestCase):
             "callback_overhead_seconds": 40,
             "callback_cancel_grace_seconds": 15,
             "poll_seconds": 1,
+            "orphan_pending_seconds": 120,
         }
         self.assertEqual(json.loads(resource_path.read_text(encoding="utf-8")), expected)
         self.assertEqual(asdict(load_queue_timeout_budget({})), expected)

@@ -3,5 +3,6 @@
   "completion_review_seconds": 900,
   "callback_overhead_seconds": 40,
   "callback_cancel_grace_seconds": 15,
-  "poll_seconds": 1
+  "poll_seconds": 1,
+  "orphan_pending_seconds": 120
 }

@@ -1,5 +1,10 @@
 # Queue timeout QA candidate — CHANGES_REQUIRED
 
+2026-10-28 follow-up: the orphan pending-execution and daily-priority candidate,
+additional verification and the two missing scheduler/serial integration points
+are documented in `ORPHAN_PENDING_EXECUTION_RESULT.md`. This original report
+describes the preceding `34c4523` subset, not full acceptance of later work.
+
 ## Scope and base
 
 - Branch: `qa/queue-timeout-20261028`, parent `f4ab6bf`.

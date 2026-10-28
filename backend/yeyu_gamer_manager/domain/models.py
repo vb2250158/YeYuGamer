@@ -1476,6 +1476,7 @@ class ConfigPatchRequest(ApiModel):
     execution_strategy: Literal["continue", "stop"] | None = None
     step_timeout_seconds: int | None = Field(default=None, ge=600, le=7200)
     queue_timeout_budget: dict[str, Any] | None = None
+    daily_queue_priority: list[str] | None = None
     todo_reset_policy: TodoResetPolicyConfig | None = None
     game_paths: dict[str, GamePathConfig] | None = None
     daily_tool_profiles: DailyToolProfilesConfig | None = None
@@ -1488,6 +1489,15 @@ class ConfigPatchRequest(ApiModel):
             from ..services.queue_timeout_budget import load_queue_timeout_budget
 
             load_queue_timeout_budget({"queue_timeout_budget": value})
+        return value
+
+    @field_validator("daily_queue_priority")
+    @classmethod
+    def validate_daily_queue_priority(cls, value):
+        if value is not None:
+            from ..services.daily_queue_priority import order_daily_queue
+
+            order_daily_queue([], {"daily_queue_priority": value})
         return value
 
 
