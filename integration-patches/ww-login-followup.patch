@@ -1,0 +1,13 @@
+diff --git a/backend/yeyu_gamer_manager/services/ww_multi_account_scope.py b/backend/yeyu_gamer_manager/services/ww_multi_account_scope.py
+--- a/backend/yeyu_gamer_manager/services/ww_multi_account_scope.py
++++ b/backend/yeyu_gamer_manager/services/ww_multi_account_scope.py
+@@ -253,7 +253,8 @@ def build_for_plan(manager, run, plan, *, check_pristine=True):
+         scope['scopeSha256'] = scope_digest(scope)
+     else:
+         attempts = manager.store.list_run_attempts(run_id=source_run, limit=1)
+-        scope = (attempts[0].get('plan', {}).get('wwAccountScope') if attempts else None)
++        source_plan = attempts[0].get('plan') if attempts else None
++        scope = source_plan.get('wwAccountScope') if isinstance(source_plan, dict) else None
+         if (not isinstance(scope, dict) or scope.get('mode') != 'execute'
+                 or scope.get('sourceRunAttemptId') != attempts[0]['run_attempt_id']
+                 or scope.get('batchId') != batch_id or scope.get('members') != members

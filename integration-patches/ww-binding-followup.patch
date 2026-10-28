@@ -1,0 +1,17 @@
+# Task 6: documentation-only integration proposal; NOT applied.
+# baseSHA256 docs/integrations/ok-ww.md: 62c1397bbc3ff25c18715dc22351885017360f25a0924b9ead5938451332152e
+# HEAD f4ab6bf76365cd62e5ccde118398b417ed086de7
+# Base is the existing working file, not HEAD; preserve its unrelated changes.
+diff --git a/docs/integrations/ok-ww.md b/docs/integrations/ok-ww.md
+--- a/docs/integrations/ok-ww.md
++++ b/docs/integrations/ok-ww.md
+@@ -1,5 +1,9 @@
+ # 鸣潮（OK-WW）每日接入规范
+ 
+ > 本文定义 YeYu Gamer 如何编排本机 OK-WW 源码。它不定义鸣潮的游戏策略，也不替代 OK-WW 的自动化逻辑。
+ 
++## 本机来源与运行包边界
++
++本次源码目标是 `D:\Game\Tools\forks\ok-ww` 的 `yeyu-local-20261028`（核验提交 `1c3dc74ef985c09a9b26a4255a459d6df5d3333f`），不是把该源码目录直接填为 Adapter 的 `ToolRoot`。现有源码候选绑定要求 `WW/runtime-preparation.json`、`WW/source/main.py` 与 `r/Scripts/pythonw.exe`；普通源码树不满足此布局。`upstream-candidates/ww124` 是历史运行候选，既非该 ref，也非源码默认值；不能全局替换缓存路径或放宽来源校验。目标 ref 尚未完成运行包资格验证、Manager 真实绑定切换或实机验收。详见 `../qa/ww-binding-followup.md`。
++
+ ## 目标与边界

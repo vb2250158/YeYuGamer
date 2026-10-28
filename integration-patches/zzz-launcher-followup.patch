@@ -1,0 +1,30 @@
+diff --git a/backend/yeyu_gamer_manager/services/hoyoplay_native_observation.py b/backend/yeyu_gamer_manager/services/hoyoplay_native_observation.py
+--- a/backend/yeyu_gamer_manager/services/hoyoplay_native_observation.py
++++ b/backend/yeyu_gamer_manager/services/hoyoplay_native_observation.py
+@@ -367,6 +367,8 @@
+         (output_dir / record["logPath"]).write_text(json.dumps(record), encoding="utf-8")
+         self.register_helper(dict(record))
+         # Never terminate an existing or newly started launcher, even on Stop.
+-        if identity is None or PureWindowsPath(str(identity.executable)) != PureWindowsPath(str(FIXED_LAUNCHER_EXECUTABLE)):
++        if identity is not None and PureWindowsPath(str(identity.executable)) != PureWindowsPath(str(FIXED_LAUNCHER_EXECUTABLE)):
++            raise _failure("zzz_observation_launch_identity_mismatch", "启动请求已发出，但进程路径与锁定启动器不符。")
++        if identity is None:
+             raise _failure("zzz_observation_launch_identity_unavailable", "启动请求已发出，但进程身份未能确认。")
+         self._guard()
+diff --git a/backend/yeyu_gamer_manager/services/hoyoplay_native_execution.py b/backend/yeyu_gamer_manager/services/hoyoplay_native_execution.py
+--- a/backend/yeyu_gamer_manager/services/hoyoplay_native_execution.py
++++ b/backend/yeyu_gamer_manager/services/hoyoplay_native_execution.py
+@@ -423,9 +423,11 @@
+         }
+     }
+     $docs=@($nodes | Where-Object {$_.controlType -ceq 'ControlType.Document' -and -not $_.offscreen})
+-    if($docs.Count -ne 1 -or $docs[0].documentLocation.origin -cne 'https://hyp-api.mihoyo.com' -or
++    if($docs.Count -ne 1) {throw 'selection-document-count'}
++    if($docs[0].documentLocation.origin -cne 'https://hyp-api.mihoyo.com' -or
+        $docs[0].documentLocation.path -cne '/hypfe/index.html' -or $docs[0].documentLocation.route -cne '/nap_cn' -or
+-       $docs[0].documentLocation.status -cne 'unqualified' -or $docs[0].documentText -ceq 'unknown') {throw 'selection-unknown'}
++       $docs[0].documentLocation.status -cne 'unqualified') {throw 'selection-location-unqualified'}
++    if($docs[0].documentText -ceq 'unknown') {throw 'selection-text-unavailable'}
+     Session-Phase 'view-final-identity'; Install-Association; Same-Identity $identity; Recheck-OwnerFamily
+     if([HYPReadOnly]::Owner($hwnd) -ne $number) {throw 'window-changed'}
+     if(([Diagnostics.Stopwatch]::GetTimestamp()-$viewStarted)/[Diagnostics.Stopwatch]::Frequency -gt 2) {throw 'live-view-stale'}

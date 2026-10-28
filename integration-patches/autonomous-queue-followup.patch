@@ -1,0 +1,27 @@
+--- a/backend/yeyu_gamer_manager/services/autonomous_daily.py
++++ b/backend/yeyu_gamer_manager/services/autonomous_daily.py
+@@ -98,1 +98,1 @@
+-            active = self.store.active_execution_summary()
++            active = self.manager.execution_occupancy()
+@@ -111,1 +111,1 @@
+-        active = self.store.active_execution_summary()
++        active = self.manager.execution_occupancy()
+@@ -342,1 +342,1 @@
+-                active = self.store.active_execution_summary()
++                active = self.manager.execution_occupancy()
+@@ -585,1 +585,1 @@
+-            game_ids = [game.game_id for game in self.manager.list_games() if game.enabled]
++            game_ids = [game.game_id for game in self.manager.daily_execution_games() if game.enabled]
+@@ -932,1 +932,1 @@
+-        active = self.store.active_execution_summary()
++        active = self.manager.execution_occupancy()
+@@ -963,1 +963,1 @@
+-        active = self.store.active_execution_summary()
++        active = self.manager.execution_occupancy()
+@@ -1118,1 +1118,1 @@
+-        active = self.store.active_execution_summary()
++        active = self.manager.execution_occupancy()
+@@ -1250,1 +1250,2 @@
+-        if self.store.active_execution_summary()["batches"] or self.store.active_execution_summary()["gameRuns"]:
++        active = self.manager.execution_occupancy()
++        if active["batches"] or active["gameRuns"]:
