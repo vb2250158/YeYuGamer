@@ -6826,6 +6826,29 @@ class SqliteStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def serial_observation_execution_blockers(self, owned_run_id: str | None = None,
+                                             *, owned_pgr_resume: dict[str, Any] | None = None) -> dict[str, bool]:
+        with self._lock:
+            exempt_intent_id = None
+            if owned_pgr_resume is not None and owned_run_id is not None:
+                intent_id = owned_pgr_resume.get('resume_intent_id')
+                try:
+                    current = self.get_resume_intent(intent_id)
+                except KeyError:
+                    current = None
+                if (current == owned_pgr_resume and current is not None
+                        and current['run_id'] == owned_run_id
+                        and current['decision'].get('kind') == 'pgr-daily-step'
+                        and current['state'] in {'successor_pending', 'successor_dispatched'}):
+                    exempt_intent_id = intent_id
+            row = self.connection.execute("""SELECT
+                EXISTS(SELECT 1 FROM run_attempts WHERE state IN ('starting','running','cancelling')
+                    AND (? IS NULL OR run_id <> ?)) AS attempts,
+                EXISTS(SELECT 1 FROM resume_intents WHERE state IN ('successor_pending','successor_dispatched')
+                    AND (? IS NULL OR resume_intent_id <> ?)) AS resumes
+                """, (owned_run_id, owned_run_id, exempt_intent_id, exempt_intent_id)).fetchone()
+        return {key: bool(row[key]) for key in ('attempts', 'resumes')}
+
     def active_execution_summary(self, *, host_verified_idle: bool = False,
                                  host_owner_run_id: str | None = None,
                                  owned_batch_id: str | None = None,
@@ -6857,23 +6880,33 @@ class SqliteStore:
                               if host_verified_idle is True or row["run_id"] != host_owner_run_id}
             sibling_reservations = set()
             if owned_batch_id is not None and current_run_id is not None:
-                owned = self.connection.execute("""SELECT b.result_json FROM batch_run_memberships m JOIN batches b ON b.batch_id=m.batch_id
-                    WHERE m.batch_id=? AND m.run_id=? AND m.state IN ('queued','resume_pending','active')
+                owned = self.connection.execute("""SELECT b.result_json, b.cadence FROM batch_run_memberships m JOIN batches b ON b.batch_id=m.batch_id
+                    WHERE m.batch_id=? AND m.run_id=?
+                    AND (m.state IN ('queued','resume_pending','active') OR
+                         (m.state='terminal' AND m.terminal_outcome='completed'
+                          AND EXISTS (SELECT 1 FROM run_attempts a WHERE a.run_id=m.run_id
+                                      AND a.run_attempt_id=m.latest_run_attempt_id
+                                      AND a.state='completed' AND a.completed_at IS NOT NULL AND a.exit_code=0)))
                     AND b.state IN ('pending_execution','queued','running','cancelling')
+                    AND b.mode='execute'
+                    AND NOT EXISTS (SELECT 1 FROM batch_cancel_requests c WHERE c.batch_id=b.batch_id
+                                    AND c.state IN ('requested','signal_delivered','reconciliation_required','acknowledged'))
                     AND NOT EXISTS (SELECT 1 FROM batch_run_memberships other WHERE other.run_id=m.run_id
                                     AND other.batch_id<>m.batch_id AND other.state NOT IN ('terminal','cancelled'))""",
                     (owned_batch_id, current_run_id)).fetchone()
                 if owned is not None and _decode(owned["result_json"], {}).get("sealVersion") is None:
                     siblings = self.connection.execute("""SELECT r.run_id FROM game_runs r
                         JOIN batch_run_memberships m ON m.run_id=r.run_id
-                        WHERE m.batch_id=? AND r.run_id<>? AND m.state='queued' AND r.state='queued'
+                        WHERE m.batch_id=? AND r.run_id<>? AND m.state='queued'
+                        AND r.state IN ('queued','pending_execution') AND r.mode='execute' AND r.cadence=?
+                        AND m.latest_run_attempt_id IS NULL AND m.resume_intent_id IS NULL
+                        AND m.terminal_outcome IS NULL
                         AND NOT EXISTS (SELECT 1 FROM run_attempts a WHERE a.run_id=r.run_id)
                         AND NOT EXISTS (SELECT 1 FROM controller_leases l WHERE l.run_id=r.run_id AND l.state='active')
-                        AND NOT EXISTS (SELECT 1 FROM resume_intents i WHERE i.run_id=r.run_id
-                                        AND i.state IN ('successor_pending','successor_dispatched'))
+                        AND NOT EXISTS (SELECT 1 FROM resume_intents i WHERE i.run_id=r.run_id)
                         AND NOT EXISTS (SELECT 1 FROM batch_run_memberships other WHERE other.run_id=r.run_id
                                         AND other.batch_id<>m.batch_id AND other.state NOT IN ('terminal','cancelled'))""",
-                        (owned_batch_id, current_run_id)).fetchall()
+                        (owned_batch_id, current_run_id, owned['cadence'])).fetchall()
                     sibling_reservations = {row["run_id"] for row in siblings}
             batches = self.connection.execute(
                 f"SELECT batch_id, state FROM batches WHERE state IN ({placeholders}) "
@@ -6908,7 +6941,7 @@ class SqliteStore:
             "gameRuns": [
                 {"runId": str(row["run_id"]), "state": str(row["state"])}
                 for row in runs
-                if str(row["run_id"]) not in orphan_ids
+                if str(row["run_id"]) not in orphan_ids and str(row["run_id"]) not in sibling_reservations
             ]
             + [
                 {"runId": str(row["run_id"]), "state": str(row["state"])}
