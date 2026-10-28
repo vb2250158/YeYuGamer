@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$SourceRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$BuildRoot = (Join-Path $SourceRoot '.cache\adapter-build'),
@@ -8,7 +8,7 @@ param(
     [string]$EndfieldGamePath = 'D:\Game\Games\Endfield Game\Endfield.exe',
     [string]$Gf2ToolRoot = 'D:\Game\Tools\Automation\ok-gf2',
     [string]$Gf2GamePath = 'D:\Game\Games\GF2Exilium\GF2 Game\GF2_Exilium.exe',
-    [string]$PackageVersion = '0.2.0-local-daily.99',
+    [string]$PackageVersion = '0.2.0-local-daily.103',
     [string]$CSharpCompilerPath = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 )
 
@@ -29,9 +29,208 @@ function Assert-LocalDirectory([string]$Path, [string]$Purpose) {
 }
 function Hash([string]$Path) { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() }
 
+function Test-EndfieldNaturalSource([string]$ToolRoot, [string]$WorkingRoot, [string]$PolicyPath) {
+    try {
+        $policy = Get-Content -LiteralPath $PolicyPath -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
+        if ($policy.contract -cne 'endfield.natural-continuation@1' -or $policy.taskIndex -ne 37 -or
+            $policy.sourceEntry -cne 'src.tasks.onetime.NaturalSanityContinuationTask.NaturalSanityContinuationTask' -or
+            $policy.files.Count -lt 1 -or $policy.files.Count -gt 1024 -or $policy.runtimeFiles.Count -lt 3 -or $policy.runtimeFiles.Count -gt 32) { return $false }
+        foreach ($spec in @(@($WorkingRoot,$policy.files),@($ToolRoot,$policy.runtimeFiles))) {
+            $root = [IO.Path]::GetFullPath([string]$spec[0]).TrimEnd('\')+'\'
+            foreach ($entry in $spec[1].GetEnumerator()) {
+                $path = [IO.Path]::GetFullPath((Join-Path $root $entry.Key))
+                if (-not $path.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) { return $false }
+                $path = Assert-LocalFile $path 'Endfield frozen continuation input'
+                for ($parent=[IO.FileInfo]::new($path).Directory;$null -ne $parent -and $parent.FullName.Length -ge $root.Length-1;$parent=$parent.Parent) {
+                    if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+                }
+                if ((Hash $path) -cne $entry.Value) { return $false }
+            }
+        }
+        $audit = Assert-LocalFile (Join-Path $ToolRoot 'Endfield/native-ocr-locked-runtime-files.json') 'Endfield continuation runtime inventory'
+        return (Hash $audit) -ceq $policy.runtimeAuditSha256
+    } catch { return $false }
+}
+
+function Get-WwCohortBlobInventory([string]$Root, [bool]$Source) {
+    $result = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $pending = [Collections.Generic.Stack[string]]::new(); $pending.Push($Root); $entries = 0
+    while ($pending.Count -gt 0) {
+        foreach ($path in [IO.Directory]::EnumerateFileSystemEntries($pending.Pop())) {
+            if (++$entries -gt 20000) { throw 'WW source inventory bound exceeded' }
+            $attributes = [IO.File]::GetAttributes($path)
+            if ($attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'WW source reparse point' }
+            $relative = $path.Substring($Root.Length + 1).Replace('\', '/')
+            if ($relative -ceq '.git' -or ($Source -and $relative -cin @('configs','logs','screenshots','screenshot','ok_templates'))) { continue }
+            if ($attributes -band [IO.FileAttributes]::Directory) { $pending.Push($path) }
+            elseif (-not $result.Add($relative)) { throw 'WW source case alias' }
+        }
+    }
+    return ,$result
+}
+function Test-WwCohortBlobTree($Root, $Rows, [int]$Count, [string]$ExpectedDigest, [bool]$Source) {
+    if ($Rows -isnot [array] -or $Rows.Count -ne $Count) { return $false }
+    $Root = [IO.Path]::GetFullPath($Root)
+    for ($parent = [IO.DirectoryInfo]::new($Root); $null -ne $parent; $parent = $parent.Parent) {
+        if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+    }
+    $files = [Collections.Generic.SortedDictionary[string,string]]::new([StringComparer]::Ordinal)
+    $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($row in $Rows) {
+        if ($row -isnot [Collections.IDictionary] -or $row.Count -ne 2 -or
+            -not $row.Contains('path') -or -not $row.Contains('gitBlobSha1')) { return $false }
+        $path = $row.path; $blob = $row.gitBlobSha1
+        if ($path -isnot [string] -or -not $path -or $path -match '[\x00-\x1f\x7f\\:]' -or
+            [IO.Path]::IsPathRooted($path) -or @($path.Split('/') | Where-Object { $_ -in @('', '.', '..') }).Count -gt 0 -or
+            $blob -cnotmatch '\A[0-9a-f]{40}\z' -or -not $names.Add($path)) { return $false }
+        $files.Add($path, $blob)
+    }
+    $index = [Text.StringBuilder]::new()
+    foreach ($row in $files.GetEnumerator()) { $null = $index.Append($row.Key).Append([char]0).Append($row.Value).Append("`n") }
+    $digest = [Security.Cryptography.SHA256]::Create()
+    try { $indexHash = [Convert]::ToHexString($digest.ComputeHash([Text.Encoding]::UTF8.GetBytes($index.ToString()))).ToLowerInvariant() }
+    finally { $digest.Dispose() }
+    if ($indexHash -cne $ExpectedDigest) { return $false }
+    if (-not (Get-WwCohortBlobInventory $Root $Source).SetEquals($names)) { return $false }
+    $stamps = [Collections.Generic.List[object]]::new()
+    [long]$bytes = 0
+    foreach ($row in $files.GetEnumerator()) {
+        $path = Join-Path $Root $row.Key
+        for ($parent = [IO.DirectoryInfo]::new([IO.Path]::GetDirectoryName($path)); $null -ne $parent; $parent = $parent.Parent) {
+            if ($parent.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+            if ($parent.FullName -ieq $Root) { break }
+        }
+        $before = [IO.FileInfo]::new($path)
+        if (-not $before.Exists -or ($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $before.Length -gt 256MB) { return $false }
+        $size = $before.Length; $modified = $before.LastWriteTimeUtc; $bytes += $size
+        if ($bytes -gt 1GB) { return $false }
+        $hash = [Security.Cryptography.SHA1]::Create(); $stream = [IO.File]::OpenRead($path)
+        try {
+            $header = [Text.Encoding]::ASCII.GetBytes('blob ' + $size.ToString([Globalization.CultureInfo]::InvariantCulture) + [char]0)
+            $null = $hash.TransformBlock($header, 0, $header.Length, $header, 0)
+            $buffer = [byte[]]::new(1MB)
+            while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) { $null = $hash.TransformBlock($buffer, 0, $read, $buffer, 0) }
+            $null = $hash.TransformFinalBlock([byte[]]::new(0), 0, 0)
+            if ([Convert]::ToHexString($hash.Hash).ToLowerInvariant() -cne $row.Value) { return $false }
+        } finally { $stream.Dispose(); $hash.Dispose() }
+        $after = [IO.FileInfo]::new($path)
+        if ($after.Length -ne $size -or $after.LastWriteTimeUtc -ne $modified -or ($after.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $false }
+        $stamps.Add(@($path, $size, $modified))
+    }
+    if (-not (Get-WwCohortBlobInventory $Root $Source).SetEquals($names)) { return $false }
+    foreach ($stamp in $stamps) {
+        $file = [IO.FileInfo]::new($stamp[0])
+        if (-not $file.Exists -or $file.Length -ne $stamp[1] -or $file.LastWriteTimeUtc -ne $stamp[2] -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $false }
+    }
+    return $true
+}
+function Test-WwOcrCacheOwnership([string]$Root) {
+    try {
+        $receiptPath = Join-Path $Root 'WW/runtime-requalification-ocr-cache.json'
+        $predict = Join-Path $Root 'r/Lib/site-packages/onnxocr/predict_base.py'
+        $record = Join-Path $Root 'r/Lib/site-packages/onnxocr_ppocrv5-0.0.22.dist-info/RECORD'
+        foreach ($path in @($receiptPath,$predict,$record,(Join-Path $Root 'mutable/onnxocr'))) {
+            for ($part = [IO.Path]::GetFullPath($path); $part; $part = [IO.Path]::GetDirectoryName($part)) {
+                try { $attributes = [IO.File]::GetAttributes($part) }
+                catch [IO.FileNotFoundException] { continue }
+                catch [IO.DirectoryNotFoundException] { continue }
+                if ($attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
+            }
+        }
+        if (-not [IO.File]::Exists($receiptPath) -or ([IO.FileInfo]::new($receiptPath)).Length -gt 128KB -or
+            [IO.File]::Exists((Join-Path $Root 'mutable')) -or [IO.File]::Exists((Join-Path $Root 'mutable/onnxocr'))) { return $false }
+        $receipt = [IO.File]::ReadAllText($receiptPath) | ConvertFrom-Json -AsHashtable
+        return $receipt.schemaVersion -eq 1 -and $receipt.status -ceq 'runtime-files-requalified' -and
+            [string]::Equals($receipt.runtimeRoot, [IO.Path]::GetFullPath($Root), [StringComparison]::OrdinalIgnoreCase) -and
+            $receipt.parentManifestSha256 -ceq (Hash (Join-Path $Root 'WW/runtime-preparation.json')) -and
+            $receipt.upstreamRepository -ceq 'https://github.com/ok-oldking/OnnxOCR.git' -and
+            $receipt.officialBaseCommit -ceq '1888fd16e3ac3c663e2b25739cb21c388fb8a6fa' -and
+            $receipt.upstreamPatchCommit -ceq '9fd82161a575a994f70ef5a45e759b66dc7c7224' -and
+            $receipt.predictBaseSha256 -ceq 'cf80ceec7f6cb6c116811321a820c37aba012118deb29601bf99ddc61db2b2ec' -and
+            (Hash $predict) -ceq $receipt.predictBaseSha256 -and
+            $receipt.recordSha256 -ceq '7b4d4e3c72f1ce5a90491408e92b0ce53f6298953f6d69800c82a25e5f4fb6c5' -and
+            (Hash $record) -ceq $receipt.recordSha256 -and $receipt.cacheDirectoryRelativePath -ceq 'mutable/onnxocr'
+    } catch { return $false }
+}
+function Test-WwHardcapCohortSource($Working, $Record) {
+    try {
+        $templates = $Record.templates
+        $sourceIndex = switch ($Record.source.commit) {
+            'e28a46f93972c4fa1894f82f5fe788e7816fcd45' { if ((Hash (Join-Path $Working 'src/task/DailyTask.py')) -ceq '2a452cd3cbefa5347416e903e536019726449373c8ed260cebeac9b1f4691c17') { '2ae25602430834af0ed93e8d9ca7731efa4524b68a039e120779f5dcbfa9aae9' } }
+            'ca8dd9b96f1ecf0c5e02e61c9ef4a3ed60d9776a' { if ((Hash (Join-Path $Working 'src/task/DailyTask.py')) -ceq '51337ab585f5c56a1063d75544756f8a699afbbd553f4434f231cb80e2d062df') { '11bd003986977de6099796a63b6379132d59b2637a546734b07fe48695383aad' } }
+            '814eddb3e1acd05bc06f7fad212214e6d872a668' { if ((Hash (Join-Path $Working 'src/task/DailyTask.py')) -ceq '51337ab585f5c56a1063d75544756f8a699afbbd553f4434f231cb80e2d062df') { '2688e7a8312fbccc20a07ec319631e1085763906d927de4580d13d9328aa6973' } }
+            '6c5938976094c7423de808d7ce323df2cc39c2d3' { if ((Hash (Join-Path $Working 'src/task/DailyTask.py')) -ceq '51337ab585f5c56a1063d75544756f8a699afbbd553f4434f231cb80e2d062df') { '60d11cd8fe15719fcacbd42729eb8c9cb180e187afb1c7be4847470b164d86f6' } }
+            '20d2a0fbd5cbe257d80cc2de5f70d369ba25d07f' { if ((Hash (Join-Path $Working 'src/task/DailyTask.py')) -ceq '51337ab585f5c56a1063d75544756f8a699afbbd553f4434f231cb80e2d062df') { '8269e9e4e0499ef895213998c9fe45319efc103e42b2a084ea7aeecca79b0aaa' } }
+            '88a67e6a1719315954f5120aaf9d6a7819b28d78' { if ((Hash (Join-Path $Working 'src/task/DailyTask.py')) -ceq 'b1966a153c49f718f42a157de81431ec10d2f9de16427b72974106fe987a3041') { '351acc3af398c0e118b2e57649ea45343cd1901855ab0934c4b1fe2dcf7eca99' } }
+        }
+        if (-not $sourceIndex) { return $false }
+        $sourceCount = if ($Record.source.commit -ceq '88a67e6a1719315954f5120aaf9d6a7819b28d78') { 316 } elseif ($Record.source.commit -ceq '20d2a0fbd5cbe257d80cc2de5f70d369ba25d07f') { 304 } else { 303 }
+        return ($Record.source.commit -cnotin @('ca8dd9b96f1ecf0c5e02e61c9ef4a3ed60d9776a', '814eddb3e1acd05bc06f7fad212214e6d872a668', '6c5938976094c7423de808d7ce323df2cc39c2d3', '20d2a0fbd5cbe257d80cc2de5f70d369ba25d07f', '88a67e6a1719315954f5120aaf9d6a7819b28d78') -or
+            (Test-WwOcrCacheOwnership (Split-Path -Parent (Split-Path -Parent $Working)))) -and
+            $templates.repository -ceq 'https://github.com/ok-oldking/ok-wuthering-waves-coco-labeling.git' -and
+            $templates.commit -ceq '438526eafcf4b1caf78c1dea68ef36b42e81e3c4' -and $templates.directory -ceq 'WW/source/ok_templates' -and
+            (Test-WwCohortBlobTree $Working $Record.source.blobs $sourceCount $sourceIndex $true) -and
+            (Test-WwCohortBlobTree (Join-Path $Working 'ok_templates') $templates.blobs 165 'ca1d7d95b077c5517d5b6d515d35200ccb42e043aa333a18fd5421fae358b001' $false)
+    } catch { return $false }
+}
+function Test-EndfieldInspectionV2Source($Root, $Working, $SourceRecord, $Policy) {
+    if (-not $Policy.ContainsKey('candidateV2')) { return $false }
+    $v2 = $Policy.candidateV2
+    $required = @('state','protocol','commit','officialBaseCommit','sourceArchiveSha256','entry','dependencies','limits','files')
+    if (@($required | Where-Object { -not $v2.ContainsKey($_) }).Count -ne 0) { return $false }
+    $navigation = $v2.readonlyNavigation
+    $sourceNavigation = $SourceRecord.readonlyNavigation
+    $navigationKeys = @('contractId','baseCommit','baseTaskSha256','taskSha256','overlaySha256')
+    if ($navigation -isnot [System.Collections.IDictionary] -or $sourceNavigation -isnot [System.Collections.IDictionary] -or
+        $navigation.Count -ne 5 -or $sourceNavigation.Count -ne 5 -or
+        @($navigationKeys | Where-Object { -not $navigation.ContainsKey($_) -or -not $sourceNavigation.ContainsKey($_) -or $navigation[$_] -cne $sourceNavigation[$_] }).Count -ne 0 -or
+        $navigation.contractId -cne 'endfield.readonly-navigation@1' -or $navigation.baseCommit -cne $v2.commit -or
+        $navigation.taskSha256 -cne $v2.files['src/tasks/onetime/RewardStatusInspectionTask.py'] -or
+        $navigation.baseTaskSha256 -ceq $navigation.taskSha256) { return $false }
+    if ((Hash (Assert-LocalFile (Join-Path $Root 'readonly-navigation-overlay.zip') 'Endfield read-only navigation overlay')) -cne $navigation.overlaySha256) { return $false }
+    $entry = $v2.entry; $dependencies = $v2.dependencies; $limits = $v2.limits
+    if ($Policy.schemaVersion -ne 1 -or $v2.state -cne 'runtime-prepared-unbound' -or
+        $v2.protocol -cne 'endfield-reward-status@2' -or $v2.commit -cnotmatch '^[0-9a-f]{40}$' -or
+        $v2.officialBaseCommit -cnotmatch '^[0-9a-f]{40}$' -or
+        $SourceRecord.commit -cne $v2.commit -or $SourceRecord.officialBaseCommit -cne $v2.officialBaseCommit -or
+        $SourceRecord.repository -cne 'https://github.com/AliceJump/ok-end-field.git' -or
+        $dependencies.runtimePrepared -ne $true -or $dependencies.nativeOcrRuntimeAudited -ne $true -or
+        $entry.taskIndex -ne 36 -or $entry.taskIndexBase -ne 1 -or $entry.sourceEntry -cne 'main.py' -or
+        $entry.arguments -cne 'main.py --task 36 --exit' -or
+        $entry.taskClass -cne 'src.tasks.onetime.RewardStatusInspectionTask.RewardStatusInspectionTask' -or
+        $entry.config.Count -ne 1 -or $entry.config['日常奖励状态'] -ne $true -or
+        $limits.maxImages -ne 28 -or $limits.maxArtifacts -ne 29 -or
+        $limits.maxImageBytes -ne 20971520 -or $limits.maxTotalImageBytes -ne 134217728) { return $false }
+    $expected = @('main.py','src/config.py','src/tasks/onetime/RewardStatusInspectionTask.py',
+        'assets/reward_status_inspection.json','src/tasks/onetime/DailyRewardTask.py',
+        'src/core/base_mixin/game_flow_mixin.py','uv.lock')
+    if ($v2.files.Count -ne $expected.Count -or @($expected | Where-Object { -not $v2.files.ContainsKey($_) }).Count -ne 0) { return $false }
+    if ((Hash (Assert-LocalFile (Join-Path $Root 'official-source.zip') 'Endfield V2 inspection archive')) -cne $v2.sourceArchiveSha256) { return $false }
+    foreach ($name in $expected) {
+        $path = Assert-LocalFile (Join-Path $Working $name) 'Endfield V2 inspected source'
+        if ((Hash $path) -cne $v2.files[$name]) { throw 'Endfield V2 inspected source hash differs.' }
+    }
+    if ($v2.ContainsKey('battleFailureFiles')) {
+        $battleExpected = @('src/core/battle_outcome.py','src/tasks/onetime/AutoCombatLogic.py',
+            'src/tasks/onetime/BattleTask.py','src/tasks/mixin/battle_mixin.py',
+            'src/tasks/daily/daily_task_runner.py',
+            'assets/lang/battle_outcome.json','src/data/lang/_lang_typed.py')
+        if ($v2.battleFailureFiles -isnot [System.Collections.IDictionary] -or
+            $v2.battleFailureFiles.Count -ne $battleExpected.Count -or
+            @($battleExpected | Where-Object { -not $v2.battleFailureFiles.ContainsKey($_) }).Count -ne 0) { return $false }
+        foreach ($name in $battleExpected) {
+            $path = Assert-LocalFile (Join-Path $Working $name) 'Endfield battle failure boundary source'
+            if ((Hash $path) -cne $v2.battleFailureFiles[$name]) { throw 'Endfield battle failure boundary source hash differs.' }
+        }
+    }
+    return $true
+}
+
 $source = [IO.Path]::GetFullPath($SourceRoot)
 . (Join-Path $source 'adapter-host\Gf2SourceRegistry.ps1')
 . (Join-Path $source 'adapter-host\YeYuGamerPromotionContract.ps1')
+. (Join-Path $source 'scripts/ClaimPhasePackage.ps1')
+$claimPayload = Assert-YeYuGamerClaimPhasePayload -SourceRoot $source
 $runnerSource = Assert-LocalFile (Join-Path $source 'adapter-host\openkuro-runner\Program.cs') 'WW runner source'
 $consoleSource = Assert-LocalFile (Join-Path $source 'adapter-host\UpstreamConsoleCapture.cs') 'upstream console capture source'
 $siteCustomizeSource = Assert-LocalFile (Join-Path $source 'adapter-host\openkuro-runner\sitecustomize.py') 'OpenKuro observer bootstrap source'
@@ -41,15 +240,20 @@ $officialTaskExitSource = Assert-LocalFile (Join-Path $source 'adapter-host\open
 $officialStepCaptureSource = Assert-LocalFile (Join-Path $source 'adapter-host\openkuro-runner\OfficialStepCapture.py') 'official boundary screenshot source'
 $upstreamLoggingSource = Assert-LocalFile (Join-Path $source 'adapter-host\upstream_logging.py') 'Upstream logging observer source'
 $endfieldBridgeSource = Assert-LocalFile (Join-Path $source 'adapter-host\openkuro-runner\EndfieldYeYuBridge.py') 'Endfield YeYu bridge source'
+$endfieldBoatDiagnosticSource = Assert-LocalFile (Join-Path $source 'adapter-host\openkuro-runner\EndfieldBoatNativeDiagnostic.py') 'Endfield passive boat input diagnostic'
 $endfieldObserverSource = Assert-LocalFile (Join-Path $source 'adapter-host\openkuro-runner\EndfieldRewardStatusObserver.py') 'Endfield inspection observer source'
+$endfieldNaturalContract = Assert-LocalFile (Join-Path $source 'adapter-host\openkuro-runner\EndfieldNaturalContract.py') 'Endfield natural wire contract'
+$endfieldNaturalPolicy = Assert-LocalFile (Join-Path $source 'adapter-host\openkuro-runner\EndfieldNaturalSourceContract.json') 'Endfield natural source closure'
 $endfieldInspectionPolicySource = Assert-LocalFile (Join-Path $source 'adapter-host\openkuro-runner\EndfieldInspectionContract.json') 'Endfield inspection audit contract'
 $compiler = Assert-LocalFile $CSharpCompilerPath 'C# compiler'
 $tool = [IO.Path]::GetFullPath($ToolRoot)
 if ($tool.StartsWith('\\') -or -not (Test-Path -LiteralPath $tool -PathType Container)) { throw 'WW tool root is not a local directory.' }
 $wwCandidateManifestPath = Join-Path $tool 'WW\runtime-preparation.json'
+$wwInspectionPatch = $false
 $wwRewardInspectionPatch = $false
 $wwBattlePassInspectionPatch = $false
 $wwBattlePassHistoryPatch = $false
+$wwCurrentStatePatch = $false
 if (Test-Path -LiteralPath $wwCandidateManifestPath -PathType Leaf) {
     $wwCandidateManifest = Get-Content -LiteralPath (Assert-LocalFile $wwCandidateManifestPath 'WW official source candidate manifest') -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
     $wwCandidateSource = $wwCandidateManifest.source; $wwCandidateEntry = $wwCandidateManifest.entry
@@ -82,6 +286,28 @@ if (Test-Path -LiteralPath $wwCandidateManifestPath -PathType Leaf) {
          ($wwCandidateSource.commit -ceq '85e54379b3a6859f30f2a1df6326091f3a51929d' -and (Hash (Join-Path $wwWorking 'src\task\DailyTask.py')) -ceq 'facab02135deab404e7d59602655c91d915b7ef49a3f74506baf42332f524b5b')) -and
         (Hash (Join-Path $wwWorking 'src\task\MultiAccountDailyTask.py')) -ceq '5ccee3872e8190b94490d9b7329aee6920706d3ab79bef4923595217b54ec0ed' -and
         (Hash (Join-Path $wwWorking 'src\task\resources\daily_reward_claimed_check.png')) -ceq '57ef1470aaf2e9d8fb55773d06f14b693a076ea5dc668f685e09b3a83223fd3f'
+    $wwCohortPatch = $wwCandidateManifest.candidateKind -ceq 'isolated-local-ww-source-patch' -and
+        $wwCandidateSource.officialBaseCommit -ceq '6ffaa7f0b0b7f3140367de96c8eacba533c96894' -and
+        $wwCandidateSource.commit -ceq '6b6d876f370fd682c6bae54b5b134e7a6c414c10' -and
+        (Hash (Join-Path $wwWorking 'src/task/DailyTask.py')) -ceq 'facab02135deab404e7d59602655c91d915b7ef49a3f74506baf42332f524b5b' -and
+        (Hash (Join-Path $wwWorking 'src/task/MultiAccountDailyTask.py')) -ceq 'fb6c5783c97d182c1ae8b7dd059bdfe9976186bfe894dac15a1accf0fc9cb62b' -and
+        (Hash (Join-Path $wwWorking 'src/task/BaseCombatTask.py')) -ceq '7a1afca54a67279028aa8da143c39f1aebaf01b07b9b70fc95d2ce972d2d7d65' -and
+        (Hash (Join-Path $wwWorking 'src/task/resources/daily_reward_claimed_check.png')) -ceq '57ef1470aaf2e9d8fb55773d06f14b693a076ea5dc668f685e09b3a83223fd3f'
+    $wwCurrentStatePatch = $wwCandidateManifest.candidateKind -ceq 'isolated-local-ww-source-patch' -and
+        $wwCandidateSource.officialBaseCommit -ceq '6ffaa7f0b0b7f3140367de96c8eacba533c96894' -and
+        (Test-WwHardcapCohortSource $wwWorking $wwCandidateManifest) -and
+        (Hash (Join-Path $wwWorking 'src/task/StaminaBudget.py')) -ceq 'd9d6e44c6a25be00069873779f50b1db7c6747dd62a98d00d949dba1cb5f7ccf' -and
+        (Hash (Join-Path $wwWorking 'src/task/MultiAccountDailyTask.py')) -cin @('7d2c193e8c978014977b653457e689766e1cc444d43bd9609b73e1e5deaceac3', 'ddb61a0e23c72c54d0690ef15e71adefa0263c75afbfde1493cb74266a1d299d', 'd7430d3fc268c7abd473ba1cecf46da904714928087be97be37d06d3dd7446af', '890d2fe4eea471cc54ae651da6545d27e079db289875eee77833ae37061ed9a6', '34f0b3e96102fdddf4610fa7de3ff6e56acd24ee438d84c2e7a7062738cb7fff') -and
+        (Hash (Join-Path $wwWorking 'src/task/BaseWWTask.py')) -ceq '88969a22399518128bb9e67e5c7356305dc3eecfd1cb4bd9defe3d67e9598006' -and
+        (Hash (Join-Path $wwWorking 'src/task/DomainTask.py')) -ceq '14d553b5547dfaab3cb8fa70734ae4a9701b35484a03b2ff39bdd286699adb44' -and
+        (Hash (Join-Path $wwWorking 'src/task/TacetTask.py')) -ceq '7625dd0e8420c9ad0a41ac7dc150be277f58f1f8dd3b4b0d106c1353a3f24d36' -and
+        (Hash (Join-Path $wwWorking 'src/task/ForgeryTask.py')) -ceq 'e26b2000c90ed398a9aff30505996b0ef6e7a0395b3499536de7391e476df99e' -and
+        (Hash (Join-Path $wwWorking 'src/task/SimulationTask.py')) -ceq '74d09e0893803aedc999fe5368bf258e09ae8e340b4a78a3a900ed67bc4460af' -and
+        (Hash (Join-Path $wwWorking 'src/task/BaseCombatTask.py')) -cin @('eb452b6e28d80539617af069e579f47791b206932dd4d183b72e3cdb7f95da51', '2da3a6212b94fc7d851721e5a98987784cc114d0809e4ec1c5822901a31837e9') -and
+        (Hash (Join-Path $wwWorking 'src/task/resources/daily_reward_claimed_check.png')) -ceq '57ef1470aaf2e9d8fb55773d06f14b693a076ea5dc668f685e09b3a83223fd3f' -and
+        $true
+    $wwCohortPatch = $wwCohortPatch -or $wwCurrentStatePatch
+    $wwBattlePassHistoryPatch = $wwBattlePassHistoryPatch -or $wwCohortPatch -or $wwCurrentStatePatch
     if ($wwBattlePassHistoryPatch) {
         $wwSdk = $wwCandidateManifest.sdkSourcePatch
         $wwSdkFile = Assert-LocalFile (Join-Path $tool 'r\Lib\site-packages\ok\device\capture_methods\windows_graphics.py') 'WW audited SDK capture source'
@@ -111,6 +337,8 @@ if (Test-Path -LiteralPath $wwCandidateManifestPath -PathType Leaf) {
 }
 $game = Assert-LocalFile $GamePath 'WW game executable'
 $endfieldTool = Assert-LocalDirectory $EndfieldToolRoot 'Endfield tool root'
+$endfieldRewardInspectionV2 = $false
+$endfieldNaturalPatch = $false
 $endfieldCandidateManifestPath = Join-Path $endfieldTool 'Endfield\runtime-preparation.json'
 if (Test-Path -LiteralPath $endfieldCandidateManifestPath -PathType Leaf) {
     $endfieldCandidateManifest = Get-Content -LiteralPath (Assert-LocalFile $endfieldCandidateManifestPath 'Endfield official source candidate manifest') -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
@@ -120,8 +348,12 @@ if (Test-Path -LiteralPath $endfieldCandidateManifestPath -PathType Leaf) {
     $endfieldPython = Assert-LocalFile (Join-Path $endfieldTool 'r\Scripts\pythonw.exe') 'Endfield official candidate Python runtime'
     $endfieldMain = Assert-LocalFile (Join-Path $endfieldWorking 'main.py') 'Endfield official candidate GUI entry'
     $endfieldDailyConfig = Assert-LocalFile (Join-Path $endfieldWorking 'configs\DailyTask.json') 'Endfield official candidate daily configuration'
+    $endfieldNaturalPatch = Test-EndfieldNaturalSource $endfieldTool $endfieldWorking $endfieldNaturalPolicy
     $endfieldLocalPatch = $endfieldCandidateManifest.candidateKind -ceq 'isolated-local-source-patch-with-formal-runtime-binding' -and
-        (($endfieldCandidateSource.commit -ceq 'ec5058f90b91f816201227cd66b75770422c7c67' -and
+        (($endfieldCandidateSource.commit -ceq '36bdd0af4c4fa61e166678e65106078598e575de' -and
+          $endfieldCandidateSource.officialBaseCommit -ceq '889b89ea57e4850d42c2016139cac2e6fd15ba44' -and
+          $endfieldCandidateSource.keyFileSha256.gameFlow -ceq 'abec4b14743125f7e68a1eb2c9428d447f22c88b9c3a53a10c90713705d5fe8f') -or
+         ($endfieldCandidateSource.commit -ceq 'ec5058f90b91f816201227cd66b75770422c7c67' -and
           $endfieldCandidateSource.officialBaseCommit -ceq '34626b32e5cf5f8a7039b0d10c898169a5c421d6') -or
          ($endfieldCandidateSource.commit -ceq '194b7c94f2e29980667c41a1b16df0556cacd6be' -and
           $endfieldCandidateSource.officialBaseCommit -ceq 'bb5af7df07297fdb6edfc483cedd7167840d5e82') -or
@@ -153,8 +385,11 @@ if (Test-Path -LiteralPath $endfieldCandidateManifestPath -PathType Leaf) {
             if ((Hash $inspectionPath) -cne $inspectionFile.Value) { throw 'Endfield inspected source hash differs.' }
         }
     }
+    $endfieldRewardInspectionV2 = $endfieldCandidateManifest.candidateKind -ceq 'isolated-local-source-patch-with-formal-runtime-binding' -and
+        (Test-EndfieldInspectionV2Source $endfieldTool $endfieldWorking $endfieldCandidateSource $inspectionPolicy)
+    $endfieldRewardInspectionPatch = $endfieldRewardInspectionPatch -or $endfieldRewardInspectionV2
     if ($endfieldCandidateManifest.schemaVersion -ne 1 -or $endfieldCandidateManifest.status -cne 'read-only-import-ready' -or
-        (-not ($endfieldOfficialSource -or $endfieldLocalPatch -or $endfieldRewardInspectionPatch)) -or
+        (-not ($endfieldOfficialSource -or $endfieldLocalPatch -or $endfieldRewardInspectionPatch -or $endfieldNaturalPatch)) -or
         $endfieldCandidateSource.repository -cne 'https://github.com/AliceJump/ok-end-field.git' -or
         $endfieldCandidateSource.sourceDirectory -cne 'Endfield/source' -or
         $endfieldCandidateEntry.sourceEntry -cne 'main.py' -or $endfieldCandidateEntry.arguments -cne 'main.py --task 1 --exit' -or
@@ -235,7 +470,7 @@ $candidate = Join-Path $build 'local-daily-candidate'
 if (Test-Path -LiteralPath $candidate) { Move-Item -LiteralPath $candidate -Destination (Join-Path $build ('local-daily-candidate.previous-' + [DateTimeOffset]::UtcNow.ToString('yyyyMMddHHmmss'))) }
 New-Item -ItemType Directory -Path $candidate -Force | Out-Null
 $runner = Join-Path $candidate 'runner.exe'
-& $compiler /nologo /codepage:65001 /target:exe /optimize+ /platform:anycpu /r:System.Web.Extensions.dll /r:System.Drawing.dll ("/out:$runner") $runnerSource $consoleSource
+& $compiler /nologo /codepage:65001 /target:exe /optimize+ /platform:anycpu /r:System.Web.Extensions.dll /r:System.Drawing.dll ("/out:$runner") $runnerSource $consoleSource $claimPayload.CSharpSource (Join-Path $source 'adapter-host/shared/WwAccountScope.cs') (Join-Path $source 'adapter-host/shared/EndfieldNaturalContinuation.cs')
 if ($LASTEXITCODE -ne 0) { throw 'WW runner compilation failed.' }
 $siteCustomize = Join-Path $candidate 'sitecustomize.py'
 Copy-Item -LiteralPath $siteCustomizeSource -Destination $siteCustomize
@@ -250,7 +485,11 @@ Copy-Item -LiteralPath $officialStepCaptureSource -Destination $officialStepCapt
 $upstreamLogging = Join-Path $candidate 'upstream_logging.py'
 Copy-Item -LiteralPath $upstreamLoggingSource -Destination $upstreamLogging
 $endfieldBridge = Join-Path $candidate 'EndfieldYeYuBridge.py'
+Copy-Item -LiteralPath $endfieldBoatDiagnosticSource -Destination (Join-Path $candidate 'EndfieldBoatNativeDiagnostic.py')
 Copy-Item -LiteralPath $endfieldObserverSource -Destination (Join-Path $candidate 'EndfieldRewardStatusObserver.py')
+Copy-Item -LiteralPath (Join-Path $source 'backend/yeyu_gamer_manager/services/endfield_image_bundle.py') -Destination (Join-Path $candidate 'EndfieldImageBundle.py')
+Copy-Item -LiteralPath $endfieldNaturalContract -Destination (Join-Path $candidate 'EndfieldNaturalContract.py')
+Copy-Item -LiteralPath $endfieldNaturalPolicy -Destination (Join-Path $candidate 'EndfieldNaturalSourceContract.json')
 Copy-Item -LiteralPath $endfieldInspectionPolicySource -Destination (Join-Path $candidate 'EndfieldInspectionContract.json')
 Copy-Item -LiteralPath $endfieldBridgeSource -Destination $endfieldBridge
 $binding = [ordered]@{ schemaVersion = 2; tools = [ordered]@{
@@ -262,6 +501,18 @@ $bindingPath = Join-Path $candidate 'tool-binding.json'
 [IO.File]::WriteAllText($bindingPath, ($binding | ConvertTo-Json -Depth 6 -Compress), [Text.UTF8Encoding]::new($false))
 $operation = { param($id,$class,$definition,$timeout,$evidenceKinds=@('tool-log-outcome')) $handlerId = if ($id -ceq 'ww.daily_task') { 'ww.account_daily_task' } else { $id }; [ordered]@{ handlerId=$handlerId; mode='granular'; actionClass=$class; risk='routine_action'; todoDefinitionIds=@($definition); adapterCapabilityRefs=@('game.daily.run@1.0'); supportsResume=$false; timeoutSeconds=$timeout; requiredEvidenceKinds=@($evidenceKinds) } }
 $manifest = [ordered]@{ schemaVersion=2; packageId='legacy-night-rain-gamer'; packageVersion=$PackageVersion; buildId=('local-daily-'+[DateTimeOffset]::UtcNow.ToString('yyyyMMddHHmmss')); builtAt=[DateTimeOffset]::UtcNow.ToString('o'); installedAt=[DateTimeOffset]::UtcNow.ToString('o'); protocolVersions=@('1.1'); hostPackageId='manager-adapter-host'; minHostVersion='0.2.0'; entryPoint='runner.exe'; files=@([ordered]@{path='runner.exe';sha256=(Hash $runner);sizeBytes=(Get-Item -LiteralPath $runner).Length},[ordered]@{path='EndfieldYeYuBridge.py';sha256=(Hash $endfieldBridge);sizeBytes=(Get-Item -LiteralPath $endfieldBridge).Length},[ordered]@{path='tool-binding.json';sha256=(Hash $bindingPath);sizeBytes=(Get-Item -LiteralPath $bindingPath).Length}); supportedGameIds=@('WW','Endfield','GF2'); operationBindings=[ordered]@{ WW=[ordered]@{ 'attach-world'=(& $operation 'ww.daily_task' 'session' 'todo.v1.ww.daily.attach-world' 1800); 'inspect-daily-progress'=(& $operation 'ww.daily_task' 'daily' 'todo.v1.ww.daily.inspect-daily-progress' 1800); 'farm-nightmare-daily-echo'=(& $operation 'ww.daily_task' 'daily' 'todo.v1.ww.daily.farm-nightmare-daily-echo' 1800); 'spend-waveplates'=(& $operation 'ww.daily_task' 'stamina' 'todo.v1.ww.daily.spend-waveplates' 1800); 'claim-daily-reward'=(& $operation 'ww.daily_task' 'reward' 'todo.v1.ww.daily.claim-daily-reward' 1800); 'claim-mail'=(& $operation 'ww.daily_task' 'mail' 'todo.v1.ww.daily.claim-mail' 1800); 'claim-battle-pass'=(& $operation 'ww.daily_task' 'reward' 'todo.v1.ww.daily.claim-battle-pass' 1800) }; Endfield=[ordered]@{ 'attach-world'=(& $operation 'endfield.attach_world' 'session' 'todo.v1.endfield.daily.attach-world' 1800); 'mail'=(& $operation 'endfield.daily_task' 'daily' 'todo.v1.endfield.daily.mail' 1800); 'spend-sanity'=(& $operation 'endfield.daily_task' 'stamina' 'todo.v1.endfield.daily.spend-sanity' 1800); 'delivery-commission'=(& $operation 'endfield.daily_task' 'daily' 'todo.v1.endfield.daily.delivery-commission' 1800); 'collect-credit'=(& $operation 'endfield.daily_task' 'daily' 'todo.v1.endfield.daily.collect-credit' 1800); 'dijiang-harvest'=(& $operation 'endfield.daily_task' 'daily' 'todo.v1.endfield.daily.dijiang-harvest' 1800); 'claim-daily-reward'=(& $operation 'endfield.daily_task' 'reward' 'todo.v1.endfield.daily.claim-daily-reward' 1800) }; GF2=[ordered]@{ 'attach-home'=(& $operation 'gf2.attach_home' 'session' 'todo.v1.gf2.daily.attach-home' 1800); 'mail'=(& $operation 'gf2.daily_task' 'daily' 'todo.v1.gf2.daily.mail' 1800); 'activity-supply'=(& $operation 'gf2.daily_task' 'daily' 'todo.v1.gf2.daily.activity-supply' 1800); 'star-wish'=(& $operation 'gf2.daily_task' 'daily' 'todo.v1.gf2.daily.star-wish' 1800); 'event-battle'=(& $operation 'gf2.daily_task' 'daily' 'todo.v1.gf2.daily.event-battle' 1800); 'exploration-claim'=(& $operation 'gf2.daily_task' 'daily' 'todo.v1.gf2.daily.exploration-claim' 1800); 'public-area-dispatch'=(& $operation 'gf2.daily_task' 'daily' 'todo.v1.gf2.daily.public-area-dispatch' 1800); 'spend-stamina'=(& $operation 'gf2.daily_task' 'stamina' 'todo.v1.gf2.daily.spend-stamina' 1800); 'squad-tasks'=(& $operation 'gf2.daily_task' 'daily' 'todo.v1.gf2.daily.squad-tasks' 1800); 'claim-daily-missions'=(& $operation 'gf2.daily_task' 'reward' 'todo.v1.gf2.daily.claim-daily-missions' 1800); 'battle-pass-free-track'=(& $operation 'gf2.daily_task' 'reward' 'todo.v1.gf2.daily.battle-pass-free-track' 1800) } }; forbiddenOperationClasses=@('gacha','purchase','dismantle','enhance','trade','account_settings','pvp','irreversible_choice','arbitrary_command','arbitrary_path','arbitrary_input'); limits=[ordered]@{maxRequestBytes=262144;maxEventBytes=65536;maxArtifactsPerTodo=32}; artifactPolicy=[ordered]@{allowedMimeTypes=@('text/plain','image/png');maxArtifactBytes=20971520}; security=[ordered]@{allowsArbitraryCommand=$false;allowsArbitraryPath=$false;allowsArbitraryInput=$false}; promotion=[ordered]@{status='candidate';replaySuiteDigest='sha256:'+('0'*64);shadowSuiteDigest='sha256:'+('0'*64);canarySuiteDigest='sha256:'+('0'*64);payloadDigest='';receiptFile='';receiptSha256='';receiptResourceId=''}; executionReady=$false }
+$manifest.operationBindings.Endfield.'spend-sanity'.adapterCapabilityRefs += @('endfield.natural-sanity.observe@1.0','endfield.natural-sanity.consume-once@1.0')
+$manifest.operationBindings.Endfield.'claim-daily-reward'.adapterCapabilityRefs += @('endfield.daily.current-status@1.0','endfield.daily.current-claim-once@1.0')
+# Natural inspection preserves all PNG bytes in bounded bundles. Main's 32-artifact cap stays unchanged.
+if ($wwCurrentStatePatch) {
+    $manifest.operationBindings.WW.'inspect-daily-progress'.adapterCapabilityRefs += 'ww.current-state.inspect@1.0'
+}
+if ($endfieldRewardInspectionV2) {
+    $manifest.operationBindings.Endfield.'claim-daily-reward'.adapterCapabilityRefs += 'endfield.daily.reward-status.inspect@2.1'
+}
+if ($wwInspectionPatch) {
+    $manifest.operationBindings.WW.'inspect-daily-progress'.adapterCapabilityRefs += 'ww.daily.progress.inspect@1.0'
+}
 if ($wwRewardInspectionPatch) {
     $manifest.operationBindings.WW.'claim-daily-reward'.adapterCapabilityRefs += 'ww.daily.reward-status.inspect@1.0'
 }
@@ -285,10 +536,11 @@ $manifest.files += [ordered]@{path='gf2-source-candidates.json';sha256=(Hash $gf
 $manifest.files += [ordered]@{path='upstream_logging.py';sha256=(Hash $upstreamLogging);sizeBytes=(Get-Item -LiteralPath $upstreamLogging).Length}
 $manifest.files += [ordered]@{path='OfficialTaskExit.py';sha256=(Hash $officialTaskExit);sizeBytes=(Get-Item -LiteralPath $officialTaskExit).Length}
 $manifest.files += [ordered]@{path='OfficialStepCapture.py';sha256=(Hash $officialStepCapture);sizeBytes=(Get-Item -LiteralPath $officialStepCapture).Length}
-foreach ($inspectionPayload in @('EndfieldRewardStatusObserver.py','EndfieldInspectionContract.json')) {
+foreach ($inspectionPayload in @('EndfieldImageBundle.py','EndfieldRewardStatusObserver.py','EndfieldInspectionContract.json','EndfieldBoatNativeDiagnostic.py','EndfieldNaturalContract.py','EndfieldNaturalSourceContract.json')) {
     $inspectionPayloadPath = Join-Path $candidate $inspectionPayload
     $manifest.files += [ordered]@{path=$inspectionPayload;sha256=(Hash $inspectionPayloadPath);sizeBytes=(Get-Item -LiteralPath $inspectionPayloadPath).Length}
 }
+$manifest.files += @(Copy-YeYuGamerClaimPhasePayload -Payload $claimPayload -Destination $candidate)
 $manifest.promotion.payloadDigest = Get-YeYuGamerPayloadDigest -Files @($manifest.files)
 [IO.File]::WriteAllText((Join-Path $candidate 'install-manifest.json'), ($manifest | ConvertTo-Json -Depth 12 -Compress), [Text.UTF8Encoding]::new($false))
 [pscustomobject]@{status='candidate-built';candidateRoot=$candidate;gameIds=@('WW','Endfield','GF2');executionReady=$false;gameStarted=$false;validatedToolPaths=@($endfieldLauncher,$endfieldUpdateState,$endfieldPython,$endfieldMain,$endfieldDailyConfig,$endfieldGame,$gf2Launcher,$gf2Python,$gf2Main,$gf2DailyConfig,$gf2Cli,$gf2Game | Where-Object { $_ })} | ConvertTo-Json -Compress

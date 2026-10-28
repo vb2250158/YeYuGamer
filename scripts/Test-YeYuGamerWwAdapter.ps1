@@ -179,12 +179,49 @@ try {
     $endfieldOfficialSource = Split-Path -Parent ([string]$toolBinding.tools.Endfield.guiEntry)
     & $PythonPath -X utf8 -m unittest discover -s (Join-Path $source 'adapter-host\tests') -p 'test_endfield_reward_status_observer.py' -v
     if ($LASTEXITCODE -ne 0) { throw 'Endfield reward inspection observation changed an official result or input.' }
-    if (Test-Path -LiteralPath (Join-Path $endfieldOfficialSource 'src\tasks\onetime\RewardStatusInspectionTask.py')) {
+    # Inspection integrity checks the audited EndfieldInspectionContract tip, not
+    # merely RewardStatusInspectionTask.py presence (natural tips may carry the
+    # file without matching the contract commit/archive/files).
+    $endfieldInspectionPolicyPath = Join-Path $source 'adapter-host\openkuro-runner\EndfieldInspectionContract.json'
+    $endfieldInspectionRoot = $null
+    if (Test-Path -LiteralPath $endfieldInspectionPolicyPath -PathType Leaf) {
+        $endfieldInspectionPolicy = Get-Content -LiteralPath $endfieldInspectionPolicyPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $boundEndfieldRoot = [string]$toolBinding.tools.Endfield.root
+        $boundPrep = Join-Path $boundEndfieldRoot 'Endfield\runtime-preparation.json'
+        if ((Test-Path -LiteralPath $boundPrep -PathType Leaf)) {
+            $boundSource = (Get-Content -LiteralPath $boundPrep -Raw -Encoding UTF8 | ConvertFrom-Json).source
+            if ([string]$boundSource.commit -ceq [string]$endfieldInspectionPolicy.commit -and
+                [string]$boundSource.officialBaseCommit -ceq [string]$endfieldInspectionPolicy.officialBaseCommit -and
+                [string]$boundSource.repository -ceq [string]$endfieldInspectionPolicy.repository) {
+                $endfieldInspectionRoot = $boundEndfieldRoot
+            }
+        }
+        if (-not $endfieldInspectionRoot) {
+            $candidatesRoot = Join-Path $source '.cache\upstream-candidates'
+            if (Test-Path -LiteralPath $candidatesRoot -PathType Container) {
+                foreach ($dir in @(Get-ChildItem -LiteralPath $candidatesRoot -Directory -ErrorAction SilentlyContinue)) {
+                    $prep = Join-Path $dir.FullName 'Endfield\runtime-preparation.json'
+                    if (-not (Test-Path -LiteralPath $prep -PathType Leaf)) { continue }
+                    $srcRec = (Get-Content -LiteralPath $prep -Raw -Encoding UTF8 | ConvertFrom-Json).source
+                    if ([string]$srcRec.commit -ceq [string]$endfieldInspectionPolicy.commit -and
+                        [string]$srcRec.officialBaseCommit -ceq [string]$endfieldInspectionPolicy.officialBaseCommit -and
+                        [string]$srcRec.repository -ceq [string]$endfieldInspectionPolicy.repository -and
+                        (Test-Path -LiteralPath (Join-Path $dir.FullName 'Endfield\source\src\tasks\onetime\RewardStatusInspectionTask.py') -PathType Leaf)) {
+                        $endfieldInspectionRoot = $dir.FullName
+                        break
+                    }
+                }
+            }
+        }
+    }
+    if ($endfieldInspectionRoot) {
         $inspectionReplay = Join-Path $endfieldReplayRoot 'endfield-inspection-replay.exe'
         & $compiler /nologo /codepage:65001 /target:exe /r:System.Web.Extensions.dll ("/out:$inspectionReplay") (Join-Path $source 'adapter-host\tests\EndfieldRewardInspectionReplay.cs') | Out-Null
         if ($LASTEXITCODE -ne 0) { throw 'Endfield inspection replay compilation failed.' }
-        & $inspectionReplay $runner ([string]$toolBinding.tools.Endfield.root)
+        & $inspectionReplay $runner $endfieldInspectionRoot
         if ($LASTEXITCODE -ne 0) { throw 'Endfield inspection fixed source or scope replay failed.' }
+    } elseif (Test-Path -LiteralPath (Join-Path $endfieldOfficialSource 'src\tasks\onetime\RewardStatusInspectionTask.py')) {
+        throw 'Endfield inspection task is present on the bound source but no EndfieldInspectionContract-matching candidate root was resolved.'
     }
     if (Test-Path -LiteralPath (Join-Path $endfieldOfficialSource 'src\tasks\daily\daily_feature.py')) {
         $splitReplay = Join-Path $endfieldReplayRoot 'endfield-split-config-replay.exe'

@@ -1078,6 +1078,13 @@ namespace YeYuGamer.LocalDailyAdapter
                 Hash(Path.Combine(expectedWorking, "src", "task", "MultiAccountDailyTask.py")) == "5ccee3872e8190b94490d9b7329aee6920706d3ab79bef4923595217b54ec0ed" &&
                 Hash(Path.Combine(expectedWorking, "src", "task", "resources", "daily_reward_claimed_check.png")) == "57ef1470aaf2e9d8fb55773d06f14b693a076ea5dc668f685e09b3a83223fd3f" &&
                 IsAuditedWwCaptureSdkPatch(candidateRoot, record);
+            bool currentStatePatch = record != null && source != null &&
+                IsWwHardcapCohortSource(expectedWorking, record) &&
+                (record["candidateKind"] as string) == "isolated-local-ww-source-patch" &&
+                source.ContainsKey("officialBaseCommit") &&
+                (source["officialBaseCommit"] as string) == "6ffaa7f0b0b7f3140367de96c8eacba533c96894";
+            // Audited hardcap trees retain the ordinary ordered cohort entry (88a67 only; ban 7237).
+            battlePassHistoryPatch = battlePassHistoryPatch || currentStatePatch;
             battlePassInspectionPatch = battlePassInspectionPatch || battlePassHistoryPatch;
             bool localPatch = inspectionPatch || rewardInspectionPatch || battlePassInspectionPatch || (record != null && source != null && (record["candidateKind"] as string) == "isolated-local-ww-source-patch" &&
                 new[] { "20a2d40d0eaa0cfa053ceafecd9a4d04395291f4", "737c89ef00e36248baa0ab92df248af935528b56", "4a1b39d002c5754557bdc7b30782fad0048cd106", "567e71c93c32f03a7bd3ad013205438c0adcba11" }.Contains(source["commit"] as string) && source.ContainsKey("officialBaseCommit") &&
@@ -1095,6 +1102,151 @@ namespace YeYuGamer.LocalDailyAdapter
             binding.InnerEntry = expectedMain;
             return binding;
         }
+private static bool IsWwHardcapCohortSource(string working, IDictionary<string, object> record) {
+            try {
+                var source = record["source"] as IDictionary<string, object>;
+                var templates = record["templates"] as IDictionary<string, object>;
+            string commit = source == null ? null : source["commit"] as string;
+            string dailyHash = Hash(Path.Combine(working, "src", "task", "DailyTask.py"));
+            string sourceIndex = commit == "e28a46f93972c4fa1894f82f5fe788e7816fcd45" && dailyHash == "2a452cd3cbefa5347416e903e536019726449373c8ed260cebeac9b1f4691c17" ?
+                "2ae25602430834af0ed93e8d9ca7731efa4524b68a039e120779f5dcbfa9aae9" :
+                commit == "ca8dd9b96f1ecf0c5e02e61c9ef4a3ed60d9776a" && dailyHash == "51337ab585f5c56a1063d75544756f8a699afbbd553f4434f231cb80e2d062df" ?
+                "11bd003986977de6099796a63b6379132d59b2637a546734b07fe48695383aad" :
+                commit == "814eddb3e1acd05bc06f7fad212214e6d872a668" && dailyHash == "51337ab585f5c56a1063d75544756f8a699afbbd553f4434f231cb80e2d062df" ?
+                "2688e7a8312fbccc20a07ec319631e1085763906d927de4580d13d9328aa6973" :
+                commit == "6c5938976094c7423de808d7ce323df2cc39c2d3" && dailyHash == "51337ab585f5c56a1063d75544756f8a699afbbd553f4434f231cb80e2d062df" ?
+                "60d11cd8fe15719fcacbd42729eb8c9cb180e187afb1c7be4847470b164d86f6" :
+                commit == "20d2a0fbd5cbe257d80cc2de5f70d369ba25d07f" && dailyHash == "51337ab585f5c56a1063d75544756f8a699afbbd553f4434f231cb80e2d062df" ?
+                "8269e9e4e0499ef895213998c9fe45319efc103e42b2a084ea7aeecca79b0aaa" :
+                commit == "88a67e6a1719315954f5120aaf9d6a7819b28d78" && dailyHash == "b1966a153c49f718f42a157de81431ec10d2f9de16427b72974106fe987a3041" ?
+                "351acc3af398c0e118b2e57649ea45343cd1901855ab0934c4b1fe2dcf7eca99" : null;
+            if (sourceIndex == null) return false;
+            int sourceCount = commit == "88a67e6a1719315954f5120aaf9d6a7819b28d78" ? 316 : (commit == "20d2a0fbd5cbe257d80cc2de5f70d369ba25d07f" ? 304 : 303);
+                return source != null && templates != null &&
+                    (!new[] { "ca8dd9b96f1ecf0c5e02e61c9ef4a3ed60d9776a", "814eddb3e1acd05bc06f7fad212214e6d872a668", "6c5938976094c7423de808d7ce323df2cc39c2d3", "20d2a0fbd5cbe257d80cc2de5f70d369ba25d07f", "88a67e6a1719315954f5120aaf9d6a7819b28d78" }.Contains(commit) ||
+                        IsAuditedWwOcrCachePatch(Path.GetDirectoryName(Path.GetDirectoryName(working)))) &&
+                    (templates["repository"] as string) == "https://github.com/ok-oldking/ok-wuthering-waves-coco-labeling.git" &&
+                    (templates["commit"] as string) == "438526eafcf4b1caf78c1dea68ef36b42e81e3c4" &&
+                    (templates["directory"] as string) == "WW/source/ok_templates" &&
+                    AuditedWwBlobTree(working, source["blobs"] as object[], sourceCount,
+                        sourceIndex, true) &&
+                    AuditedWwBlobTree(Path.Combine(working, "ok_templates"), templates["blobs"] as object[], 165,
+                        "ca1d7d95b077c5517d5b6d515d35200ccb42e043aa333a18fd5421fae358b001", false);
+            } catch { return false; }
+        }
+
+private static bool AuditedWwBlobTree(string root, object[] rows, int count, string expectedDigest, bool source) {
+            if (rows == null || rows.Length != count) return false;
+            root = Path.GetFullPath(root);
+            for (var parent = new DirectoryInfo(root); parent != null; parent = parent.Parent)
+                if ((parent.Attributes & FileAttributes.ReparsePoint) != 0) return false;
+            var files = new SortedDictionary<string, string>(StringComparer.Ordinal);
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var raw in rows) {
+                var row = raw as IDictionary<string, object>;
+                if (row == null || row.Count != 2 || !row.ContainsKey("path") || !row.ContainsKey("gitBlobSha1")) return false;
+                string path = row["path"] as string, blob = row["gitBlobSha1"] as string;
+                if (String.IsNullOrEmpty(path) || path.Any(Char.IsControl) || path.Contains('\\') || path.Contains(':') ||
+                    Path.IsPathRooted(path) || path.Split('/').Any(p => p.Length == 0 || p == "." || p == "..") ||
+                    !Regex.IsMatch(blob ?? "", "\\A[0-9a-f]{40}\\z") || !names.Add(path)) return false;
+                files.Add(path, blob);
+            }
+            string index = String.Concat(files.Select(p => p.Key + "\0" + p.Value + "\n"));
+            using (var digest = SHA256.Create())
+                if (BitConverter.ToString(digest.ComputeHash(Encoding.UTF8.GetBytes(index))).Replace("-", "").ToLowerInvariant() != expectedDigest) return false;
+            if (!WwBlobInventory(root, source).SetEquals(names)) return false;
+            var stamps = new List<Tuple<string, long, DateTime>>();
+            long bytes = 0;
+            foreach (var row in files) {
+                string path = Path.Combine(root, row.Key.Replace('/', Path.DirectorySeparatorChar));
+                for (var parent = new DirectoryInfo(Path.GetDirectoryName(path)); parent != null; parent = parent.Parent) {
+                    if ((parent.Attributes & FileAttributes.ReparsePoint) != 0) return false;
+                    if (String.Equals(parent.FullName, root, StringComparison.OrdinalIgnoreCase)) break;
+                }
+                var before = new FileInfo(path);
+                if (!before.Exists || (before.Attributes & FileAttributes.ReparsePoint) != 0 || before.Length > 256L * 1024 * 1024 ||
+                    (bytes += before.Length) > 1024L * 1024 * 1024) return false;
+                long size = before.Length; DateTime modified = before.LastWriteTimeUtc;
+                using (var hash = SHA1.Create()) using (var stream = File.OpenRead(path)) {
+                    byte[] header = Encoding.ASCII.GetBytes("blob " + size.ToString(CultureInfo.InvariantCulture) + "\0");
+                    hash.TransformBlock(header, 0, header.Length, header, 0);
+                    byte[] buffer = new byte[65536]; int read;
+                    while ((read = stream.Read(buffer, 0, buffer.Length)) != 0) hash.TransformBlock(buffer, 0, read, buffer, 0);
+                    hash.TransformFinalBlock(new byte[0], 0, 0);
+                    if (BitConverter.ToString(hash.Hash).Replace("-", "").ToLowerInvariant() != row.Value) return false;
+                }
+                var after = new FileInfo(path);
+                if (after.Length != size || after.LastWriteTimeUtc != modified || (after.Attributes & FileAttributes.ReparsePoint) != 0) return false;
+                stamps.Add(Tuple.Create(path, size, modified));
+            }
+            return WwBlobInventory(root, source).SetEquals(names) && stamps.All(stamp => {
+                var file = new FileInfo(stamp.Item1);
+                return file.Exists && file.Length == stamp.Item2 && file.LastWriteTimeUtc == stamp.Item3 &&
+                    (file.Attributes & FileAttributes.ReparsePoint) == 0;
+            });
+        }
+
+private static HashSet<string> WwBlobInventory(string root, bool source) {
+            var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var pending = new Stack<string>(); pending.Push(root); int entries = 0;
+            while (pending.Count != 0) {
+                string directory = pending.Pop();
+                foreach (string path in Directory.EnumerateFileSystemEntries(directory)) {
+                    if (++entries > 20000) throw new InvalidDataException("ww_source_inventory_bound");
+                    var attributes = File.GetAttributes(path);
+                    if ((attributes & FileAttributes.ReparsePoint) != 0) throw new InvalidDataException("ww_source_reparse");
+                    string relative = path.Substring(root.Length + 1).Replace('\\', '/');
+                    // Runtime configuration/output is not source; templates have
+                    // their own complete fixed tree, checked separately.
+                    if (relative == ".git" || (source && new[] {"configs", "logs", "screenshots", "screenshot", "ok_templates"}.Contains(relative))) continue;
+                    if ((attributes & FileAttributes.Directory) != 0) pending.Push(path);
+                    else if (!result.Add(relative)) throw new InvalidDataException("ww_source_case_alias");
+                }
+            }
+            return result;
+        }
+
+private static void AssertWwOcrPathNoLinks(string path) {
+            for (string part = Path.GetFullPath(path); !String.IsNullOrEmpty(part); part = Path.GetDirectoryName(part)) {
+                FileAttributes attributes;
+                try { attributes = File.GetAttributes(part); }
+                catch (FileNotFoundException) { continue; }
+                catch (DirectoryNotFoundException) { continue; }
+                if ((attributes & FileAttributes.ReparsePoint) != 0) throw new InvalidOperationException("ww_ocr_cache_redirected_path");
+            }
+        }
+
+private static string GetWwOcrCacheDirectory(string root) {
+            string path = Path.Combine(Path.GetFullPath(root), "mutable", "onnxocr");
+            AssertWwOcrPathNoLinks(path);
+            if (File.Exists(path) || File.Exists(Path.GetDirectoryName(path))) throw new InvalidOperationException("ww_ocr_cache_not_directory");
+            return path;
+        }
+
+private static bool IsAuditedWwOcrCachePatch(string root) {
+            try {
+                string path = Path.Combine(root, "WW", "runtime-requalification-ocr-cache.json");
+                string predict = Path.Combine(root, "r", "Lib", "site-packages", "onnxocr", "predict_base.py");
+                string record = Path.Combine(root, "r", "Lib", "site-packages", "onnxocr_ppocrv5-0.0.22.dist-info", "RECORD");
+                AssertWwOcrPathNoLinks(path); AssertWwOcrPathNoLinks(predict); AssertWwOcrPathNoLinks(record);
+                GetWwOcrCacheDirectory(root);
+                if (!File.Exists(path) || new FileInfo(path).Length > 128 * 1024) return false;
+                var receipt = Json.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as IDictionary<string, object>;
+                return receipt != null && NumberEquals(receipt["schemaVersion"], 1) &&
+                    (receipt["status"] as string) == "runtime-files-requalified" &&
+                    String.Equals(receipt["runtimeRoot"] as string, Path.GetFullPath(root), StringComparison.OrdinalIgnoreCase) &&
+                    (receipt["parentManifestSha256"] as string) == Hash(Path.Combine(root, "WW", "runtime-preparation.json")) &&
+                    (receipt["upstreamRepository"] as string) == "https://github.com/ok-oldking/OnnxOCR.git" &&
+                    (receipt["officialBaseCommit"] as string) == "1888fd16e3ac3c663e2b25739cb21c388fb8a6fa" &&
+                    (receipt["upstreamPatchCommit"] as string) == "9fd82161a575a994f70ef5a45e759b66dc7c7224" &&
+                    (receipt["predictBaseSha256"] as string) == "cf80ceec7f6cb6c116811321a820c37aba012118deb29601bf99ddc61db2b2ec" &&
+                    Hash(predict) == (receipt["predictBaseSha256"] as string) &&
+                    (receipt["recordSha256"] as string) == "7b4d4e3c72f1ce5a90491408e92b0ce53f6298953f6d69800c82a25e5f4fb6c5" &&
+                    Hash(record) == (receipt["recordSha256"] as string) &&
+                    (receipt["cacheDirectoryRelativePath"] as string) == "mutable/onnxocr";
+            } catch { return false; }
+        }
+
         internal static bool IsAuditedWwCaptureSdkPatch(string root, IDictionary<string, object> record) {
             if (record == null || !record.ContainsKey("sdkSourcePatch")) return false;
             IDictionary<string, object> sdk = record["sdkSourcePatch"] as IDictionary<string, object>;

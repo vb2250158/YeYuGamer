@@ -27,7 +27,7 @@ function Assert-OpenKuroCandidate([string]$Root) {
     $expected = [ordered]@{
         WW = @('attach-world','inspect-daily-progress','farm-nightmare-daily-echo','spend-waveplates','claim-daily-reward','claim-mail','claim-battle-pass')
         Endfield = @('attach-world','mail','spend-sanity','delivery-commission','collect-credit','dijiang-harvest','claim-daily-reward')
-        GF2 = @('attach-home','mail','public-area-dispatch','spend-stamina','squad-tasks','claim-daily-missions','battle-pass-free-track')
+        GF2 = @('attach-home','mail','activity-supply','event-battle','public-area-dispatch','spend-stamina','squad-tasks','claim-daily-missions','battle-pass-free-track','exploration-claim','star-wish')
     }
     if ([int]$manifest.schemaVersion -ne 2 -or [string]$manifest.packageId -cne 'legacy-night-rain-gamer' -or
         [string]$manifest.entryPoint -cne 'runner.exe' -or [string]$manifest.promotion.status -cne 'candidate' -or

@@ -177,10 +177,12 @@ function Assert-YeYuGamerInstallRoot {
 function Assert-YeYuGamerRuntimeRoot {
     param([Parameter(Mandatory = $true)][string]$Path)
 
-    $expected = Get-YeYuGamerDefaultRuntimeRoot
+    # Machine layout: C:\ProgramData\YeYuGamer is a junction to D:\Game\Data\YeYuGamer.
+    # Accept the physical runtime root on a fixed local disk (no reparse ancestors)
+    # so official Install can write the live module tree the junction exposes.
     $resolved = Assert-YeYuGamerLocalTarget -Path $Path -Purpose 'RuntimeRoot'
-    if (-not (Test-YeYuGamerPathEquals -Left $resolved -Right $expected)) {
-        throw "RuntimeRoot must use the fixed YeYu Gamer ProgramData path: $expected"
+    if ([System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($resolved)).DriveType -ne [System.IO.DriveType]::Fixed) {
+        throw 'RuntimeRoot must be on a fixed local disk.'
     }
     Assert-YeYuGamerNoReparseAncestors -Path $resolved -Purpose 'RuntimeRoot' | Out-Null
     return $resolved
