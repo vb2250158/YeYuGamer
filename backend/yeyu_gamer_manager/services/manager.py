@@ -13,6 +13,7 @@ from .queue_parking import attempt_parking_record, parking_record, park_human_ga
 from .queue_timeout_budget import load_queue_timeout_budget
 from .orphan_pending_execution import fail_resume_successor, recover_orphan_pending_executions, validate_resume_intent
 from .daily_queue_priority import order_daily_queue
+from . import dispatch_reservation
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -295,6 +296,7 @@ class ManagerService:
             adapter,
             promotion_receipt_resolver=self._resolve_adapter_promotion_receipt,
             queue_timeout_budget_resolver=lambda: load_queue_timeout_budget(self.store.get_config()["values"]),
+            execution_start_guard=lambda plan: dispatch_reservation.validate_start(self, plan),
         )
         self.manager_todos = ManagerTodosService(
             store=store,
@@ -7061,6 +7063,9 @@ class ManagerService:
                         state="active",
                         latest_run_attempt_id=plan.run_attempt_id,
                     )
+            dispatch_reservation.register_prepared(
+                self, plan, candidate.controller_lease_id, candidate.generation
+            )
         return plan
 
     def _terminalize_unsealed_batch_memberships(
@@ -8090,6 +8095,7 @@ class ManagerService:
             attempt_ordinal=attempt_ordinal,
             resume_intent_id=resume_intent_id,
         )
+        dispatch_reservation.claim_start(self, plan)
         attempt_log = self._open_attempt_log(
             game_id=str(run["game_id"]), run_attempt_id=plan.run_attempt_id
         )
@@ -9238,26 +9244,28 @@ class ManagerService:
 
             try:
                 plan, _ = self._start_game_run(run_id, complete)
-                budget = load_queue_timeout_budget(self.store.get_config()["values"])
-                wait_seconds = plan.timeout_seconds + budget.callback_overhead_seconds
+                wait_seconds = dispatch_reservation.callback_wait_seconds(self, plan, utc_now)
                 if not finished.wait(wait_seconds):
                     timed_out = True
-                    attempt = self.store.get_run_attempt(plan.run_attempt_id)
-                    if attempt["state"] in {"starting", "running"}:
-                        self.adapter_host.cancel(
-                            run_attempt_id=plan.run_attempt_id,
-                            fencing_token=plan.fencing_token,
-                            reason_code="manager_batch_wait_timeout",
-                        )
-                        self.store.update_run_attempt(
-                            plan.run_attempt_id,
-                            state="cancelling",
-                            result={"code": "manager_batch_wait_timeout"},
-                            completed=False,
-                        )
-                    finished.wait(budget.callback_cancel_grace_seconds)
+                    if not dispatch_reservation.recover_undispatched(self, batch_id, plan, utc_now):
+                        budget = load_queue_timeout_budget(self.store.get_config()["values"])
+                        attempt = self.store.get_run_attempt(plan.run_attempt_id)
+                        if attempt["state"] in {"starting", "running"}:
+                            self.adapter_host.cancel(
+                                run_attempt_id=plan.run_attempt_id,
+                                fencing_token=plan.fencing_token,
+                                reason_code="manager_batch_wait_timeout",
+                            )
+                            self.store.update_run_attempt(
+                                plan.run_attempt_id,
+                                state="cancelling",
+                                result={"code": "manager_batch_wait_timeout"},
+                                completed=False,
+                            )
+                        finished.wait(budget.callback_cancel_grace_seconds)
                 result = outcome.get("result")
                 if result is None:
+                    dispatch_reservation.recover_undispatched(self, batch_id, plan, utc_now)
                     attempt = self.store.get_run_attempt(plan.run_attempt_id)
                     if attempt["state"] in {"starting", "running", "cancelling"}:
                         requirements = [

@@ -127,6 +127,7 @@ class ManagerAdapterHost:
             Callable[[str], Mapping[str, Any]] | None
         ) = None,
         queue_timeout_budget_resolver: Callable[[], QueueTimeoutBudget] | None = None,
+        execution_start_guard: Callable[[AdapterExecutionPlan], None] | None = None,
     ) -> None:
         self.compatibility_adapter = compatibility_adapter
         self.runtime_dir = compatibility_adapter.runtime_dir
@@ -137,6 +138,7 @@ class ManagerAdapterHost:
         self._cancel_sent = False
         self._promotion_receipt_resolver = promotion_receipt_resolver
         self._queue_timeout_budget_resolver = queue_timeout_budget_resolver or (lambda: load_queue_timeout_budget({}))
+        self._execution_start_guard = execution_start_guard
 
     @staticmethod
     def adapter_id(game_id: str) -> str:
@@ -2105,6 +2107,8 @@ class ManagerAdapterHost:
             raise AdapterExecutionRejected(
                 "execution_scope_mismatch", "Plan scope differs from execute arguments"
             )
+        if self._execution_start_guard is not None:
+            self._execution_start_guard(execution_plan)
 
         probe = self.probe()
         if not probe["hostHealthy"]:
