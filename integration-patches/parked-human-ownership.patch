@@ -1,0 +1,21 @@
+Base-SHA256: a2ea026dd0834f7c89500c8143db6aa8d91eba701cfe705e0c2f210acfc4e2f0
+Reference: backend/yeyu_gamer_manager/services/human_gates.py
+--- a/backend/yeyu_gamer_manager/services/human_gates.py
++++ b/backend/yeyu_gamer_manager/services/human_gates.py
+@@ -7,6 +7,7 @@
+ from typing import TYPE_CHECKING, Any
+ 
+ from .manager_errors import ManagerConflict
++from .queue_parking import parked_human_gate_yielded
+ 
+ if TYPE_CHECKING:
+     from ..store.sqlite_store import SqliteStore
+@@ -23,6 +24,8 @@
+             or row["seal_version"] is not None or row["membership_state"] == "cancelled"
+         ):
+             continue
++        if parked_human_gate_yielded(store, row["run_id"], row["batch_id"]):
++            continue
+         owners.append({"gameId": row["game_id"], "accountId": row["account_id"],
+                        "runId": row["run_id"], "batchId": row["batch_id"],
+                        "kind": "human_required"})

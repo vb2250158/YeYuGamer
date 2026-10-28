@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import timedelta
+import json
+import math
+from datetime import datetime, timedelta, timezone
 
 from ..domain.execution_control import LeaseState
 from ..domain.models import EntityState
@@ -31,6 +33,89 @@ def unresolved_parking_record(manager, run_id):
 def parking_record(manager, run_id):
     resource = unresolved_parking_record(manager, run_id)
     return resource if resource is not None and resource["state"] == "parked" else None
+
+
+def parked_human_gate_yielded(store, run_id, batch_id):
+    """Read a committed queue yield, not human release or Host quiescence."""
+    if not batch_id:
+        return False
+    try:
+        with store._lock:
+            latest = store.list_run_attempts(run_id=run_id, limit=1)
+            if not latest:
+                return False
+            attempt = latest[0]
+            attempt_id = attempt["run_attempt_id"]
+            resource = store.get_resource(RESOURCE_TYPE, attempt_id)
+            document = resource["document"]
+            run = store.get_game_run(run_id)
+            batch = store.get_batch(batch_id)
+            member = store.get_batch_run_membership(batch_id, run_id)
+            if (resource["state"] != "parked"
+                    or document["runId"] != run_id or document["batchId"] != batch_id
+                    or document["runAttemptId"] != attempt_id or document["gameId"] != run["game_id"]
+                    or document.get("gateKind") != "human_takeover"
+                    or document.get("reasonCode") != "human_takeover_budget"
+                    or document.get("ownershipReleased") is not True
+                    or document.get("businessCompleted") is not False
+                    or run["mode"] != "execute" or run["state"] != "review_required"
+                    or batch["mode"] != "execute" or batch["state"] == "cancelled"
+                    or batch["cadence"] != run["cadence"] or batch["result"].get("sealVersion") is not None
+                    or attempt["state"] != "human_required" or not attempt["completed_at"]
+                    or member["state"] != "terminal" or member["terminal_outcome"] != "review_required"
+                    or member["latest_run_attempt_id"] != attempt_id
+                    or store.get_active_batch_cancel_request(batch_id) is not None):
+                return False
+            started = datetime.fromisoformat(document["startedAt"])
+            expires = datetime.fromisoformat(document["expiresAt"])
+            parked = datetime.fromisoformat(document["parkedAt"])
+            seconds = document["budgetSeconds"]
+            if (isinstance(seconds, bool) or not isinstance(seconds, (float, int))
+                    or not math.isfinite(seconds) or seconds < 0
+                    or any(value.utcoffset() is None for value in (started, expires, parked))
+                    or expires != started + timedelta(seconds=seconds)
+                    or not expires <= parked <= datetime.now(timezone.utc)):
+                return False
+            receipt = store.connection.execute(
+                """SELECT payload_json FROM events WHERE entity_type='run-attempt'
+                   AND entity_id=? AND event_type='queue.parking.expired'
+                   ORDER BY sequence DESC LIMIT 1""", (attempt_id,),
+            ).fetchone()
+            if receipt is None:
+                return False
+            recorded = json.loads(receipt["payload_json"])
+            if not isinstance(recorded, dict) or not recorded or any(
+                    document.get(key) != value for key, value in recorded.items()):
+                return False
+            lease = store.get_controller_lease_for_attempt(attempt_id)
+            if store.list_controller_leases(run_id=run_id, active_only=True, limit=1):
+                return False
+            if lease is not None and datetime.fromisoformat(lease["created_at"]) > started:
+                return False
+            if document.get("controllerLeaseId") is not None:
+                if (lease is None or lease["controller_lease_id"] != document["controllerLeaseId"]
+                        or lease["generation"] != document["controllerLeaseGeneration"]
+                        or lease["state"] != "revoked"
+                        or lease["end_reason_code"] != "queue_human_takeover_budget_expired"):
+                    return False
+            elif lease is not None and (not lease["ended_at"]
+                    or datetime.fromisoformat(lease["ended_at"]) > started):
+                return False
+            memberships = store.list_batch_run_memberships(run_id=run_id, limit=5000)
+            intents = store.list_resume_intents(run_id=run_id, limit=5000)
+            blockers = store.list_todo_blockers(run_id=run_id, active_only=True, limit=5000)
+            if (len(memberships) >= 5000 or len(intents) >= 5000 or len(blockers) >= 5000
+                    or any(item["batch_id"] != batch_id and item["state"] not in {"terminal", "cancelled"}
+                           for item in memberships)
+                    or any(item["state"] in {"successor_pending", "successor_dispatched"} for item in intents)
+                    or any(item["kind"] == "human_required" and (
+                        item["run_attempt_id"] != attempt_id
+                        or datetime.fromisoformat(item["raised_at"]) > parked
+                        or datetime.fromisoformat(item["created_at"]) > parked) for item in blockers)):
+                return False
+            return True
+    except (RecordNotFound, KeyError, TypeError, ValueError, OverflowError):
+        return False
 
 
 def park_human_gate(manager, batch_id, run_id, clock):
