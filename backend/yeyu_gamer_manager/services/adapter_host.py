@@ -29,7 +29,6 @@ from .adapter_protocol import (
     AdapterRunResult,
     ExecutionPackageManifest,
     NoExecutableTodos,
-    serialize_cancel_control,
     serialize_durable_cancel_control,
     serialize_execute_request,
     validate_plan_against_manifest,
@@ -321,7 +320,7 @@ class ManagerAdapterHost:
 
         In particular, no inherited ``YEYU_*`` value, tray bootstrap secret,
         actor credential, SMTP setting, token, or unrelated service credential
-        crosses the process boundary. The one Adapter variable is derived from
+        crosses the process boundary. Adapter paths are derived from
         Manager-owned local runtime state rather than an API request.
         """
         environment = {
@@ -329,6 +328,7 @@ class ManagerAdapterHost:
             for name in self.HOST_ENV_ALLOWLIST
             if (value := os.environ.get(name)) is not None
         }
+        environment["YEYU_GAMER_RUNTIME_DIR"] = str(self.runtime_dir.resolve())
         if staging_dir is not None:
             environment["YEYU_GAMER_ADAPTER_STAGING_DIR"] = str(staging_dir)
         if installation_binding_path is not None:
@@ -1642,7 +1642,6 @@ class ManagerAdapterHost:
             process is None
             or self._active_plan != plan
             or process.poll() is not None
-            or process.stdin is None
             or self._cancel_sent
         ):
             return False
@@ -1652,15 +1651,9 @@ class ManagerAdapterHost:
             cancel_authority=plan.cancel_authority,
             reason_code=reason_code,
         )
-        at = datetime.now(timezone.utc).isoformat()
-        payload = serialize_cancel_control(plan, at=at, reason_code=reason_code)
-        try:
-            process.stdin.write(payload)
-            process.stdin.flush()
-        except (BrokenPipeError, OSError, ValueError):
-            return durable
-        self._cancel_sent = True
-        return True
+        if durable:
+            self._cancel_sent = True
+        return durable
 
     def cancel(
         self,
@@ -1671,8 +1664,10 @@ class ManagerAdapterHost:
     ) -> bool:
         """Request cooperative cancellation for the exact active attempt.
 
-        The Host and runner receive a typed control envelope. This method never
-        terminates a game process or an arbitrary child process tree.
+        Success means a scoped cancellation request was durably persisted, not
+        delivered or acknowledged. The fixed Host authenticates and relays it.
+        This method never writes the Host stdin pipe or terminates a game
+        process or an arbitrary child process tree.
         """
         with self._execution_lock:
             plan = self._active_plan

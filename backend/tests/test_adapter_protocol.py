@@ -1178,7 +1178,12 @@ class AdapterHostSupervisorTests(unittest.TestCase):
                     "YEYU_GAMER_ADAPTER_STAGING_DIR",
                     "YEYU_GAMER_INSTALLATION_BINDING_PATH",
                     "YEYU_GAMER_EXECUTION_PACKAGE_ROOT",
+                    "YEYU_GAMER_RUNTIME_DIR",
                 },
+            )
+            self.assertEqual(
+                Path(child_environment["YEYU_GAMER_RUNTIME_DIR"]),
+                self.runtime.resolve(),
             )
             self.assertEqual(
                 Path(child_environment["YEYU_GAMER_ADAPTER_STAGING_DIR"]),
@@ -1240,6 +1245,7 @@ class AdapterHostSupervisorTests(unittest.TestCase):
                 "YEYU_GAMER_TRAY_BOOTSTRAP_SECRET": "must-not-cross",
                 "YEYU_GAMER_ACTOR_TOKEN": "must-not-cross",
                 "SMTP_PASSWORD": "must-not-cross",
+                "YEYU_GAMER_RUNTIME_DIR": "must-not-be-inherited",
             },
         ), self._patched_popen(script):
             pid = self.host_service.execute(
@@ -1462,8 +1468,15 @@ class AdapterHostSupervisorTests(unittest.TestCase):
         script = self._fake_host_script(
             "todo=request['executableTodoInstanceIds'][0]\n"
             f"hello=base('hello',0);hello.update({{'packageId':'legacy-night-rain-gamer','packageVersion':'0.1.0','packageDigest':{package_digest!r},'runnerPid':os.getpid(),'acceptedTodoInstanceIds':[todo]}});print(json.dumps(hello),flush=True)\n"
-            "control=json.loads(sys.stdin.readline())\n"
-            "assert control['controlType']=='cancel' and control['runAttemptId']==request['runAttemptId'] and control['fencingToken']==request['fencingToken']\n"
+            "import hashlib,hmac,pathlib\n"
+            "pending=pathlib.Path(os.environ['YEYU_GAMER_RUNTIME_DIR'])/'adapter-controls'/(request['runAttemptId']+'.cancel.json')\n"
+            "deadline=time.monotonic()+3\n"
+            "while not pending.exists() and time.monotonic()<deadline: time.sleep(0.01)\n"
+            "control=json.loads(pending.read_text(encoding='utf-8'))\n"
+            "assert control['controlType']=='cancel' and control['runId']==request['runId'] and control['runAttemptId']==request['runAttemptId']\n"
+            "canonical='\\n'.join(control[key] for key in ('protocolVersion','controlType','runId','runAttemptId','at','reasonCode','nonce'))\n"
+            "expected='hmac-sha256:'+hmac.new(request['cancelAuthority'].encode(),canonical.encode(),hashlib.sha256).hexdigest()\n"
+            "assert hmac.compare_digest(control['authorityMac'],expected)\n"
             "terminal=base('run_terminal',1);terminal.update({'status':'cancelled','transportOutcome':'cancelled','attemptedTodoInstanceIds':[],'completedTodoInstanceIds':[],'unresolvedTodoInstanceIds':[todo],'terminalEventDigest':'sha256:'+'d'*64,'exitCode':0});print(json.dumps(terminal),flush=True)\n"
         )
         completed: list[object] = []
