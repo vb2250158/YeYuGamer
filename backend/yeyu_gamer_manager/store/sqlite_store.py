@@ -7149,6 +7149,8 @@ class SqliteStore:
             "diagnostic-bundle",
             "run-control-request",
             "queue-parking",
+            "input-recovery",
+            "quarantine",
             "attempt-dispatch",
             "notification",
             "config-validation",

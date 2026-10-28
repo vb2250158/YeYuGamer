@@ -10,6 +10,7 @@ import stat
 import threading
 from .snapshot_coalescer import SnapshotCoalescer
 from .queue_parking import attempt_parking_record, parking_record, park_human_gate, park_review_gate, review_gate_released, unresolved_parking_record
+from . import input_recovery
 from .queue_timeout_budget import load_queue_timeout_budget
 from .orphan_pending_execution import fail_resume_successor, recover_orphan_pending_executions, validate_resume_intent
 from .daily_queue_priority import order_daily_queue
@@ -297,6 +298,7 @@ class ManagerService:
             promotion_receipt_resolver=self._resolve_adapter_promotion_receipt,
             queue_timeout_budget_resolver=lambda: load_queue_timeout_budget(self.store.get_config()["values"]),
             execution_start_guard=lambda plan: dispatch_reservation.validate_start(self, plan),
+            owned_input_scope_resolver=lambda plan, digest: input_recovery.scope_for_plan(self, plan, digest),
         )
         self.manager_todos = ManagerTodosService(
             store=store,
@@ -6906,6 +6908,10 @@ class ManagerService:
         attempt_ordinal: int | None = None,
         resume_intent_id: str | None = None,
     ) -> AdapterExecutionPlan:
+        input_recovery.require_desktop_available(self)
+        active_plan_resolver = getattr(self.adapter_host, "active_plan_for_run", None)
+        if callable(active_plan_resolver) and active_plan_resolver(run["run_id"]) is not None:
+            raise dispatch_reservation.DispatchReservationRejected("Same-run Host owner still requires input recovery")
         plan = self._build_execution_plan(
             run, todo_instance_ids=todo_instance_ids
         )
@@ -6918,7 +6924,7 @@ class ManagerService:
         game_day_key = self._run_game_day_key(
             run, list(plan.executable_todo_instance_ids)
         )
-        desktop_id = "windows-interactive-desktop"
+        desktop_id = input_recovery.DESKTOP_ID
         issued_at = self._contract_datetime(plan.issued_at)
         candidate = ControllerLease(
             controller_lease_id=str(uuid.uuid4()),
@@ -6959,6 +6965,7 @@ class ManagerService:
         grant_controller_lease(candidate, existing, at=issued_at)
         with self.store.atomic():
             latest_run = self.store.get_game_run(run["run_id"])
+            input_recovery.require_desktop_available(self)
             if latest_run["state"] == EntityState.CANCELLED or latest_run["state"] != run["state"]:
                 raise GameLaunchCancelled("GameRun changed before controller lease commit")
             if resume_intent_id is not None:
@@ -7265,6 +7272,8 @@ class ManagerService:
         manifest: ExecutionPackageManifest | None = None,
         capture_pids: frozenset[int] | None = None,
     ) -> None:
+        if input_recovery.ignore_recovered_callback(self, plan, "event"):
+            return
         parked = attempt_parking_record(self, plan.run_attempt_id)
         if parked is not None:
             self.store.append_event("queue.parking.late-event", "run-attempt", plan.run_attempt_id,
@@ -7738,6 +7747,8 @@ class ManagerService:
         command_id: str | None = None,
         manager_control_outcome: str | None = None,
     ) -> AdapterRunResult | None:
+        if input_recovery.ignore_recovered_callback(self, plan, "result"):
+            return None
         parked = attempt_parking_record(self, plan.run_attempt_id)
         if parked is not None:
             self.store.append_event("queue.parking.late-result", "run-attempt", plan.run_attempt_id,
@@ -7780,6 +7791,8 @@ class ManagerService:
             else EntityState.FAILED
         )
         with self.store.atomic():
+            if input_recovery.ignore_recovered_callback(self, plan, "result"):
+                return None
             if self.store.get_run_attempt(plan.run_attempt_id)["state"] not in {"starting", "running", "cancelling"}:
                 _log.info("attempt.result.ignored_terminal attempt=%s", plan.run_attempt_id)
                 return None
@@ -7926,6 +7939,7 @@ class ManagerService:
         attempt_ordinal: int | None = None,
         resume_intent_id: str | None = None,
     ) -> tuple[AdapterExecutionPlan, int]:
+        input_recovery.require_desktop_available(self)
         run = self.store.get_game_run(run_id)
         self._validate_run_account_identity(run)
 
@@ -8156,11 +8170,15 @@ class ManagerService:
 
         def finished(result: AdapterRunResult, *, handoff: Callable[[], bool] | None = None) -> None:
             nonlocal completion_result, completion_ack_blocked
+            if input_recovery.ignore_recovered_callback(self, plan, "finish"):
+                return
             completion_result = None
             completion_ack_blocked = False
             with bind_log_context(**log_fields, phase="finish"):
                 _finished(result)
             self._close_attempt_log(plan.run_attempt_id)
+            if input_recovery.ignore_recovered_callback(self, plan, "handoff"):
+                return
             if completion_ack_blocked:
                 _log.error("attempt.handoff.unconfirmed reason=persistence_recovery_incomplete")
                 return
@@ -8180,6 +8198,8 @@ class ManagerService:
 
         def _finished(result: AdapterRunResult) -> None:
             nonlocal completion_result, completion_ack_blocked
+            if input_recovery.ignore_recovered_callback(self, plan, "result"):
+                return
             if attempt_parking_record(self, plan.run_attempt_id) is not None:
                 self.store.append_event("queue.parking.late-result", "run-attempt", plan.run_attempt_id,
                                         {"status": result.status, "code": result.code, "businessCompleted": False})
@@ -8250,6 +8270,7 @@ class ManagerService:
                         attempt = self.store.get_run_attempt(plan.run_attempt_id)
                         latest = self.store.list_run_attempts(run_id=plan.run_id, limit=1)
                         if (attempt_parking_record(self, plan.run_attempt_id) is not None
+                                or input_recovery.attempt_recovery_record(self, plan.run_attempt_id) is not None
                                 or not latest or latest[0]["run_attempt_id"] != plan.run_attempt_id):
                             effective_result = None
                             self.store.append_event("queue.parking.late-callback-failure", "run-attempt", plan.run_attempt_id,
@@ -8435,6 +8456,8 @@ class ManagerService:
                 )
             return plan, pid
         except GameLaunchCancelled as error:
+            if input_recovery.preserve_start_failure(self, plan):
+                raise
             _log.info(
                 "attempt.launch.cancelled target=manager-game-launch message=%s",
                 error,
@@ -8473,6 +8496,8 @@ class ManagerService:
             self._close_attempt_log(plan.run_attempt_id)
             raise
         except GameLaunchHumanRequired as error:
+            if input_recovery.preserve_start_failure(self, plan):
+                raise
             _log.info(
                 "attempt.launch.human_required code=%s message=%s",
                 error.reason_code,
@@ -8518,6 +8543,8 @@ class ManagerService:
             self._close_attempt_log(plan.run_attempt_id)
             raise
         except Exception as error:
+            if input_recovery.preserve_start_failure(self, plan):
+                raise
             failure_code = (
                 "game_start_failed"
                 if isinstance(error, (GameLaunchError, EmulatorBindingError))
@@ -8601,6 +8628,9 @@ class ManagerService:
         )
 
     def _terminal_game_cleanup_gate(self, plan: AdapterExecutionPlan, batch_id: str | None = None) -> bool:
+        if (input_recovery.attempt_recovery_record(self, plan.run_attempt_id) is not None
+                or input_recovery.desktop_quarantine(self) is not None):
+            raise GameLaunchCancelled("Input recovery preserves the client and forbids physical cleanup")
         run = self.store.get_game_run(plan.run_id)
         attempt = self.store.get_run_attempt(plan.run_attempt_id)
         if run["state"] == EntityState.HUMAN_REQUIRED or attempt["state"] == "human_required" or any(
@@ -9189,6 +9219,9 @@ class ManagerService:
             run_id = str(run["runId"])
             game_id = str(run["gameId"])
             account_id = str(run.get("accountId", DEFAULT_ACCOUNT_ID))
+            if input_recovery.skip_quarantined_member(self, batch_id, run_id):
+                not_started.append(run_id)
+                continue
             membership = self.store.get_batch_run_membership(batch_id, run_id)
             if membership["state"] not in {"queued", "resume_pending"}:
                 self._fence_batch_for_reconciliation(
@@ -9247,22 +9280,36 @@ class ManagerService:
                 wait_seconds = dispatch_reservation.callback_wait_seconds(self, plan, utc_now)
                 if not finished.wait(wait_seconds):
                     timed_out = True
-                    if not dispatch_reservation.recover_undispatched(self, batch_id, plan, utc_now):
-                        budget = load_queue_timeout_budget(self.store.get_config()["values"])
-                        attempt = self.store.get_run_attempt(plan.run_attempt_id)
-                        if attempt["state"] in {"starting", "running"}:
-                            self.adapter_host.cancel(
-                                run_attempt_id=plan.run_attempt_id,
-                                fencing_token=plan.fencing_token,
-                                reason_code="manager_batch_wait_timeout",
-                            )
-                            self.store.update_run_attempt(
-                                plan.run_attempt_id,
-                                state="cancelling",
-                                result={"code": "manager_batch_wait_timeout"},
-                                completed=False,
-                            )
-                        finished.wait(budget.callback_cancel_grace_seconds)
+                    if dispatch_reservation.recover_undispatched(self, batch_id, plan, utc_now):
+                        failures.append(run_id)
+                        continue
+                    budget = load_queue_timeout_budget(self.store.get_config()["values"])
+                    attempt = self.store.get_run_attempt(plan.run_attempt_id)
+                    if attempt["state"] in {"starting", "running"}:
+                        try:
+                            self.adapter_host.cancel(run_attempt_id=plan.run_attempt_id,
+                                fencing_token=plan.fencing_token, reason_code="manager_batch_wait_timeout")
+                        except Exception:
+                            _log.exception("input-recovery.cancel_delivery_failed attempt=%s", plan.run_attempt_id)
+                        with self.store.atomic():
+                            current = self.store.get_run_attempt(plan.run_attempt_id)
+                            latest = self.store.list_run_attempts(run_id=plan.run_id, limit=1)
+                            if (current["state"] in {"starting", "running"}
+                                    and latest and latest[0]["run_attempt_id"] == plan.run_attempt_id
+                                    and input_recovery.attempt_recovery_record(self, plan.run_attempt_id) is None):
+                                self.store.update_run_attempt(plan.run_attempt_id, state="cancelling",
+                                    result={"code": "manager_batch_wait_timeout"}, completed=False)
+                    finished.wait(budget.callback_cancel_grace_seconds)
+                    try:
+                        recovered = (input_recovery.recover_attempt(self, batch_id, plan, utc_now)
+                                     if outcome.get("result") is None else False)
+                    except Exception:
+                        _log.exception("input-recovery.failed attempt=%s", plan.run_attempt_id)
+                        self._complete_command(command_id, "failed", "Input recovery failed; no queue handoff is authorized.")
+                        return
+                    if recovered:
+                        failures.append(run_id)
+                        continue
                 result = outcome.get("result")
                 if result is None:
                     dispatch_reservation.recover_undispatched(self, batch_id, plan, utc_now)
@@ -9312,6 +9359,20 @@ class ManagerService:
                     failures.append(run_id)
                     timed_out = timed_out or result.transport_outcome == "timeout"
             except Exception as error:
+                active_plan_resolver = getattr(self.adapter_host, "active_plan_for_run", None)
+                try:
+                    failed_plan = active_plan_resolver(run_id) if callable(active_plan_resolver) else None
+                    if failed_plan is not None:
+                        input_recovery.preserve_start_failure(self, failed_plan)
+                        if not input_recovery.recover_attempt(self, batch_id, failed_plan, utc_now):
+                            self._complete_command(command_id, "failed", "Failed Host owner could not be reconciled; next dispatch is forbidden.")
+                            return
+                        failures.append(run_id)
+                        continue
+                except Exception:
+                    _log.exception("input-recovery.start-failed run=%s", run_id)
+                    self._complete_command(command_id, "failed", "Failed Host owner recovery did not commit; next dispatch is forbidden.")
+                    return
                 attempts = self.store.list_run_attempts(run_id=run_id, limit=1)
                 launch_cancelled = isinstance(error, GameLaunchCancelled)
                 if attempts and not launch_cancelled:
@@ -9510,12 +9571,19 @@ class ManagerService:
             return
         parked_run_ids = [str(member["run_id"]) for member in memberships
                           if parking_record(self, str(member["run_id"])) is not None]
+        recovered_run_ids = []
+        for member in memberships:
+            attempt_id = member.get("latest_run_attempt_id")
+            if attempt_id and input_recovery.attempt_recovery_record(self, str(attempt_id)) is not None:
+                recovered_run_ids.append(str(member["run_id"]))
+        parked_run_ids = list(dict.fromkeys(parked_run_ids + recovered_run_ids))
         if parked_run_ids:
             current = self.store.get_batch(batch_id)
             self.store.update_batch(batch_id, state=EntityState.REVIEW_REQUIRED, result={
                 **dict(current["result"]), "currentGameId": None,
                 "parkedRunIds": parked_run_ids, "acceptedDone": False,
                 "completedRunIds": completed, "failedRunIds": failures,
+                "notStartedRunIds": not_started, "inputRecoveryRunIds": recovered_run_ids,
                 "recoveryPhase": {"schemaVersion": 1, "status": "ready_for_resume",
                                   "parkedReview": True, "affectedRunIds": parked_run_ids},
             })

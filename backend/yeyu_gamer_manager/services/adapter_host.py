@@ -37,6 +37,8 @@ from .adapter_protocol import (
 )
 from .legacy_adapter import LegacyAdapter
 from .queue_timeout_budget import QueueTimeoutBudget, load_queue_timeout_budget
+from .owned_input_qualification import owned_input_qualified
+from .input_request_writer import DurableCancelWriter, InputRequestWriter
 from .private_runtime_acl import (
     PrivateRuntimeAclError,
     assert_private_runtime_acl,
@@ -127,6 +129,8 @@ class ManagerAdapterHost:
         ) = None,
         queue_timeout_budget_resolver: Callable[[], QueueTimeoutBudget] | None = None,
         execution_start_guard: Callable[[AdapterExecutionPlan], None] | None = None,
+        owned_input_scope_resolver: Callable[[AdapterExecutionPlan, str], Mapping[str, Any]] | None = None,
+        owned_input_qualification_resolver: Callable[[str, str, str], bool] | None = None,
     ) -> None:
         self.compatibility_adapter = compatibility_adapter
         self.runtime_dir = compatibility_adapter.runtime_dir
@@ -138,6 +142,15 @@ class ManagerAdapterHost:
         self._promotion_receipt_resolver = promotion_receipt_resolver
         self._queue_timeout_budget_resolver = queue_timeout_budget_resolver or (lambda: load_queue_timeout_budget({}))
         self._execution_start_guard = execution_start_guard
+        self._owned_input_scope_resolver = owned_input_scope_resolver
+        self._owned_input_qualification_resolver = owned_input_qualification_resolver or owned_input_qualified
+        self._owned_execution = None
+        self._owned_binding_path: Path | None = None
+        self._request_writer: InputRequestWriter | None = None
+        self._active_timeout_budget: QueueTimeoutBudget | None = None
+        self._cancel_writer: DurableCancelWriter | None = None
+        self._cancel_writer_plan: AdapterExecutionPlan | None = None
+        self._cancel_requested = False
 
     @staticmethod
     def adapter_id(game_id: str) -> str:
@@ -1254,7 +1267,11 @@ class ManagerAdapterHost:
         self.compatibility_adapter.validate_game_id(game_id)
 
     def active_execution(self) -> dict[str, object] | None:
-        with self._execution_lock:
+        budget = self._active_timeout_budget or self._queue_timeout_budget_resolver()
+        if not self._execution_lock.acquire(timeout=budget.host_stop_grace_seconds):
+            return {"runId": None, "runAttemptId": None, "gameId": None, "pid": None,
+                    "exited": False, "cancelRequested": False, "ownershipUnknown": True}
+        try:
             if self._active_process is not None:
                 plan = self._active_plan
                 return {
@@ -1263,15 +1280,78 @@ class ManagerAdapterHost:
                     "gameId": plan.game_id if plan is not None else None,
                     "pid": self._active_process.pid,
                     "exited": self._active_process.poll() is not None,
-                    "cancelRequested": self._cancel_sent,
+                    "cancelRequested": self._cancel_requested or self._cancel_sent,
                 }
+        finally:
+            self._execution_lock.release()
         return self.compatibility_adapter.active_execution()
 
     def release_terminal_owner(self, run_attempt_id: str) -> bool:
-        with self._execution_lock:
-            if self._active_process is None:
+        budget = self._active_timeout_budget or self._queue_timeout_budget_resolver()
+        if not self._execution_lock.acquire(timeout=budget.host_stop_grace_seconds):
+            return False
+        try:
+            if (self._active_process is None and self._active_plan is None
+                    and self._owned_execution is None
+                    and (self._request_writer is None or not self._request_writer.is_alive())):
                 return self.compatibility_adapter.active_execution() is None
             return False
+        finally:
+            self._execution_lock.release()
+
+    def owned_execution_for(self, plan: AdapterExecutionPlan):
+        budget = self._active_timeout_budget or self._queue_timeout_budget_resolver()
+        if not self._execution_lock.acquire(timeout=budget.host_stop_grace_seconds):
+            return None
+        try:
+            if self._active_plan is not plan:
+                return None
+            execution = self._owned_execution
+            if execution is None:
+                return None
+            from .owned_input_execution import OwnedInputExecution
+            return execution if type(execution) is OwnedInputExecution else None
+        finally:
+            self._execution_lock.release()
+
+    def active_plan_for_run(self, run_id):
+        """Return a scope candidate, never an ownership or quiescence proof."""
+        plan = self._active_plan
+        return plan if plan is not None and plan.run_id == run_id else None
+
+    def release_owned_execution(self, plan, execution, receipt) -> bool:
+        budget = self._active_timeout_budget or self._queue_timeout_budget_resolver()
+        if not self._execution_lock.acquire(timeout=budget.host_stop_grace_seconds):
+            return False
+        try:
+            if (self._active_plan is not plan or self._owned_execution is not execution
+                    or not execution.verify_receipt(receipt, execution.scope)):
+                return False
+            try:
+                execution.close()
+            except Exception:
+                _log.exception("adapter.owned_input.cleanup_failed")
+                return False
+            binding_path = self._owned_binding_path
+            self._active_process = None
+            self._active_plan = None
+            self._owned_execution = None
+            self._owned_binding_path = None
+            self._request_writer = None
+            self._active_timeout_budget = None
+            self._cancel_sent = False
+            self._cancel_requested = False
+            self._cancel_writer = None
+            self._cancel_writer_plan = None
+        finally:
+            self._execution_lock.release()
+        self._cleanup_attempt_controls(plan)
+        if binding_path is not None:
+            try:
+                binding_path.unlink(missing_ok=True)
+            except OSError:
+                _log.warning("adapter.owned_input.binding_cleanup_pending")
+        return True
 
     def _verified_execution_manifest(self, game_id: str) -> ExecutionPackageManifest:
         try:
@@ -1645,15 +1725,43 @@ class ManagerAdapterHost:
             or self._cancel_sent
         ):
             return False
-        durable = self._write_durable_cancel(
-            run_id=plan.run_id,
-            run_attempt_id=plan.run_attempt_id,
-            cancel_authority=plan.cancel_authority,
-            reason_code=reason_code,
-        )
-        if durable:
+        self._cancel_requested = True
+        writer = self._cancel_writer
+        if writer is not None and self._cancel_writer_plan is not plan:
+            return False
+        if writer is None:
+            writer = DurableCancelWriter(lambda: self._write_durable_cancel(
+                run_id=plan.run_id, run_attempt_id=plan.run_attempt_id,
+                cancel_authority=plan.cancel_authority, reason_code=reason_code), plan.run_attempt_id)
+            self._cancel_writer = writer
+            self._cancel_writer_plan = plan
+            try:
+                if self._owned_execution is None:
+                    writer.start()
+                else:
+                    self._owned_execution.start_writer(writer)
+            except Exception as error:
+                if writer.ident is None:
+                    self._cancel_writer = None
+                    self._cancel_writer_plan = None
+                if self._owned_execution is not None:
+                    from .owned_host_job import OwnedHostJobError
+                    if isinstance(error, OwnedHostJobError) and error.operation == "execution_stopping_or_closed":
+                        return False
+                raise
+        budget = self._active_timeout_budget or self._queue_timeout_budget_resolver()
+        writer.join(budget.host_stop_grace_seconds)
+        if writer.is_alive():
+            return False
+        self._cancel_writer = None
+        self._cancel_writer_plan = None
+        if writer.error is not None:
+            error = writer.error
+            writer.error = None
+            raise error
+        if writer.result:
             self._cancel_sent = True
-        return durable
+        return writer.result
 
     def cancel(
         self,
@@ -1669,7 +1777,10 @@ class ManagerAdapterHost:
         This method never writes the Host stdin pipe or terminates a game
         process or an arbitrary child process tree.
         """
-        with self._execution_lock:
+        budget = self._active_timeout_budget or self._queue_timeout_budget_resolver()
+        if not self._execution_lock.acquire(timeout=budget.host_stop_grace_seconds):
+            return False
+        try:
             plan = self._active_plan
             if (
                 plan is None
@@ -1678,6 +1789,8 @@ class ManagerAdapterHost:
             ):
                 return False
             return self._send_cancel_locked(plan=plan, reason_code=reason_code)
+        finally:
+            self._execution_lock.release()
 
     def cancel_run(
         self, *, run_id: str, reason_code: str = "user_cancelled"
@@ -1688,7 +1801,10 @@ class ManagerAdapterHost:
         method resolves it only from the Host's in-memory active ownership.
         """
 
-        with self._execution_lock:
+        budget = self._active_timeout_budget or self._queue_timeout_budget_resolver()
+        if not self._execution_lock.acquire(timeout=budget.host_stop_grace_seconds):
+            return "", False
+        try:
             plan = self._active_plan
             if plan is None or plan.run_id != run_id:
                 return "", False
@@ -1696,6 +1812,8 @@ class ManagerAdapterHost:
                 plan.run_attempt_id,
                 self._send_cancel_locked(plan=plan, reason_code=reason_code),
             )
+        finally:
+            self._execution_lock.release()
 
     def cancel_persisted_attempt(
         self,
@@ -1765,6 +1883,7 @@ class ManagerAdapterHost:
         installation_binding_path: Path | None = None,
         transcript: AttemptLogSession | None = None,
         timeout_budget: QueueTimeoutBudget | None = None,
+        owned_execution=None,
     ) -> None:
         with bind_log_context(
             run=plan.run_id, attempt=plan.run_attempt_id, game=plan.game_id, phase="tool-run"
@@ -1779,6 +1898,7 @@ class ManagerAdapterHost:
                 installation_binding_path=installation_binding_path,
                 transcript=transcript,
                 timeout_budget=timeout_budget,
+                owned_execution=owned_execution,
             )
 
     def _watch_execution_bound(
@@ -1793,6 +1913,7 @@ class ManagerAdapterHost:
         installation_binding_path: Path | None = None,
         transcript: AttemptLogSession | None = None,
         timeout_budget: QueueTimeoutBudget | None = None,
+        owned_execution=None,
     ) -> None:
         budget = timeout_budget if timeout_budget is not None else self._queue_timeout_budget_resolver()
         stop_grace_seconds = budget.host_stop_grace_seconds
@@ -1868,7 +1989,11 @@ class ManagerAdapterHost:
                             raise rejection
                     event = stream.consume_line(line[:-1])
                     if on_event is not None:
-                        on_event(event, manifest)
+                        if owned_execution is None:
+                            on_event(event, manifest)
+                        else:
+                            with owned_execution.event_callback():
+                                on_event(event, manifest)
                 except AdapterProtocolError as error:
                     record_failure(error)
                     return
@@ -1915,6 +2040,9 @@ class ManagerAdapterHost:
             name=f"yeyu-adapter-stderr-{plan.run_attempt_id[:8]}",
             daemon=True,
         )
+        if owned_execution is not None:
+            owned_execution.register_reader(stdout_thread)
+            owned_execution.register_reader(stderr_thread)
         stdout_thread.start()
         stderr_thread.start()
 
@@ -1925,7 +2053,7 @@ class ManagerAdapterHost:
             deadline = time.monotonic() + plan.timeout_seconds
             while process.poll() is None:
                 with self._execution_lock:
-                    cancel_requested = self._cancel_sent
+                    cancel_requested = self._cancel_requested or self._cancel_sent
                 if cancel_requested:
                     break
                 remaining = deadline - time.monotonic()
@@ -1951,6 +2079,11 @@ class ManagerAdapterHost:
                         ),
                     )
                 try:
+                    if owned_execution is not None:
+                        receipt = owned_execution.stop_and_drain(stop_grace_seconds)
+                        if receipt is None:
+                            _log.error("adapter.watch.handoff_retained reason=owned_input_drain_unconfirmed")
+                            return
                     exit_code = process.wait(timeout=stop_grace_seconds)
                 except subprocess.TimeoutExpired:
                     # Only the fixed Host process is terminated. The game client
@@ -1963,6 +2096,11 @@ class ManagerAdapterHost:
                         exit_code = process.wait(timeout=stop_grace_seconds)
             else:
                 exit_code = process.wait(timeout=stop_grace_seconds)
+            if owned_execution is not None:
+                receipt = owned_execution.stop_and_drain(stop_grace_seconds)
+                if receipt is None:
+                    _log.error("adapter.watch.handoff_retained reason=owned_input_drain_unconfirmed")
+                    return
             stdout_thread.join(timeout=stop_grace_seconds)
             stderr_thread.join(timeout=stop_grace_seconds)
             if stdout_thread.is_alive() or stderr_thread.is_alive():
@@ -2000,6 +2138,9 @@ class ManagerAdapterHost:
                     )
             else:
                 result = stream.finish(process_exit_code=exit_code)
+            if owned_execution is not None and owned_execution.forced_stop and result.status == "completed":
+                result = stream.failure_result(code="owned_input_forced_stop",
+                    message="Owned input executors required forced shutdown", process_exit_code=exit_code)
             _log.info(
                 "adapter.watch.end exit=%s timedOut=%s cancelRequested=%s protocolFailure=%s "
                 "-> status=%s transport=%s code=%s stderrBytes=%s",
@@ -2027,6 +2168,10 @@ class ManagerAdapterHost:
         if process.poll() is None or stdout_thread.is_alive() or stderr_thread.is_alive():
             _log.error("adapter.watch.handoff_retained reason=host_exit_or_reader_drain_unconfirmed")
             return
+        if (self._cancel_writer_plan is plan and self._cancel_writer is not None
+                and self._cancel_writer.is_alive()):
+            _log.error("adapter.watch.handoff_retained reason=cancel_writer_not_drained")
+            return
         for pipe in (process.stdin, process.stdout, process.stderr):
             if pipe is not None:
                 try:
@@ -2041,14 +2186,28 @@ class ManagerAdapterHost:
             with self._execution_lock:
                 if not handoff_open or handed_off or self._active_process is not process or self._active_plan is not plan:
                     return False
+                if owned_execution is not None:
+                    if not self.release_owned_execution(plan, owned_execution, owned_execution.last_receipt):
+                        return False
+                    handed_off = True
+                    return True
                 self._active_process = None
                 self._active_plan = None
+                self._request_writer = None
+                self._active_timeout_budget = None
                 self._cancel_sent = False
+                self._cancel_requested = False
+                self._cancel_writer = None
+                self._cancel_writer_plan = None
                 handed_off = True
                 return True
 
         try:
-            on_complete(result, handoff=handoff)
+            if owned_execution is None:
+                on_complete(result, handoff=handoff)
+            else:
+                with owned_execution.finalization_callback():
+                    on_complete(result, handoff=handoff)
         except Exception:
             # Manager owns callback persistence and recovery. Never invoke a
             # completion callback twice after an exception.
@@ -2114,6 +2273,17 @@ class ManagerAdapterHost:
         manifest = self._verified_execution_manifest(game_id)
 
         entrypoint = self._fixed_host_file(self.HOST_ENTRYPOINT)
+        qualified_owned_input = self._owned_input_qualification_resolver(
+            game_id, manifest.package_digest, "sha256:" + hashlib.sha256(entrypoint.read_bytes()).hexdigest()
+        )
+        if type(qualified_owned_input) is not bool:
+            raise AdapterExecutionRejected("owned_input_qualification_invalid", "Qualification must be explicit")
+        owned_execution = None
+        owned_scope = None
+        if qualified_owned_input:
+            if self._owned_input_scope_resolver is None:
+                raise AdapterExecutionRejected("owned_input_scope_missing", "Owned input requires a Manager scope")
+            owned_scope = self._owned_input_scope_resolver(execution_plan, manifest.package_digest)
         staging_dir = self._artifact_staging_dir(execution_plan)
         if installation_binding is None:
             raise AdapterExecutionRejected(
@@ -2134,7 +2304,9 @@ class ManagerAdapterHost:
         creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         with self._execution_lock:
             active = self._active_process
-            if active is not None:
+            if active is not None or self._owned_execution is not None:
+                if owned_execution is not None:
+                    owned_execution.close()
                 raise AdapterExecutionRejected(
                     "adapter_busy", "Another Adapter execution is already active"
                 )
@@ -2150,14 +2322,16 @@ class ManagerAdapterHost:
             )
             authority_path = self._write_control_authority(execution_plan)
             try:
+                environment = self._host_environment(staging_dir=staging_dir,
+                    installation_binding_path=binding_path, execution_package_root=package_root)
+                if qualified_owned_input:
+                    from .owned_input_execution import OwnedInputExecution
+                    owned_execution = OwnedInputExecution(owned_scope)
+                    environment["YEYU_GAMER_OWNED_INPUT_JOB"] = owned_execution.job_name
                 process = subprocess.Popen(
                     command,
                     cwd=self.host_root,
-                    env=self._host_environment(
-                        staging_dir=staging_dir,
-                        installation_binding_path=binding_path,
-                        execution_package_root=package_root,
-                    ),
+                    env=environment,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -2165,7 +2339,17 @@ class ManagerAdapterHost:
                     creationflags=creation_flags,
                     bufsize=0,
                 )
-            except OSError as error:
+            except Exception as error:
+                if owned_execution is not None:
+                    try:
+                        owned_execution.close()
+                    except Exception:
+                        self._active_plan = execution_plan
+                        self._owned_execution = owned_execution
+                        self._owned_binding_path = binding_path
+                        _log.exception("adapter.startup.owned_cleanup_pending")
+                        raise AdapterHostProtocolError("host_invocation_cleanup_pending",
+                            "Fixed Host startup failed; native cleanup owner retained") from error
                 binding_path.unlink(missing_ok=True)
                 authority_path.unlink(missing_ok=True)
                 raise AdapterHostProtocolError(
@@ -2173,15 +2357,60 @@ class ManagerAdapterHost:
                 ) from error
             self._active_process = process
             self._active_plan = execution_plan
+            self._owned_execution = owned_execution
+            self._owned_binding_path = binding_path if owned_execution is not None else None
             self._cancel_sent = False
+            self._cancel_requested = False
+            self._cancel_writer = None
+            self._cancel_writer_plan = None
+            self._active_timeout_budget = timeout_budget
             try:
                 if process.stdin is None:
                     raise OSError("Adapter Host stdin is unavailable")
-                process.stdin.write(request_payload)
-                process.stdin.flush()
-            except (BrokenPipeError, OSError, ValueError) as error:
-                process.terminate()
+                if owned_execution is not None:
+                    owned_execution.bind(process, timeout_budget.host_stop_grace_seconds)
+                    owned_execution.dispatch(request_payload, timeout_budget.host_stop_grace_seconds)
+                else:
+                    writer = InputRequestWriter(process.stdin, request_payload, execution_plan.run_attempt_id)
+                    self._request_writer = writer
+                    writer.start()
+                    writer.join(timeout_budget.host_stop_grace_seconds)
+                    if writer.is_alive():
+                        raise TimeoutError("Fixed Host request writer exceeded startup budget")
+                    if writer.error is not None:
+                        raise OSError("Fixed Host request write failed") from writer.error
+            except Exception as error:
+                if process.poll() is None:
+                    try:
+                        process.terminate()
+                    except OSError:
+                        if process.poll() is None:
+                            raise
                 process.wait(timeout=timeout_budget.host_stop_grace_seconds)
+                if self._request_writer is not None:
+                    self._request_writer.join(timeout_budget.host_stop_grace_seconds)
+                    if self._request_writer.is_alive():
+                        raise AdapterHostProtocolError("host_request_writer_unconfirmed",
+                            "Fixed Host request writer did not drain after stop") from error
+                if owned_execution is not None:
+                    receipt = owned_execution.stop_and_drain(timeout_budget.host_stop_grace_seconds)
+                    if receipt is None:
+                        receipt = owned_execution.abort_before_dispatch(process, timeout_budget.host_stop_grace_seconds)
+                    if receipt is None:
+                        raise AdapterHostProtocolError("owned_input_startup_unconfirmed",
+                            "Owned input startup did not produce a quiescence receipt") from error
+                    owned_execution.close()
+                for pipe in (process.stdin, process.stdout, process.stderr):
+                    close = getattr(pipe, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except (OSError, ValueError):
+                            _log.warning("adapter.startup.pipe_cleanup_pending")
+                self._owned_execution = None
+                self._owned_binding_path = None
+                self._request_writer = None
+                self._active_timeout_budget = None
                 self._active_process = None
                 self._active_plan = None
                 binding_path.unlink(missing_ok=True)
@@ -2202,6 +2431,7 @@ class ManagerAdapterHost:
                 "installation_binding_path": binding_path,
                 "transcript": transcript,
                 "timeout_budget": timeout_budget,
+                "owned_execution": owned_execution,
             },
             name=f"yeyu-adapter-watch-{execution_plan.run_attempt_id[:8]}",
             daemon=True,

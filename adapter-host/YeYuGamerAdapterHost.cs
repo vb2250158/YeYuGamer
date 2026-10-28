@@ -125,6 +125,7 @@ namespace YeYuGamer.AdapterHost
 
         private static int Execute(ParsedArguments parsed)
         {
+            JoinOwnedInputJob();
             string requestJson;
             bool eof;
             if (!ReadLineBounded(ProtocolInput, MaxRequestBytes, out requestJson, out eof))
@@ -556,6 +557,32 @@ namespace YeYuGamer.AdapterHost
             int informationClass,
             IntPtr information,
             uint informationLength);
+
+        private static void JoinOwnedInputJob()
+        {
+            string name = Environment.GetEnvironmentVariable("YEYU_GAMER_OWNED_INPUT_JOB");
+            if (String.IsNullOrEmpty(name)) return;
+            if (!Regex.IsMatch(name, @"\ALocal\\YeYuOwnedHost-[0-9a-f]{32}\z"))
+                throw new InvalidOperationException("owned_input_job_name_invalid");
+            IntPtr job = OpenJobObject(1, false, name);
+            if (job == IntPtr.Zero) throw new InvalidOperationException("owned_input_job_open_failed");
+            try
+            {
+                using (Process current = Process.GetCurrentProcess())
+                {
+                    if (!AssignProcessToJobObject(job, current.Handle))
+                        throw new InvalidOperationException("owned_input_job_join_failed");
+                }
+            }
+            finally
+            {
+                if (!CloseHandle(job)) throw new InvalidOperationException("owned_input_job_close_failed");
+            }
+            Environment.SetEnvironmentVariable("YEYU_GAMER_OWNED_INPUT_JOB", null);
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr OpenJobObject(uint access, bool inheritHandle, string name);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
