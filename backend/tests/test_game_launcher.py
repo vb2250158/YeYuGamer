@@ -119,8 +119,12 @@ class GameLaunchServiceTests(unittest.TestCase):
         observations = []
         with mock.patch.object(self.launcher, "_list_running", return_value={}), mock.patch.object(
             self.launcher, "_ensure_started"
-        ) as start:
+        ) as start, mock.patch(
+            "yeyu_gamer_manager.services.zzz_launcher_preflight.ensure_zzz_launcher",
+            return_value={"state": "launcher-verified"},
+        ) as preflight:
             receipt = self.launcher.ensure_started("ZZZ", str(executable), observer=observations.append)
+        preflight.assert_called_once()
         start.assert_not_called()
         self.assertEqual(receipt.state, "official-tool-pending")
         self.assertIsNone(receipt.process_id)

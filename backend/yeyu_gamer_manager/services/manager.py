@@ -8383,6 +8383,21 @@ class ManagerService:
                         "configured game executable is required before Adapter launch"
                     )
                 self._record_zombie_game_processes(plan)
+                preflight_options = {}
+                if plan.game_id == "ZZZ":
+                    from .hoyoplay_manager_session import manager_context
+
+                    authority_valid = lambda: (
+                        not self._launch_cancel_requested(plan.run_attempt_id)
+                        and self._zzz_launcher_authority_valid(plan)
+                    )
+                    preflight_options = {
+                        "preflight_deadline_at": self._contract_datetime(plan.expires_at),
+                        "preflight_authority_valid": authority_valid,
+                        "preflight_native_context": manager_context(
+                            self, plan.run_attempt_id, authority_valid
+                        ),
+                    }
                 game_launch = self.game_launcher.ensure_started(
                     run["game_id"],
                     game_path,
@@ -8392,6 +8407,7 @@ class ManagerService:
                     cancel_requested=lambda: self._launch_cancel_requested(
                         plan.run_attempt_id
                     ),
+                    **preflight_options,
                 )
             _log.info(
                 "attempt.launch.receipt %s",
@@ -8938,6 +8954,32 @@ class ManagerService:
         "launch-failed": "game-ui-launch-failed",
     }
 
+    def _zzz_launcher_authority_valid(self, plan: AdapterExecutionPlan) -> bool:
+        lease = self.store.get_controller_lease_for_attempt(
+            plan.run_attempt_id, active_only=True
+        )
+        if lease is None or plan.game_id != "ZZZ":
+            return False
+        expected = {
+            "manager_id": self.manager_id,
+            "run_id": plan.run_id,
+            "run_attempt_id": plan.run_attempt_id,
+            "game_id": plan.game_id,
+            "desktop_id": "windows-interactive-desktop",
+            "holder_principal_id": "manager-adapter",
+            "state": "active",
+            "fencing_hash": "sha256:" + hashlib.sha256(
+                plan.fencing_token.encode("utf-8")
+            ).hexdigest(),
+        }
+        if any(lease.get(key) != value for key, value in expected.items()):
+            return False
+        now = utc_now()
+        return (
+            self._contract_datetime(lease["expires_at"]) > now
+            and self._contract_datetime(plan.expires_at) > now
+        )
+
     def _record_launch_observation(
         self, plan: AdapterExecutionPlan, observation: LaunchObservation
     ) -> None:
@@ -8980,6 +9022,11 @@ class ManagerService:
                         result={"launchObservation": checkpoint}, completed=False,
                     )
             try:
+                if observation.game_id == "ZZZ" and (
+                    not observation.process_ids
+                    or observation.detail.get("captureRequested") is False
+                ):
+                    raise WindowCaptureError("ZZZ checkpoint has no requested verified capture scope")
                 if (
                     not observation.process_ids
                     and (

@@ -54,6 +54,16 @@ def named_mutex_is_held(name: str) -> bool:
 class GameLaunchError(RuntimeError):
     """The configured game client could not be made available to its Adapter."""
 
+    def __init__(
+        self, message: str, *, reason_code: str | None = None,
+        detail: dict[str, object] | None = None,
+        process_ids: frozenset[int] = frozenset(),
+    ) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.detail = dict(detail or {})
+        self.process_ids = process_ids
+
 
 class GameLaunchCancelled(GameLaunchError):
     """The persisted Manager cancellation intent stopped the pre-Adapter launch gate."""
@@ -1271,6 +1281,9 @@ exit 3
         observer: LaunchObserver | None = None,
         *,
         cancel_requested: LaunchCancellationCheck | None = None,
+        preflight_deadline_at=None,
+        preflight_authority_valid=None,
+        preflight_native_context=None,
     ) -> GameLaunchReceipt:
         started_at = time.monotonic()
         try:
@@ -1288,6 +1301,16 @@ exit 3
                 self._raise_if_cancelled(cancel_requested)
                 executable = self.validate_configured_executable(game_path)
                 names = self._launch_surface_names(game_id, str(executable))
+                if game_id == "ZZZ":
+                    from .zzz_launcher_preflight import ensure_zzz_launcher
+
+                    ensure_zzz_launcher(
+                        self, executable, observer, started_at,
+                        cancel_requested=cancel_requested,
+                        deadline_at=preflight_deadline_at,
+                        authority_valid=preflight_authority_valid,
+                        native_context=preflight_native_context,
+                    )
                 if game_id == "NTE":
                     # Clear the launcher's "new launcher" modal once the official
                     # tool brings the launcher up; otherwise its LauncherTask
@@ -1324,6 +1347,8 @@ exit 3
             raise
         except GameLaunchCancelled as error:
             cancellation_scope: dict[str, object] = {}
+            if game_id == "ZZZ":
+                cancellation_scope["process_ids"] = error.process_ids
             if game_id == "WW" and Path(game_path).name.casefold() == "launcher.exe":
                 try:
                     cancellation_scope["process_ids"] = frozenset(self._list_ww_running(Path(game_path), set(self._launch_surface_names(game_id, game_path))))
@@ -1368,6 +1393,7 @@ exit 3
                 started_at,
                 self._launch_surface_names(game_id, game_path),
                 {"error": str(error)},
+                **({"process_ids": error.process_ids} if game_id == "ZZZ" else {}),
             )
             raise
         self._notify(
