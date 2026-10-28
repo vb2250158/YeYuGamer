@@ -1,4 +1,10 @@
 {
   "schemaVersion": 1,
-  "qualifications": []
+  "qualifications": [
+    {
+      "gameId": "WW",
+      "packageDigest": "sha256:1966ed0ad307a81c7170bd54995c64d08f5bf34df1440cff00eddb9b02230e21",
+      "hostSha256": "sha256:87e66531eed97313394c9fc57d3150bc5b8fa6261f81a44eace4d69f76f40f38"
+    }
+  ]
 }

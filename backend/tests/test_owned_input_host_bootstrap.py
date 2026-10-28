@@ -99,6 +99,16 @@ class OwnedInputHostBootstrapTests(unittest.TestCase):
         self.assertEqual(process.returncode, 70)
         self.assertEqual(json.loads(output)["code"], "host_error")
 
+    def test_bare_package_digest_normalized_to_prefixed_matches_qualification(self):
+        # Call-site normalizes ExecutionPackageManifest bare hex to schema sha256: form.
+        bare_package = '1' * 64
+        host = 'sha256:' + '2' * 64
+        identity = ('WW', 'sha256:' + bare_package, host)
+        normalized = 'sha256:' + bare_package.removeprefix('sha256:')
+        with mock.patch.object(policy, '_qualifications', return_value=frozenset({identity})):
+            self.assertTrue(policy.owned_input_qualified('WW', normalized, host))
+            self.assertFalse(policy.owned_input_qualified('WW', bare_package, host))
+
     def test_unqualified_default_does_not_enable_containment_for_games(self):
         self.assertFalse(policy.owned_input_qualified("WW", "sha256:" + "1" * 64, "sha256:" + "2" * 64))
 

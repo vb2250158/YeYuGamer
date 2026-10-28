@@ -2273,8 +2273,10 @@ class ManagerAdapterHost:
         manifest = self._verified_execution_manifest(game_id)
 
         entrypoint = self._fixed_host_file(self.HOST_ENTRYPOINT)
+        package_digest = "sha256:" + manifest.package_digest.removeprefix("sha256:")
+        host_sha256 = "sha256:" + hashlib.sha256(entrypoint.read_bytes()).hexdigest().removeprefix("sha256:")
         qualified_owned_input = self._owned_input_qualification_resolver(
-            game_id, manifest.package_digest, "sha256:" + hashlib.sha256(entrypoint.read_bytes()).hexdigest()
+            game_id, package_digest, host_sha256
         )
         if type(qualified_owned_input) is not bool:
             raise AdapterExecutionRejected("owned_input_qualification_invalid", "Qualification must be explicit")
