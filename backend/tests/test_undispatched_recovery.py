@@ -259,13 +259,50 @@ class UndispatchedRecoveryTests(unittest.TestCase):
         with self.assertRaises(dispatch.DispatchReservationRejected):
             dispatch.callback_wait_seconds(self.manager, self.plan, lambda: self.now)
 
-    def test_first_timeout_claimed_still_cancels_waits_grace_and_fences(self):
+    def test_first_timeout_claimed_cancels_waits_grace_then_revokes_and_quarantines(self):
+        import json
+        import sqlite3
+
+        from yeyu_gamer_manager.services import input_recovery
+        from yeyu_gamer_manager.services.queue_timeout_budget import load_queue_timeout_budget
+
         run, plan, waits, cancel = self.run_coordinator_timeout(claimed=True)
         self.assertEqual(len(waits), 2)
         cancel.assert_called_once()
-        self.assertEqual(self.store.get_run_attempt(plan.run_attempt_id)["state"], "cancelling")
-        self.assertEqual(self.store.get_resource(dispatch.RESOURCE_TYPE, dispatch._resource_id(plan))["state"], "claimed")
-        self.assertIsNotNone(self.store.get_controller_lease_for_attempt(plan.run_attempt_id, active_only=True))
+        budget = load_queue_timeout_budget(self.store.get_config()["values"])
+        self.assertEqual(waits[1], budget.callback_cancel_grace_seconds)
+        attempt = self.store.get_run_attempt(plan.run_attempt_id)
+        self.assertEqual(attempt["state"], "review_required")
+        self.assertTrue(attempt["completed_at"])
+        self.assertFalse(attempt["result"]["businessCompleted"])
+        self.assertEqual(self.store.get_game_run(run["run_id"])["state"], "review_required")
+        resource = self.store.get_resource(dispatch.RESOURCE_TYPE, dispatch._resource_id(plan))
+        self.assertEqual(resource["state"], "claimed")
+        lease = self.store.get_controller_lease_for_attempt(plan.run_attempt_id)
+        self.assertEqual(lease["state"], "revoked")
+        self.assertEqual(lease["controller_lease_id"], resource["document"]["controllerLeaseId"])
+        self.assertEqual(lease["generation"], resource["document"]["controllerLeaseGeneration"])
+        self.assertIsNone(self.store.get_controller_lease_for_attempt(plan.run_attempt_id, active_only=True))
+        quarantine = self.store.get_resource(input_recovery.QUARANTINE_RESOURCE, lease["desktop_id"])
+        self.assertEqual(quarantine["state"], "quarantined")
+        self.assertEqual(quarantine["document"]["runAttemptId"], plan.run_attempt_id)
+        self.assertEqual(quarantine["document"]["controllerLeaseId"], lease["controller_lease_id"])
+        self.assertEqual(quarantine["document"]["controllerLeaseGeneration"], lease["generation"])
+        self.assertFalse(quarantine["document"]["proofVerified"])
+        self.assertFalse(quarantine["document"]["businessCompleted"])
+        self.assertTrue(quarantine["document"]["ownerRetained"])
+        durable_store = sqlite3.connect(self.fixture.settings.database_path.as_uri() + "?mode=ro", uri=True)
+        try:
+            state, document = durable_store.execute(
+                "SELECT state, document_json FROM manager_resources WHERE resource_type=? AND resource_id=?",
+                (input_recovery.QUARANTINE_RESOURCE, lease["desktop_id"])).fetchone()
+            self.assertEqual(state, "quarantined")
+            self.assertEqual(json.loads(document), quarantine["document"])
+        finally:
+            durable_store.close()
+        with self.assertRaises(dispatch.DispatchReservationRejected):
+            input_recovery.require_desktop_available(self.manager)
+        self.spawn.assert_not_called()
 
     def test_recovery_rolls_back_each_partial_write(self):
         for operation in ("update_resource", "update_run_attempt", "update_game_run",
