@@ -52,6 +52,7 @@ class ParkedHumanOwnershipTests(unittest.TestCase):
             if hashlib.sha256(content).hexdigest() != expected:
                 raise AssertionError("Reference SHA mismatch: " + relative)
             cls.sources[relative] = content.decode("utf-8-sig")
+        (QA_ROOT / ".cache").mkdir(parents=True, exist_ok=True)
         cls.overlay = tempfile.TemporaryDirectory(prefix="parked-human-", dir=QA_ROOT / ".cache")
         cls.addClassCleanup(cls.overlay.cleanup)
         target = Path(cls.overlay.name) / "backend/yeyu_gamer_manager/services/human_gates.py"

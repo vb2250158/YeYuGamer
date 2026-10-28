@@ -83,6 +83,8 @@ python -B -m unittest -q test_ww_login_followup
 
 每次实现提交前均执行 staged 安全预筛，最终未提交交付物执行 WorkingTree 预筛，均无High/Critical；`git diff 4361c93 --check`通过。预筛不代表完整语义安全或上线批准。
 
+干净detached检出复跑曾暴露human-owner测试把`.cache`父目录存在当成隐含前置（103项运行、1个setUpClass错误，未将跳过的16项计过）。已在测试中显式创建自有缓存父目录，不需要复制原工作树缓存；业务helper不变。原测试字节SHA与修复后SHA均保留在备份/专项报告，最终干净复跑以会话验证收据为准。
+
 ## 六项任务逐项状态
 
 | 项目 | 可交付结果 | 是否仍CHANGES_REQUIRED |
