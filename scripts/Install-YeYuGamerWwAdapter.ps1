@@ -4,11 +4,15 @@ param(
     [string]$CandidateRoot = (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'YeYuGamer\adapter-build\local-daily-candidate'),
     [string]$RuntimeRoot = (Join-Path $env:ProgramData 'YeYuGamer\runtime'),
     [string]$CandidateTestEvidenceDirectory = '',
+    [ValidateSet('WW','Endfield','GF2')]
+    [ValidateNotNullOrEmpty()]
+    [string[]]$GameIds = @('WW','Endfield','GF2'),
     [switch]$PromoteForDailyBatchValidation
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+$GameIds = @(@('WW','Endfield','GF2') | Where-Object { $_ -in $GameIds })
 . (Join-Path $PSScriptRoot 'YeYuGamer.Common.ps1')
 $source = Assert-YeYuGamerLocalTarget -Path $SourceRoot -Purpose 'OpenKuro installer source root'
 . (Join-Path $source 'adapter-host\YeYuGamerPromotionContract.ps1')
@@ -72,7 +76,7 @@ if ($LASTEXITCODE -ne 0) { throw 'OpenKuro candidate binding probe failed.' }
 
 $scoped = @{}
 $testEvidence = @{}
-foreach ($gameId in @('WW','Endfield','GF2')) {
+foreach ($gameId in $GameIds) {
     $manifest = (($candidate.Manifest | ConvertTo-Json -Depth 12 -Compress) | ConvertFrom-Json -ErrorAction Stop)
     $bindings = $manifest.operationBindings.$gameId
     $manifest.supportedGameIds = @($gameId)
@@ -86,7 +90,7 @@ $runtime = Assert-YeYuGamerRuntimeRoot -Path $RuntimeRoot
 $modules = Assert-YeYuGamerChildPath -Parent $runtime -Child (Join-Path $runtime 'adapters\game-modules') -Purpose 'game module root'
 New-Item -ItemType Directory -Path $modules -Force | Out-Null
 Assert-YeYuGamerNoReparseTree -Path $modules -Purpose 'game module root' | Out-Null
-$targets = @('ww','endfield','gf2') | ForEach-Object { Join-Path $modules $_ }
+$targets = $GameIds | ForEach-Object { Join-Path $modules $_.ToLowerInvariant() }
 $active = @(Get-CimInstance Win32_Process -Filter "Name='runner.exe'" -ErrorAction SilentlyContinue | Where-Object {
     $executablePath = $_.ExecutablePath
     $executablePath -and @($targets | Where-Object { ([IO.Path]::GetFullPath($executablePath)).StartsWith(($_.TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
@@ -97,7 +101,7 @@ $lock = Enter-YeYuGamerInstallLifecycleLock
 $incoming = $null
 $results = @()
 try {
-    foreach ($gameId in @('WW','Endfield','GF2')) {
+    foreach ($gameId in $GameIds) {
         $leaf = $gameId.ToLowerInvariant()
         $incoming = Assert-YeYuGamerChildPath -Parent $modules -Child (Join-Path $modules ('.' + $leaf + '.incoming-' + [guid]::NewGuid().ToString('N'))) -Purpose "incoming $gameId Adapter"
         Copy-Item -LiteralPath $candidate.Root -Destination $incoming -Recurse
@@ -128,7 +132,7 @@ try {
         }
     }
     [pscustomobject]@{
-        status='modules-installed-unpromoted'; packageId='legacy-night-rain-gamer'; gameIds=@('WW','Endfield','GF2');
+        status='modules-installed-unpromoted'; packageId='legacy-night-rain-gamer'; gameIds=@($GameIds);
         executionReady=$false; promotionOwner='manager'; gameStarted=$false; modules=$results
     } | ConvertTo-Json -Depth 7 -Compress
 }
