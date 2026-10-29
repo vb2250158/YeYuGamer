@@ -60,6 +60,21 @@
         "tests/TestRewardTrackNavigation.py": "9fb040d30f36a3126dd08098ce392cfbd3ebc9281218833da3ee564bc9e90247",
         "docs/reward-status-inspection-candidate.md": "61bee778612b23f726577affa01095ff93c33ce3f54e5c16b645fe8062c86db0"
       }
+    },
+    {
+      "candidateKind": "isolated-official-gf2-source",
+      "repository": "https://github.com/vb2250158/ok-gf2.git",
+      "commit": "d6197e82aac39ea9b933bb34433106f58b7b8e9d",
+      "tag": null,
+      "files": {
+        "main.py": "8350e12a28e44516a30edc99c06c174a45f9af80076a7c24614cf7862795add8",
+        "requirements.txt": "7564035a8df1a1e4e7287bcea0130b322a72301cc2a112dfa567781c21e132d7",
+        "src/tasks/DailyTask.py": "34382b5e4ce70b42f6a8b6d6e394439fcee6bc28f918c12cce20a4fe2ae42e30",
+        "src/tasks/DailyTaskRunner.py": "7b7cc02390ba470f1bdcd84d0f8e4a39ad9e661de175c8bbe845a5ef9e581755",
+        "src/tasks/daily/daily_reward_mixin.py": "f695afc4cf8c58796f732cabbddd347a581f0bf6719e15302e0f2264c89e1ac3",
+        "src/tasks/daily/daily_activity_mixin.py": "b41c26d7635cd64d4933669f8a000ce1163d6c7e7e2b9f2a4d42a7f6fa458d5e",
+        "src/config.py": "74c0e9f78cd7864b8cf1f8cdc708a755bff0a47f5584420634602e43e108b377"
+      }
     }
   ]
 }

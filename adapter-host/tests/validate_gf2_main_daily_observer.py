@@ -185,6 +185,7 @@ def main():
         task.box_of_screen = lambda *args, **kwargs: object()
         if hasattr(task, '_collect_supply_activities'):
             task._executor = SimpleNamespace(device_manager=SimpleNamespace(hwnd_window=SimpleNamespace(hwnd=0)))
+            task._ensure_supply_menu = lambda: True
             task._open_supply_activity = lambda name: True
             task._claim_supply_activity = lambda name: '已领取'
             activity_body = DailyTask.activities
