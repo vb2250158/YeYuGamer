@@ -985,6 +985,29 @@ ConvertTo-Json -InputObject $results -Compress
             dll.return_value = kernel32
             self.assertTrue(GameLaunchService._process_is_live(4242))
 
+    def test_exit_code_zero_with_unsignaled_process_remains_live(self) -> None:
+        with mock.patch("ctypes.WinDLL", create=True) as dll:
+            api = mock.Mock()
+            dll.return_value = api
+            api.OpenProcess.return_value = 99
+            api.GetExitCodeProcess.side_effect = lambda _, output: setattr(output._obj, "value", 0) or 1
+            for result in (258, 0xFFFFFFFF, 128):
+                api.WaitForSingleObject.return_value = result
+                self.assertTrue(GameLaunchService._process_is_live(4242))
+            api.OpenProcess.assert_called_with(0x101000, False, 4242)
+            api.WaitForSingleObject.assert_called_with(99, 0)
+            self.assertEqual(api.CloseHandle.call_count, 3)
+
+    def test_signaled_process_does_not_depend_on_stale_or_259_exit_code(self) -> None:
+        with mock.patch("ctypes.WinDLL", create=True) as dll:
+            api = mock.Mock()
+            dll.return_value = api
+            api.OpenProcess.return_value = 99
+            api.WaitForSingleObject.return_value = 0
+            api.GetExitCodeProcess.side_effect = AssertionError("Exit code alone is not termination proof")
+            self.assertFalse(GameLaunchService._process_is_live(4242))
+            api.CloseHandle.assert_called_once_with(99)
+
     def test_close_started_does_not_revive_a_client_that_already_exited(self) -> None:
         """A successful close must not be re-opened by a stale re-read.
 

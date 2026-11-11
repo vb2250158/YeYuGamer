@@ -22,6 +22,7 @@ from pydantic import (
     model_validator,
 )
 
+from .artifact_limits import MAX_ARTIFACTS_PER_TODO
 
 def _to_camel(value: str) -> str:
     head, *tail = value.split("_")
@@ -416,13 +417,13 @@ class TodoBlocker(ExecutionFact):
     raised_at: datetime
     transitioned_at: datetime
     reason: ReasonText
-    artifact_refs: tuple[OpaqueId, ...] = Field(min_length=1, max_length=20)
+    artifact_refs: tuple[OpaqueId, ...] = Field(min_length=1, max_length=MAX_ARTIFACTS_PER_TODO)
     action_receipt_id: OpaqueId | None = None
     resolved_at: datetime | None = None
     resolution_code: OpaqueId | None = None
     resolution_reason: ReasonText | None = None
     resolution_artifact_refs: tuple[OpaqueId, ...] = Field(
-        default=(), max_length=20
+        default=(), max_length=MAX_ARTIFACTS_PER_TODO
     )
 
     _raised_at_is_aware = field_validator("raised_at")(_aware)
